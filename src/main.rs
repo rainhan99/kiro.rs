@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod gateway;
 mod http_client;
 mod image_resize;
 mod kiro;
