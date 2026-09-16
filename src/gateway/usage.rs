@@ -323,6 +323,9 @@ fn normalize_anthropic(
         (five_minutes, write_evidence, one_hour, write_1h_evidence)
     } else {
         match (policy.cache_write, policy.cache_write_1h, write_total) {
+            (CacheCategoryPolicy::Reported, CacheCategoryPolicy::Reported, Some(0)) => {
+                (0, EvidenceKind::Reported, 0, EvidenceKind::Reported)
+            }
             (CacheCategoryPolicy::Reported, CacheCategoryPolicy::NotApplicable, Some(total)) => (
                 total,
                 EvidenceKind::Reported,
@@ -535,6 +538,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn anthropic_zero_writes_without_ttl_details_are_confirmed_zero() {
+        let raw = json!({
+            "input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 3,
+            "cache_creation_input_tokens": 0
+        });
+        let usage = normalize_usage(UpstreamKind::Anthropic, &raw)
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.cache_write, usage.cache_write_1h), (0, 0));
+        assert_eq!(usage.cache_evidence.cache_write, EvidenceKind::Reported);
+        assert_eq!(usage.cache_evidence.cache_write_1h, EvidenceKind::Reported);
+        assert_eq!(usage.raw, raw);
     }
 
     #[test]
