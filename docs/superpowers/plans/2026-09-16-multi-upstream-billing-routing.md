@@ -71,6 +71,8 @@ Upstream: `id`, `name`, `kind` (`kiro`, `anthropic`, `openai_chat`, `openai_resp
 
 Budget policy: `unit`, nullable decimal-string `limit`, `enforcement` (`hard`, `soft`), `maxInFlight`, `maxPending`, `allowedModels`, `allowedUpstreams`. Empty allowlists mean all models/upstreams in the configured account scope, not access without an account. Monetary bindings cannot debit a credit account; Kiro-credit bindings cannot reference direct API upstreams. The binding explicitly determines the downstream account and default sell tariff. This first release does not add per-Key price overrides; separate model aliases/bindings provide explicit tariffs without ambiguously selecting currencies by balance.
 
+Upstream also carries `cacheUsagePolicy`: categories `cacheRead`, `cacheWrite`, `cacheWrite1h` are explicitly `reported` or `not_applicable`. Strict defaults never fabricate supported-but-missing counts; policy-aware normalization retains per-category evidence, and nonzero raw data contradicting N/A is rejected. Web exposes this distinction for compatible endpoints that genuinely do not implement a cache category.
+
 ## Task 1: Typed contracts, exact arithmetic and usage evidence
 
 **Files:** Create `src/gateway/mod.rs`, `amount.rs`, `config.rs`, `usage.rs`; modify `src/main.rs` only to declare `mod gateway;`.
@@ -78,7 +80,7 @@ Budget policy: `unit`, nullable decimal-string `limit`, `enforcement` (`hard`, `
 **Interfaces:**
 
 ```rust
-pub struct Amount(i128); // nonnegative; 12 decimal places; string serde
+pub struct Amount(i128); // nonnegative; 18 decimal places; string serde
 impl Amount {
     pub const ZERO: Self;
     pub fn checked_add(self, rhs: Self) -> anyhow::Result<Self>;
@@ -86,7 +88,7 @@ impl Amount {
     pub fn checked_mul_tokens(self, tokens: u64) -> anyhow::Result<Self>;
 }
 // FromStr + Display; price values restricted to six decimal places so
-// multiplying integer tokens and dividing by 1_000_000 is exact at scale 12.
+// multiplying integer tokens and dividing by 1_000_000 is exact at scale 18.
 pub enum BillingUnit { KiroCredit, Cny, Usd }
 pub enum RoutingMode { Sticky, WeightedRandom }
 pub enum UpstreamKind { Kiro, Anthropic, OpenaiChat, OpenaiResponses }
@@ -116,7 +118,7 @@ fn cached_input_is_not_charged_as_ordinary_input() {
 ```
 
 - [ ] Run focused `cargo test gateway::` before implementation and capture missing-behavior failure (minimal stubs may compile but must not implement behavior first).
-- [ ] GREEN: Implement Amount parsing/serialization with checked integer arithmetic; reject negative/nonfinite/exponent/overflow input and precision beyond twelve decimals. Price validation allows at most six fractional digits. Use checked sum, never `as` casts for externally sized arithmetic.
+- [ ] GREEN: Implement Amount parsing/serialization with checked integer arithmetic; reject negative/nonfinite/exponent/overflow input and precision beyond eighteen decimals. Preserve the existing native credit fixture `0.0169543708291874` exactly. Price validation allows at most six fractional digits. Use checked sum, never `as` casts for externally sized arithmetic.
 - [ ] Implement full shared JSON structs, serde defaults, duplicate/reference/URL-shape/weights/TTL/context/price/unit validation. Empty default configuration is backward compatible. Native usage parsers distinguish missing required totals from confirmed zero and validate disjoint cache subsets. Anthropic TTL write breakdown must sum to total; OpenAI input includes read/write subsets when reported. Keep raw evidence, not fabricated zero cache evidence.
 - [ ] Run focused tests and full Rust suite. Report test commands, RED/GREEN and any fields refined from the contract. Do not commit earlier work.
 
@@ -128,7 +130,7 @@ fn cached_input_is_not_charged_as_ordinary_input() {
 
 - [ ] RED: Tests create an in-memory real SQLite DB, configure CNY limit `1`, reserve `0.7`, then assert another `0.4` reservation fails while an independent USD account remains usable. Settle same attempt twice and assert used remains `0.5`; conflicting repeat must fail, not overwrite.
 - [ ] Run focused `cargo test gateway::ledger` and capture failure.
-- [ ] GREEN: Use transactions and unique request/attempt/settlement keys; canonical integer atoms stored as TEXT, not REAL. Account update cannot relabel units or erase usage. Reject missing accounts, exhausted limits, unsupported hard bounds, over-concurrency/pending; quota zero denies even if a caller supplies zero reservation. Exact upper bound reservation decrements availability atomically.
+- [ ] GREEN: Use transactions and unique request/attempt/settlement keys; canonical Amount decimal strings stored as TEXT, not REAL, and calculate under the transaction in Rust rather than SQLite floating-point SUM. Account update cannot relabel units or erase usage. Reject missing accounts, exhausted limits, unsupported hard bounds, over-concurrency/pending; quota zero denies even if a caller supplies zero reservation. Exact upper bound reservation decrements availability atomically. Price/config snapshots contain only typed nonsecret version, route and tariff fields, never a serialized secret-bearing GatewayConfig.
 - [ ] Persist pending evidence and in-flight attempts. Recovery changes unresolved reservations to pending; never silently zero-settle them. Release hidden failed-attempt customer reservations while still keeping upstream cost (possibly pending). Confirmed committed interruptions may settle; partial unknown usage stays pending. Support audited adjustment/new-cycle operations with reason, never a raw counter reset.
 - [ ] Add idempotent legacy opening-balance import and full file-reopen tests. No trace cleanup dependence or in-memory fallback on financial DB failure. Migration must not overwrite existing accounts on restart.
 - [ ] Run focused and full tests; report exact interfaces, RED/GREEN and durable behavior.
