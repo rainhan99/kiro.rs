@@ -184,4 +184,31 @@ mod tests {
         );
         assert!((Amount::ZERO.checked_sub("0.1".parse().unwrap())).is_err());
     }
+
+    #[test]
+    fn arithmetic_boundaries_reject_parse_add_and_multiply_overflow() {
+        let maximum = "170141183460469231731.687303715884105727"
+            .parse::<Amount>()
+            .unwrap();
+        assert_eq!(
+            maximum.to_string(),
+            "170141183460469231731.687303715884105727"
+        );
+        assert!(
+            "170141183460469231731.687303715884105728"
+                .parse::<Amount>()
+                .is_err()
+        );
+        assert!(
+            maximum
+                .checked_add("0.000000000000000001".parse().unwrap())
+                .is_err()
+        );
+        assert!(
+            "10".parse::<Amount>()
+                .unwrap()
+                .checked_mul_tokens(u64::MAX)
+                .is_err()
+        );
+    }
 }

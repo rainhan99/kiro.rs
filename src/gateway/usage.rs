@@ -279,70 +279,75 @@ fn normalize_anthropic(
         ),
         None => None,
     };
-    let write_5m = details
+    let reported_write_5m = details
         .map(|details| optional_counter(details, "ephemeral_5m_input_tokens"))
         .transpose()?
         .flatten();
-    let write_1h = details
+    let reported_write_1h = details
         .map(|details| optional_counter(details, "ephemeral_1h_input_tokens"))
         .transpose()?
         .flatten();
 
-    let (cache_write, write_evidence, cache_write_1h, write_1h_evidence) = match policy.cache_write
-    {
-        CacheCategoryPolicy::NotApplicable => {
-            let Some((cache_write, write_evidence)) =
-                category(write_total, policy.cache_write, "cache write")?
-            else {
-                unreachable!()
-            };
-            let Some((cache_write_1h, write_1h_evidence)) =
-                category(write_1h, policy.cache_write_1h, "1h cache write")?
-            else {
-                return Ok(None);
-            };
-            (
-                cache_write,
-                write_evidence,
-                cache_write_1h,
-                write_1h_evidence,
-            )
-        }
-        CacheCategoryPolicy::Reported => {
-            let Some(total) = write_total else {
-                return Ok(None);
-            };
-            if total > 0
-                && details.is_none()
-                && policy.cache_write_1h == CacheCategoryPolicy::Reported
-            {
-                return Ok(None);
-            }
-            let (five_minutes, one_hour) = if details.is_some() {
-                (write_5m.unwrap_or(0), write_1h.unwrap_or(0))
-            } else {
-                (total, 0)
-            };
+    if let Some(total) = write_total {
+        let known = reported_write_5m
+            .unwrap_or(0)
+            .checked_add(reported_write_1h.unwrap_or(0))
+            .context("Anthropic cache TTL write breakdown overflow")?;
+        ensure!(
+            known <= total,
+            "Anthropic cache TTL write breakdown exceeds cache_creation_input_tokens"
+        );
+        if reported_write_5m.is_some() && reported_write_1h.is_some() {
             ensure!(
-                five_minutes.checked_add(one_hour) == Some(total),
+                known == total,
                 "Anthropic cache TTL write breakdown does not sum to cache_creation_input_tokens"
             );
-            if policy.cache_write_1h == CacheCategoryPolicy::NotApplicable {
-                ensure!(
-                    one_hour == 0,
-                    "1h cache write is nonzero but configured not_applicable"
-                );
-            }
-            (
-                five_minutes,
+        }
+    }
+
+    let (cache_write, write_evidence, cache_write_1h, write_1h_evidence) = if details.is_some() {
+        let five_minutes = category(reported_write_5m, policy.cache_write, "5m cache write")?;
+        let one_hour = category(reported_write_1h, policy.cache_write_1h, "1h cache write")?;
+        let (Some((five_minutes, write_evidence)), Some((one_hour, write_1h_evidence))) =
+            (five_minutes, one_hour)
+        else {
+            return Ok(None);
+        };
+        let Some(total) = write_total else {
+            return Ok(None);
+        };
+        ensure!(
+            five_minutes.checked_add(one_hour) == Some(total),
+            "Anthropic cache TTL write breakdown does not sum to cache_creation_input_tokens"
+        );
+        (five_minutes, write_evidence, one_hour, write_1h_evidence)
+    } else {
+        match (policy.cache_write, policy.cache_write_1h, write_total) {
+            (CacheCategoryPolicy::Reported, CacheCategoryPolicy::NotApplicable, Some(total)) => (
+                total,
                 EvidenceKind::Reported,
-                one_hour,
-                if policy.cache_write_1h == CacheCategoryPolicy::Reported {
-                    EvidenceKind::Reported
-                } else {
-                    EvidenceKind::NotApplicable
-                },
-            )
+                0,
+                EvidenceKind::NotApplicable,
+            ),
+            (CacheCategoryPolicy::NotApplicable, CacheCategoryPolicy::Reported, Some(total)) => (
+                0,
+                EvidenceKind::NotApplicable,
+                total,
+                EvidenceKind::Reported,
+            ),
+            (CacheCategoryPolicy::NotApplicable, CacheCategoryPolicy::NotApplicable, total) => {
+                ensure!(
+                    total.unwrap_or(0) == 0,
+                    "cache write total is nonzero but all write buckets are not_applicable"
+                );
+                (
+                    0,
+                    EvidenceKind::NotApplicable,
+                    0,
+                    EvidenceKind::NotApplicable,
+                )
+            }
+            _ => return Ok(None),
         }
     };
     Ok(Some(NativeUsage {
@@ -483,6 +488,14 @@ mod tests {
     }
 
     #[test]
+    fn kiro_numeric_credit_preserves_the_json_lexeme() {
+        let raw: Value =
+            serde_json::from_str(r#"{"unit":"credit","usage":0.123456789012345678}"#).unwrap();
+        let usage = normalize_usage(UpstreamKind::Kiro, &raw).unwrap().unwrap();
+        assert_eq!(usage.credits.unwrap().to_string(), "0.123456789012345678");
+    }
+
+    #[test]
     fn missing_required_totals_are_unknown_but_complete_zero_is_known() {
         assert!(
             normalize_usage(UpstreamKind::OpenaiResponses, &json!({"input_tokens": 1}))
@@ -525,6 +538,35 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_not_applicable_buckets_still_validate_raw_ttl_breakdown() {
+        let policy = CacheUsagePolicy {
+            cache_read: CacheCategoryPolicy::Reported,
+            cache_write: CacheCategoryPolicy::NotApplicable,
+            cache_write_1h: CacheCategoryPolicy::NotApplicable,
+        };
+        let raw = json!({
+            "input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_creation": {"ephemeral_5m_input_tokens": 5, "ephemeral_1h_input_tokens": 0}
+        });
+        assert!(normalize_usage_with_policy(UpstreamKind::Anthropic, &raw, policy).is_err());
+    }
+
+    #[test]
+    fn anthropic_missing_reported_ttl_bucket_remains_unknown() {
+        let raw = json!({
+            "input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 8,
+            "cache_creation": {"ephemeral_5m_input_tokens": 8}
+        });
+        assert!(
+            normalize_usage(UpstreamKind::Anthropic, &raw)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn computes_each_bucket_exactly() {
         let prices = TokenPrices {
             currency: BillingUnit::Usd,
@@ -549,6 +591,33 @@ mod tests {
             raw: Value::Null,
         };
         assert_eq!(token_cost(&prices, &usage).unwrap().to_string(), "2.55");
+    }
+
+    #[test]
+    fn accumulated_token_cost_overflow_is_rejected() {
+        let prices = TokenPrices {
+            currency: BillingUnit::Usd,
+            input: "100000000000000000000".parse().unwrap(),
+            output: "100000000000000000000".parse().unwrap(),
+            cache_read: Amount::ZERO,
+            cache_write: Amount::ZERO,
+            cache_write_1h: None,
+        };
+        let usage = NativeUsage {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 0,
+            cache_write: 0,
+            cache_write_1h: 0,
+            credits: None,
+            cache_evidence: CacheEvidence {
+                cache_read: EvidenceKind::Reported,
+                cache_write: EvidenceKind::Reported,
+                cache_write_1h: EvidenceKind::NotApplicable,
+            },
+            raw: Value::Null,
+        };
+        assert!(token_cost(&prices, &usage).is_err());
     }
 
     #[test]
