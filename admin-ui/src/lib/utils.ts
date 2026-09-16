@@ -152,6 +152,14 @@ export function formatCredits(value: number | null | undefined): string {
   return value.toFixed(3)
 }
 
+/** Kiro 账户额度：保留两位小数和负余额，不换算货币或使用紧凑计费量格式。 */
+export function formatKiroCredits(value: number): string {
+  return `${value.toLocaleString('zh-CN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })} 积分`
+}
+
 /**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */
@@ -324,4 +332,3 @@ export function generateApiKey(prefix: string = 'sk-kiro-', randomLen: number = 
   }
   return prefix + out
 }
-

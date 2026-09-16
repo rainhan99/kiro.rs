@@ -334,6 +334,8 @@ Admin API 鉴权同样支持：
 <a id="configuration"></a>
 ## ⚙️ 配置
 
+长度治理、原文按需读取、图片保真、缓存构造与真实用量举证见 [请求管线说明](docs/request-pipeline.md)；可用 [配置示例](config.pipeline.example.json) 和 `--check-config` / `--inspect-request` 离线检查，不需要调用 Kiro。
+
 默认配置文件名是 `config.json`。首次启动如果文件不存在，会自动生成最小配置。
 
 ### 最小配置

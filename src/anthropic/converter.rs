@@ -71,9 +71,17 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
                 .into_iter()
                 .map(|(k, v)| (k, normalize_property_schema(v)))
                 .collect();
-            obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(normalized),
+            );
         }
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -90,7 +98,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -122,7 +135,12 @@ fn strip_top_level_combinators(obj: &mut serde_json::Map<String, serde_json::Val
             if m.get("type").and_then(|v| v.as_str()) != Some("object") {
                 continue;
             }
-            for key in &["properties", "required", "additionalProperties", "description"] {
+            for key in &[
+                "properties",
+                "required",
+                "additionalProperties",
+                "description",
+            ] {
                 if let Some(val) = m.get(*key) {
                     obj.entry(key.to_string()).or_insert_with(|| val.clone());
                 }
@@ -146,10 +164,18 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     obj.remove("$schema");
 
     // exclusiveMinimum/exclusiveMaximum：Draft 2019-09+ 为数字，Draft 07 为 bool；移除数字形式
-    if obj.get("exclusiveMinimum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMinimum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMinimum");
     }
-    if obj.get("exclusiveMaximum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMaximum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMaximum");
     }
 
@@ -168,7 +194,10 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
             .into_iter()
             .map(|(k, v)| (k, normalize_property_schema(v)))
             .collect();
-        obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+        obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(normalized),
+        );
     }
 
     // 递归处理 items（数组元素 schema）
@@ -378,8 +407,8 @@ fn native_reasoning_requested(req: &MessagesRequest, model_id: &str) -> bool {
 /// 由 Anthropic `thinking.budget_tokens` 推导 effort 档位。
 ///
 /// 当客户端只发标准 `thinking:{type:"enabled",budget_tokens:N}`、不带 `output_config`
-/// 时，用它把「思考预算」映射到 Kiro 的 effort。（本项目 budget_tokens 上限 24576，
-/// 故经此推导实际最高到 `high`；`xhigh` 仍需客户端显式 `output_config.effort`。）
+/// 时，用它把「思考预算」映射到 Kiro 的 effort。保留客户端的正整数预算，
+/// 超过 64000 时推导为 `xhigh`；显式 `output_config.effort` 始终优先。
 fn effort_from_budget_tokens(tokens: i32) -> &'static str {
     match tokens {
         i32::MIN..=4_000 => "low",
@@ -465,8 +494,7 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // it with `Invalid additionalModelRequestFields`, so map to the nearest
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::None
-        && !model_uses_gpt_reasoning_effort(model_id)
+    let normalized = if requested == EffortTier::None && !model_uses_gpt_reasoning_effort(model_id)
     {
         EffortTier::High
     } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
@@ -602,7 +630,7 @@ impl std::error::Error for ConversionError {}
 /// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
 ///
 /// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
+pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
         if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
@@ -681,9 +709,30 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     convert_request_with_mode(req, ToolCompatibilityMode::ClaudeCode)
 }
 
+#[cfg(test)]
 pub fn convert_request_with_mode(
     req: &MessagesRequest,
     tool_compatibility_mode: ToolCompatibilityMode,
+) -> Result<ConversionResult, ConversionError> {
+    convert_request_inner(req, tool_compatibility_mode, false)
+}
+
+pub fn convert_request_with_pipeline(
+    req: &MessagesRequest,
+    mode: ToolCompatibilityMode,
+    config: &crate::pipeline::config::PipelineConfig,
+) -> Result<ConversionResult, ConversionError> {
+    convert_request_inner(
+        req,
+        mode,
+        config.mode == crate::pipeline::config::PipelineMode::Enforce,
+    )
+}
+
+fn convert_request_inner(
+    req: &MessagesRequest,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    preserve: bool,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model).ok_or_else(|| {
@@ -732,11 +781,17 @@ pub fn convert_request_with_mode(
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, tool_results) =
+        process_message_content_dedup(&last_message.content, None, preserve)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?;
+    let mut tools = convert_tools_inner(
+        &req.tools,
+        &mut tool_name_map,
+        tool_compatibility_mode,
+        preserve,
+    )?;
 
     // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
     let mut known_tool_names: std::collections::HashSet<String> = req
@@ -757,6 +812,7 @@ pub fn convert_request_with_mode(
         &model_id,
         &mut tool_name_map,
         tool_compatibility_mode,
+        preserve,
     )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
@@ -815,10 +871,7 @@ pub fn convert_request_with_mode(
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
@@ -843,19 +896,13 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
 
-/// 处理消息内容，提取文本、图片和工具结果
-fn process_message_content(
-    content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
-    process_message_content_dedup(content, None)
-}
-
 /// Same as `process_message_content`, but when `dedup` is `Some` it deduplicates images by SHA256:
 /// the same image (identical base64) recurring across history is kept only on first sight and later replaced with placeholder text,
 /// avoiding the same screenshot being re-sent as base64 over multiple turns and burning tokens.
 fn process_message_content_dedup(
     content: &serde_json::Value,
     mut dedup: Option<&mut std::collections::HashSet<String>>,
+    preserve: bool,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -877,15 +924,19 @@ fn process_message_content_dedup(
                         "image" => {
                             if let Some(source) = block.source
                                 && let Some(placeholder) =
-                                    extract_kiro_image(&source, &mut dedup, &mut images)
+                                    extract_kiro_image(&source, &mut dedup, &mut images, preserve)
                             {
                                 text_parts.push(placeholder);
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content =
-                                    extract_tool_result_content(&block.content, &mut dedup, &mut images);
+                                let result_content = extract_tool_result_content(
+                                    &block.content,
+                                    &mut dedup,
+                                    &mut images,
+                                    preserve,
+                                );
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -933,8 +984,13 @@ fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
+    preserve: bool,
 ) -> Option<String> {
     let format = get_image_format(&source.media_type)?;
+    if preserve {
+        images.push(KiroImage::from_base64(format, source.data.clone()));
+        return None;
+    }
     // History dedup: an already-seen image omits its base64 and returns placeholder text
     if let Some(seen) = dedup.as_deref_mut() {
         let mut hasher = Sha256::new();
@@ -946,7 +1002,10 @@ fn extract_kiro_image(
     }
     let cfg = ResizeConfig::from_env();
     let processed = maybe_shrink_image(cfg, &format, &source.data);
-    images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+    images.push(KiroImage::from_base64(
+        processed.format,
+        processed.data_base64,
+    ));
     None
 }
 
@@ -959,6 +1018,7 @@ fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
+    preserve: bool,
 ) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -973,7 +1033,8 @@ fn extract_tool_result_content(
                     && let Some(source) = block.source
                 {
                     had_image = true;
-                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
+                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images, preserve)
+                    {
                         parts.push(placeholder);
                     }
                 }
@@ -1226,8 +1287,16 @@ fn map_tool_input_to_kiro(
         }
         ("Edit", "str_replace") => {
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
-            maybe_insert(&mut out, "oldStr", take_first(&obj, &["old_string", "oldStr"]));
-            maybe_insert(&mut out, "newStr", take_first(&obj, &["new_string", "newStr"]));
+            maybe_insert(
+                &mut out,
+                "oldStr",
+                take_first(&obj, &["old_string", "oldStr"]),
+            );
+            maybe_insert(
+                &mut out,
+                "newStr",
+                take_first(&obj, &["new_string", "newStr"]),
+            );
         }
         ("Bash", "execute_bash") => {
             maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
@@ -1318,11 +1387,19 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
     let mut out = serde_json::Map::new();
     match kiro_name {
         "fs_write" => {
-            maybe_insert(&mut out, "file_path", take_first(&obj, &["path", "file_path"]));
+            maybe_insert(
+                &mut out,
+                "file_path",
+                take_first(&obj, &["path", "file_path"]),
+            );
             maybe_insert(&mut out, "content", take_first(&obj, &["text", "content"]));
         }
         "str_replace" => {
-            maybe_insert(&mut out, "file_path", take_first(&obj, &["path", "file_path"]));
+            maybe_insert(
+                &mut out,
+                "file_path",
+                take_first(&obj, &["path", "file_path"]),
+            );
             maybe_insert(
                 &mut out,
                 "old_string",
@@ -1339,7 +1416,11 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         "read_file" => {
-            maybe_insert(&mut out, "file_path", take_first(&obj, &["path", "file_path"]));
+            maybe_insert(
+                &mut out,
+                "file_path",
+                take_first(&obj, &["path", "file_path"]),
+            );
             let start = obj.get("start_line").and_then(optional_number);
             let end = obj.get("end_line").and_then(optional_number);
             if let Some(start) = start {
@@ -1357,7 +1438,11 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
         }
         "grep_search" => {
             maybe_insert(&mut out, "pattern", take_first(&obj, &["query", "pattern"]));
-            maybe_insert(&mut out, "glob", take_first(&obj, &["includePattern", "glob"]));
+            maybe_insert(
+                &mut out,
+                "glob",
+                take_first(&obj, &["includePattern", "glob"]),
+            );
             maybe_insert(
                 &mut out,
                 "case_sensitive",
@@ -1506,10 +1591,20 @@ fn kiro_builtin_tool_schema(kiro_name: &str) -> Option<serde_json::Value> {
     })
 }
 
+#[cfg(test)]
 fn convert_tools(
     tools: &Option<Vec<super::types::Tool>>,
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
+) -> Result<Vec<Tool>, ConversionError> {
+    convert_tools_inner(tools, tool_name_map, mode, false)
+}
+
+fn convert_tools_inner(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+    mode: ToolCompatibilityMode,
+    preserve: bool,
 ) -> Result<Vec<Tool>, ConversionError> {
     let Some(tools) = tools else {
         return Ok(Vec::new());
@@ -1559,7 +1654,11 @@ fn convert_tools(
         };
 
         // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-        let description = match description.char_indices().nth(10000) {
+        let description = match if preserve {
+            None
+        } else {
+            description.char_indices().nth(10000)
+        } {
             Some((idx, _)) => description[..idx].to_string(),
             None => description,
         };
@@ -1623,7 +1722,14 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>, mode: ToolCompatibilityMode) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+    mode: ToolCompatibilityMode,
+    preserve: bool,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1693,7 +1799,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+                let merged_user =
+                    merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -1710,7 +1817,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -1726,6 +1833,7 @@ fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
     dedup: &mut std::collections::HashSet<String>,
+    preserve: bool,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
@@ -1733,7 +1841,7 @@ fn merge_user_messages(
 
     for msg in messages {
         let (text, images, tool_results) =
-            process_message_content_dedup(&msg.content, Some(dedup))?;
+            process_message_content_dedup(&msg.content, Some(dedup), preserve)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -1886,11 +1994,7 @@ mod tests {
                 .unwrap()
                 .contains("sonnet")
         );
-        assert!(
-            map_model("claude-sonnet-4-6")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
     }
 
     #[test]
@@ -2085,7 +2189,10 @@ mod tests {
     fn test_map_model_gpt_5_6_family() {
         // Kiro serves the GPT-5.6 family; ids pass through verbatim.
         assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
-        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(
+            map_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
         assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
         assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
     }
@@ -2375,7 +2482,10 @@ mod tests {
             "claude-fable-5",
             "claude-sonnet-5",
         ] {
-            assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
+            assert!(
+                model_supports_native_reasoning(m),
+                "{m} 应支持原生 reasoning"
+            );
         }
         for m in [
             "claude-sonnet-4.8",
@@ -2578,13 +2688,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -2638,7 +2753,10 @@ mod tests {
         assert_eq!(claude_code_tool_name_to_kiro("Glob"), Some("file_search"));
         assert_eq!(claude_code_tool_name_to_kiro("Grep"), Some("grep_search"));
         assert_eq!(claude_code_tool_name_to_kiro("LS"), Some("list_directory"));
-        assert_eq!(claude_code_tool_name_to_kiro("WebSearch"), Some("web_search"));
+        assert_eq!(
+            claude_code_tool_name_to_kiro("WebSearch"),
+            Some("web_search")
+        );
         assert_eq!(claude_code_tool_name_to_kiro("MyTool"), None);
     }
 
@@ -2732,7 +2850,10 @@ mod tests {
         assert_eq!(read["path"], serde_json::json!("/a"));
         assert_eq!(read["start_line"], serde_json::json!(10));
         assert_eq!(read["end_line"], serde_json::json!(14)); // 10 + 5 - 1
-        assert!(read.get("explanation").is_some(), "Read 缺省注入 explanation");
+        assert!(
+            read.get("explanation").is_some(),
+            "Read 缺省注入 explanation"
+        );
     }
 
     #[test]
@@ -2749,7 +2870,8 @@ mod tests {
     #[test]
     fn cc_raw_mode_input_passthrough() {
         let input = serde_json::json!({"file_path": "/a.txt", "content": "hi"});
-        let out = map_tool_input_to_kiro("Write", input.clone(), ToolCompatibilityMode::Raw).unwrap();
+        let out =
+            map_tool_input_to_kiro("Write", input.clone(), ToolCompatibilityMode::Raw).unwrap();
         assert_eq!(out, input, "Raw 模式入参原样透传");
     }
 
@@ -2817,15 +2939,22 @@ mod tests {
         };
         // convert_request 测试垫片默认 ClaudeCode 模式。
         let result = convert_request(&req).unwrap();
-        assert_eq!(result.tool_name_map.get("fs_write").map(|s| s.as_str()), Some("Write"));
-        assert_eq!(result.tool_name_map.get("read_file").map(|s| s.as_str()), Some("Read"));
+        assert_eq!(
+            result.tool_name_map.get("fs_write").map(|s| s.as_str()),
+            Some("Write")
+        );
+        assert_eq!(
+            result.tool_name_map.get("read_file").map(|s| s.as_str()),
+            Some("Read")
+        );
     }
 
     #[test]
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::BTreeMap::new();
@@ -2835,12 +2964,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -2869,8 +2996,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -2878,7 +3009,8 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -3079,9 +3211,20 @@ mod tests {
         // agentContinuationId 由 conversationId 确定性派生：同一会话两次转换必须相同，
         // 且保持 UUID 格式（上游按 36 字符 UUID 接受）。
         let again = convert_request(&req).unwrap();
-        let first_acid = result.conversation_state.agent_continuation_id.clone().unwrap();
-        let second_acid = again.conversation_state.agent_continuation_id.clone().unwrap();
-        assert_eq!(first_acid, second_acid, "同一会话的 agentContinuationId 必须稳定");
+        let first_acid = result
+            .conversation_state
+            .agent_continuation_id
+            .clone()
+            .unwrap();
+        let second_acid = again
+            .conversation_state
+            .agent_continuation_id
+            .clone()
+            .unwrap();
+        assert_eq!(
+            first_acid, second_acid,
+            "同一会话的 agentContinuationId 必须稳定"
+        );
         assert!(is_valid_uuid(&first_acid));
         assert_ne!(
             first_acid, result.conversation_state.conversation_id,
@@ -3344,7 +3487,9 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+                .expect("应该成功转换");
 
         // 验证 content 不为空（使用占位符）
         assert!(
@@ -3379,7 +3524,9 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+                .expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -3492,13 +3639,21 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("合并应成功");
+        let result =
+            merge_assistant_messages(&messages, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+                .expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -3549,7 +3704,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -3612,7 +3771,11 @@ mod tests {
         let msg = &result.conversation_state.current_message.user_input_message;
 
         // image is lifted to the top-level images
-        assert_eq!(msg.images.len(), 1, "image in tool_result should be lifted to top-level images");
+        assert_eq!(
+            msg.images.len(),
+            1,
+            "image in tool_result should be lifted to top-level images"
+        );
         assert_eq!(msg.images[0].format, "png");
         assert_eq!(msg.images[0].source.bytes, TINY_PNG_B64);
 
@@ -3665,7 +3828,10 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;
 
-        assert!(msg.images.is_empty(), "text-only tool_result should produce no top-level image");
+        assert!(
+            msg.images.is_empty(),
+            "text-only tool_result should produce no top-level image"
+        );
         let tr = &msg.user_input_message_context.tool_results;
         assert_eq!(tr.len(), 1);
         assert_eq!(

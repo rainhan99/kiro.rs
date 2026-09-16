@@ -23,8 +23,8 @@
 //! ```
 
 pub mod cache_metering;
-mod converter;
-mod handlers;
+pub(crate) mod converter;
+pub(crate) mod handlers;
 mod middleware;
 mod openai;
 mod responses;

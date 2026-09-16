@@ -6,6 +6,7 @@ import {
   PackageOpen,
   ShieldCheck,
   Tags,
+  GitBranch,
 } from 'lucide-react'
 import { PageHeader } from '@/components/console/page-header'
 import { Badge } from '@/components/ui/badge'
@@ -19,6 +20,7 @@ import { SystemSection } from '@/components/settings/system-section'
 import { SecuritySection } from '@/components/settings/security-section'
 import { MetadataSection } from '@/components/settings/metadata-section'
 import { ModelsSection } from '@/components/settings/models-section'
+import { RequestPipelineSection } from '@/components/settings/request-pipeline-section'
 
 /**
  * 设置页 —— 把此前散在三处的 7 个配置端点收拢到一处。
@@ -31,13 +33,14 @@ import { ModelsSection } from '@/components/settings/models-section'
  * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
  * 下拉菜单里塞数字输入框本来就不是它该干的事。
  */
-type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'system' | 'security'
+type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'system' | 'security' | 'pipeline'
 
 const SECTIONS: {
   key: SectionKey
   label: string
   icon: React.ReactNode
 }[] = [
+  { key: 'pipeline', label: '请求管线', icon: <GitBranch className="h-4 w-4" /> },
   {
     key: 'dispatch',
     label: '调度',
@@ -93,10 +96,10 @@ export function SettingsPage() {
         ]}
         icon={activeMeta.icon}
         title={`设置 · ${activeMeta.label}`}
-        description="所有改动即时生效并直接落盘写入 config.json，无需重启服务进程。"
+        description={active === 'pipeline' ? '请求管线配置保存到文件，服务重启后生效。当前运行值与已保存值分别展示。' : '本分区改动即时生效并写入配置文件，无需重启服务进程。'}
         badge={
           <Badge variant="outline" className="font-mono text-xs">
-            热重载就绪
+            {active === 'pipeline' ? '重启生效' : '热重载就绪'}
           </Badge>
         }
       />
@@ -131,6 +134,7 @@ export function SettingsPage() {
         <Card className="min-w-0 flex-1">
           <CardContent className="p-4 sm:p-5">
             {active === 'dispatch' && <DispatchSection />}
+            {active === 'pipeline' && <RequestPipelineSection />}
             {active === 'metadata' && <MetadataSection />}
             {active === 'models' && <ModelsSection />}
             {active === 'network' && <NetworkSection />}

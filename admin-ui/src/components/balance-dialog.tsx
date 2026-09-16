@@ -6,7 +6,7 @@ import {
 } from '@/components/ui/dialog'
 import { Progress } from '@/components/ui/progress'
 import { useCredentialBalance } from '@/hooks/use-credentials'
-import { parseError } from '@/lib/utils'
+import { formatKiroCredits, parseError } from '@/lib/utils'
 
 interface BalanceDialogProps {
   credentialId: number | null
@@ -20,20 +20,6 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
     return new Date(timestamp * 1000).toLocaleString('zh-CN')
-  }
-
-  const formatNumber = (num: number) => {
-    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  }
-
-  // 超额时 remaining 为负、usagePercentage > 100，给出带正负号的展示
-  const formatSigned = (num: number) => {
-    const abs = Math.abs(num)
-    const formatted = abs.toLocaleString('zh-CN', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })
-    return num < 0 ? `-$${formatted}` : `$${formatted}`
   }
 
   return (
@@ -82,8 +68,8 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             {/* 使用进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>已使用: {formatKiroCredits(balance.currentUsage)}</span>
+                <span>限额: {formatKiroCredits(balance.usageLimit)}</span>
               </div>
               <Progress value={balance.usagePercentage} />
               <div className="text-center text-sm text-muted-foreground">
@@ -106,7 +92,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
                       : 'text-green-600'
                   }`}
                 >
-                  {formatSigned(balance.remaining)}
+                  {formatKiroCredits(balance.remaining)}
                 </span>
               </div>
               <div>

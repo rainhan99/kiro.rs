@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getTraces, getFailureStats } from '@/api/traces'
+import { getTraces, getFailureStats, getTracePipelineEvidence } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -26,6 +26,16 @@ export function useFailureStats() {
     queryKey: ['traces', 'failure-stats'],
     queryFn: getFailureStats,
     refetchInterval: 30_000,
+    staleTime: 10_000,
+    refetchOnWindowFocus: false,
+  })
+}
+
+/** Mounted only while a trace is expanded; no background polling or upstream calls. */
+export function useTracePipelineEvidence(traceId: string) {
+  return useQuery({
+    queryKey: ['traces', traceId, 'pipeline'],
+    queryFn: () => getTracePipelineEvidence(traceId),
     staleTime: 10_000,
     refetchOnWindowFocus: false,
   })

@@ -22,6 +22,9 @@ mod middleware;
 pub mod proxy_pool;
 mod router;
 mod service;
+mod pipeline_config;
+#[cfg(test)]
+mod pipeline_config_tests;
 pub mod types;
 mod binary_update;
 pub mod client_keys;

@@ -6,6 +6,7 @@ mod http_client;
 mod image_resize;
 mod kiro;
 mod model;
+mod pipeline;
 pub mod token;
 
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ async fn main() {
 
     // 初始化日志
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -36,6 +38,16 @@ async fn main() {
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
+
+    // Offline commands exit before credential loading, generated config files,
+    // version/model warmers, Redis or any provider HTTP client is initialized.
+    if args.check_config || args.inspect_request.is_some() {
+        if let Err(error) = pipeline::inspect::run(&config_path, args.inspect_request.as_deref()) {
+            eprintln!("{error:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
@@ -99,7 +111,8 @@ async fn main() {
         .filter(|url| !url.trim().is_empty())
         .map(|url| {
             let mut proxy = http_client::ProxyConfig::new(url);
-            if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password)
+            if let (Some(username), Some(password)) =
+                (&config.proxy_username, &config.proxy_password)
             {
                 proxy = proxy.with_auth(username, password);
             }
@@ -262,10 +275,11 @@ async fn main() {
 
     // CacheMeter：本地计量模拟，支持可选 Redis 共享元数据层；不承载真实 KV Cache。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_metering_enabled = config
-        .cache_metering_enabled
-        .or_else(anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
-        .unwrap_or(true);
+    let cache_metering_enabled = config.request_pipeline.allow_simulated_cache
+        && config
+            .cache_metering_enabled
+            .or_else(anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
+            .unwrap_or(false);
     let cache_meter = std::sync::Arc::new(
         anthropic::cache_metering::CacheMeter::from_env(Some(
             cache_dir.join("cache_metering.json"),
@@ -275,9 +289,11 @@ async fn main() {
     );
     cache_meter.clone().spawn_background();
     if !cache_metering_enabled {
-        tracing::info!("本地 prompt cache 计量模拟已关闭，usage 将全量计入 input_tokens");
+        tracing::info!(
+            "模拟缓存计量已关闭；缓存证据仅使用 Kiro 原生 metadataEvent.tokenUsage，缺失时为未知"
+        );
     } else {
-        tracing::info!("本地 prompt cache 计量模拟已开启，按真实命中量上报 usage");
+        tracing::warn!("本地 prompt cache 模拟计量已显式开启；这些估算不是 Kiro 缓存命中证据");
     }
 
     // 会话粘性路由：绑定表过期条目定期清理（lookup 只顺手清自己命中的那条）
@@ -368,9 +384,7 @@ async fn main() {
                 .nest("/admin", admin_ui_app)
                 .route(
                     "/admin/",
-                    axum::routing::get(|| async {
-                        axum::response::Redirect::temporary("/admin")
-                    }),
+                    axum::routing::get(|| async { axum::response::Redirect::temporary("/admin") }),
                 )
         }
     } else {

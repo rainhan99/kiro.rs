@@ -25,6 +25,7 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
+import { TracePipelinePanel } from '@/components/trace-pipeline-panel'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { useUrlState } from '@/hooks/use-url-state'
@@ -345,18 +346,18 @@ function UsageSourceBadge({ source }: { source?: UsageSource | null }) {
   if (!source) return null
   const map: Record<UsageSource, { label: string; title: string; cls: string }> = {
     provider: {
-      label: '上游真值',
-      title: 'token / cache 三项来自 Kiro metadataEvent.tokenUsage，精确',
+      label: '上游报告',
+      title: '汇总记录标记为上游用量；逐轮完整原生快照见独立证据面板',
       cls: 'border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400',
     },
     simulated: {
       label: '本地估算',
-      title: '上游未下发精确用量；按客户端 cache_control 断点在本地模拟缓存命中，反映的是「前缀是否稳定」而非上游真实缓存',
+      title: '本地模拟估算，不能证明上游读取或写入缓存',
       cls: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
     },
     none: {
-      label: '无断点',
-      title: '请求未声明 cache_control 断点或计量已关闭，全量计入输入',
+      label: '未验证',
+      title: '未保存完整上游用量或计量关闭；缓存值为零不代表上游未命中',
       cls: 'border-border/60 text-muted-foreground',
     },
   }
@@ -441,9 +442,10 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
       : null
 
   const titleText = [
+    rec.usageSource === 'simulated' ? '本地估算；上游缓存效果未验证' : '汇总用量；原生证据见展开详情',
     `未缓存输入: ${formatTokenFull(input)}`,
     `缓存写入: ${formatTokenFull(cacheCreation)}`,
-    `缓存读取: ${formatTokenFull(cacheRead)}${hitRatio != null ? `（命中率 ${hitRatio}%）` : ''}`,
+    `缓存读取: ${formatTokenFull(cacheRead)}${hitRatio != null ? `（占比 ${hitRatio}%）` : ''}`,
     `输出: ${formatTokenFull(output)}`,
     `总计: ${formatTokenFull(total)}`,
   ].join('\n')
@@ -566,16 +568,10 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
     <div className="rounded-lg border border-border/60 bg-card/60 p-3.5 space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2">
         <div className="flex items-center gap-2">
-          <span className="text-[13px] font-semibold tracking-tight">Token 与缓存构成</span>
-          {cacheRead > 0 ? (
-            <Badge variant="success" className="text-[11px] h-5 gap-1">
-              <span>命中率 {hitRatio}%</span>
-            </Badge>
-          ) : (
-            <Badge variant="outline" className="text-[11px] h-5 text-muted-foreground">
-              未命中缓存
-            </Badge>
-          )}
+          <span className="text-[13px] font-semibold tracking-tight">Token 汇总记录</span>
+          <Badge variant="outline" className="text-[11px] h-5 text-muted-foreground">
+            {rec.usageSource === 'simulated' ? '本地估算 · 缓存效果未验证' : '原生证据见上方面板'}
+          </Badge>
           <UsageSourceBadge source={rec.usageSource} />
         </div>
         <div className="text-[11px] text-muted-foreground font-mono">
@@ -612,7 +608,7 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
           <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-muted-foreground pt-0.5">
             <span className="inline-flex items-center gap-1">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 inline-block" />
-              缓存读取 (命中): {formatTokenFull(cacheRead)} ({readPct.toFixed(1)}%)
+              缓存读取: {formatTokenFull(cacheRead)} ({readPct.toFixed(1)}%)
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="h-1.5 w-1.5 rounded-full bg-amber-500 inline-block" />
@@ -633,16 +629,16 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
           <div className="font-mono text-[14px] font-semibold tabular-nums text-foreground">
             {formatTokenFull(promptTotal)}
           </div>
-          <div className="text-[10px] text-muted-foreground/80">含缓存命中总量</div>
+          <div className="text-[10px] text-muted-foreground/80">含缓存读取与写入</div>
         </div>
 
         <div className={`rounded-md p-2 ${cacheRead > 0 ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-secondary/40'}`}>
-          <div className="text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">缓存读取 (命中)</div>
+          <div className="text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">缓存读取</div>
           <div className="font-mono text-[14px] font-semibold tabular-nums text-emerald-700 dark:text-emerald-300">
             {formatTokenFull(cacheRead)}
           </div>
           <div className="text-[10px] text-muted-foreground/80">
-            {cacheRead > 0 ? `占比 ${hitRatio}% (省钱)` : '0 (无命中)'}
+            {cacheRead > 0 ? `记录占比 ${hitRatio}%` : '记录值；原生用量可能缺失'}
           </div>
         </div>
 
@@ -651,7 +647,7 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
           <div className="font-mono text-[14px] font-semibold tabular-nums text-amber-700 dark:text-amber-300">
             {formatTokenFull(cacheCreation)}
           </div>
-          <div className="text-[10px] text-muted-foreground/80">初次断点写入</div>
+          <div className="text-[10px] text-muted-foreground/80">汇总记录的缓存创建量</div>
         </div>
 
         <div className="rounded-md bg-secondary/40 p-2">
@@ -659,7 +655,7 @@ function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
           <div className="font-mono text-[14px] font-semibold tabular-nums text-foreground">
             {formatTokenFull(freshInput)}
           </div>
-          <div className="text-[10px] text-muted-foreground/80">全价计费部分</div>
+          <div className="text-[10px] text-muted-foreground/80">汇总记录的常规输入量</div>
         </div>
 
         <div className="rounded-md bg-secondary/40 p-2">
@@ -787,6 +783,7 @@ function TraceExpandedDetail({
       </div>
 
       {/* 核心：Token 与缓存构成面板 */}
+      <TracePipelinePanel traceId={rec.traceId} />
       <TokenAndCachePanel rec={rec} />
 
       {/* 报错信息（若存在） */}

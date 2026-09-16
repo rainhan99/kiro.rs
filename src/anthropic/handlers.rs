@@ -32,7 +32,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{ConversionError, convert_request_with_pipeline};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -126,6 +126,7 @@ impl UsageRecordHook {
 ///
 /// `store` 为 None（未启用 Admin / trace）时所有方法都是空操作，零开销。
 pub(crate) struct RequestTracer {
+    pipeline_evidence: parking_lot::Mutex<Vec<(&'static str, serde_json::Value)>>,
     store: Option<SharedTraceStore>,
     trace_id: String,
     ts: String,
@@ -168,7 +169,10 @@ impl UsageSource {
     }
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
-    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
+    pub fn resolve(
+        has_provider_usage: bool,
+        cache_usage: &super::cache_metering::CacheUsage,
+    ) -> Self {
         if has_provider_usage {
             Self::Provider
         } else if cache_usage.cache_covered_est > 0 {
@@ -206,6 +210,7 @@ struct RequestTraceOptions {
 impl RequestTracer {
     fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
+            pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
             ts: Utc::now().to_rfc3339(),
@@ -278,10 +283,43 @@ impl RequestTracer {
             attempts,
         };
         store.insert(&rec);
+        let mut evidence = self.pipeline_evidence.lock();
+        // Direct one-round handlers already resolve these four fields exclusively
+        // from metadataEvent. Internal loops report individual rounds themselves.
+        if usage.source == UsageSource::Provider
+            && !evidence.iter().any(|(kind, _)| *kind == "native_usage")
+        {
+            evidence.push((
+                "native_usage",
+                json!({
+                    "uncachedInputTokens": usage.input_tokens,
+                    "outputTokens": usage.output_tokens,
+                    "cacheReadInputTokens": usage.cache_read_tokens,
+                    "cacheWriteInputTokens": usage.cache_creation_tokens
+                }),
+            ));
+        }
+        for (kind, value) in evidence.drain(..) {
+            if let Err(error) = store.record_pipeline_evidence(&self.trace_id, kind, &value) {
+                tracing::warn!(%error, "could not persist redacted pipeline evidence");
+            }
+        }
     }
 }
 
 impl TraceSink for RequestTracer {
+    fn on_wire_audit(&self, audit: serde_json::Value) {
+        let mut evidence = self.pipeline_evidence.lock();
+        if evidence.len() < 255 {
+            evidence.push(("wire_audit", audit));
+        }
+    }
+    fn on_native_usage(&self, usage: TokenUsage) {
+        let mut evidence = self.pipeline_evidence.lock();
+        if evidence.len() < 255 {
+            evidence.push(("native_usage", serde_json::to_value(usage).unwrap()));
+        }
+    }
     fn on_attempt(&self, mut attempt: TraceAttempt) {
         let mut attempts = self.attempts.lock();
         // Each provider call numbers retries from zero. A web-search request can make
@@ -393,14 +431,25 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 
     let err_str = err.to_string();
 
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
+    if err
+        .downcast_ref::<crate::pipeline::LocalPayloadLimit>()
+        .is_some()
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse::new("local_payload_limit", err_str)),
+        )
+            .into_response();
+    }
+
+    // This undocumented error does not identify body, field or token-window limits.
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        tracing::warn!("Kiro input length threshold rejection; no retry or model downgrade");
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
+                "Kiro rejected input length (CONTENT_LENGTH_EXCEEDS_THRESHOLD). The upstream did not specify whether the limit concerns total body, a text/tool-result/image field, or model context. Inspect pipeline evidence; this request was not retried, truncated or downgraded.",
             )),
         )
             .into_response();
@@ -710,6 +759,58 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    let context = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
+        Ok(context) => context,
+        Err(error) => {
+            let tracer = RequestTracer::new(
+                &state,
+                RequestTraceOptions {
+                    key_ctx: key_ctx.clone(),
+                    model: payload.model.clone(),
+                    is_stream: payload.stream,
+                },
+            );
+            tracer.finalize(
+                "error",
+                Some("pipeline_preparation"),
+                Some(&error.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "pipeline_preparation_error",
+                    error.to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    if let Some(context) = context {
+        let stream = payload.stream;
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: stream,
+            },
+        ));
+        return super::websearch_loop::run_context_loop(
+            provider,
+            payload,
+            hook,
+            tracer,
+            stream,
+            key_ctx.group.clone(),
+            state.tool_compatibility_mode,
+            context,
+        )
+        .await;
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -767,8 +868,11 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
+    let conversion_result = match convert_request_with_pipeline(
+        &payload,
+        state.tool_compatibility_mode,
+        &provider.pipeline().config,
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -801,7 +905,11 @@ pub async fn post_messages(
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    let request_body = match crate::pipeline::serialize_request(
+        &payload,
+        &kiro_request,
+        &provider.pipeline().config,
+    ) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -817,7 +925,10 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        body_bytes = request_body.len(),
+        "Kiro request prepared (content redacted)"
+    );
 
     // 估算输入 tokens
     let total_input_tokens = token::count_all_tokens(
@@ -839,7 +950,11 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = match state.cache_meter.as_ref() {
+    let cache_usage = match state
+        .cache_meter
+        .as_ref()
+        .filter(|_| provider.pipeline().config.allow_simulated_cache)
+    {
         Some(cache) => {
             super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
         }
@@ -1607,10 +1722,10 @@ fn build_non_stream_content(
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+/// - 仅在客户端未提供 thinking 时补默认值；绝不覆盖显式预算/effort。
+pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    if !model_lower.contains("thinking") || payload.thinking.is_some() {
         return;
     }
 
@@ -1630,7 +1745,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if is_opus_4_6 && payload.output_config.is_none() {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -1705,6 +1820,58 @@ pub async fn post_messages_cc(
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
+
+    let context = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
+        Ok(context) => context,
+        Err(error) => {
+            let tracer = RequestTracer::new(
+                &state,
+                RequestTraceOptions {
+                    key_ctx: key_ctx.clone(),
+                    model: payload.model.clone(),
+                    is_stream: payload.stream,
+                },
+            );
+            tracer.finalize(
+                "error",
+                Some("pipeline_preparation"),
+                Some(&error.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "pipeline_preparation_error",
+                    error.to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    if let Some(context) = context {
+        let stream = payload.stream;
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: stream,
+            },
+        ));
+        return super::websearch_loop::run_context_loop(
+            provider,
+            payload,
+            hook,
+            tracer,
+            stream,
+            key_ctx.group.clone(),
+            state.tool_compatibility_mode,
+            context,
+        )
+        .await;
+    }
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
@@ -1760,8 +1927,11 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
+    let conversion_result = match convert_request_with_pipeline(
+        &payload,
+        state.tool_compatibility_mode,
+        &provider.pipeline().config,
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1794,7 +1964,11 @@ pub async fn post_messages_cc(
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    let request_body = match crate::pipeline::serialize_request(
+        &payload,
+        &kiro_request,
+        &provider.pipeline().config,
+    ) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -1810,7 +1984,10 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        body_bytes = request_body.len(),
+        "Kiro request prepared (content redacted)"
+    );
 
     // 计算总 input tokens
     let total_input_tokens = token::count_all_tokens(
@@ -1831,7 +2008,11 @@ pub async fn post_messages_cc(
     let known_tool_names = conversion_result.known_tool_names;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = match state.cache_meter.as_ref() {
+    let cache_usage = match state
+        .cache_meter
+        .as_ref()
+        .filter(|_| provider.pipeline().config.allow_simulated_cache)
+    {
         Some(cache) => {
             super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
         }
@@ -2147,6 +2328,7 @@ mod tests {
 
         let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
         let tracer = RequestTracer {
+            pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             store: Some(store.clone()),
             trace_id: "gpt-websearch-trace".to_string(),
             ts: Utc::now().to_rfc3339(),
@@ -2218,6 +2400,7 @@ mod tests {
     #[test]
     fn tracer_only_marks_first_token_for_streaming_requests() {
         let mut tracer = RequestTracer {
+            pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             store: None,
             trace_id: "first-token-trace".to_string(),
             ts: Utc::now().to_rfc3339(),
@@ -2251,6 +2434,7 @@ mod tests {
         let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
         let tracer = RequestTracer {
             store: Some(store.clone()),
+            pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             trace_id: "mcp-failure-trace".to_string(),
             ts: Utc::now().to_rfc3339(),
             key_id: 0,

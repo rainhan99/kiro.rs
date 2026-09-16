@@ -60,9 +60,6 @@ pub struct ModelsResponse {
 
 // === Messages 端点类型 ===
 
-/// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 24576;
-
 /// Thinking 配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct Thinking {
@@ -90,7 +87,14 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = i32::deserialize(deserializer)?;
-    Ok(value.min(MAX_BUDGET_TOKENS))
+    if value < 1 {
+        return Err(serde::de::Error::custom(
+            "thinking.budget_tokens must be positive",
+        ));
+    }
+    // Preserve the requested budget; unsupported values must fail explicitly,
+    // not silently reduce reasoning capability at deserialization time.
+    Ok(value)
 }
 
 /// OutputConfig 配置

@@ -71,6 +71,9 @@ pub struct CustomModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    /// Request normalization, local budgets, context artifacts and native audit.
+    #[serde(default)]
+    pub request_pipeline: crate::pipeline::config::PipelineConfig,
     #[serde(default = "default_host")]
     pub host: String,
 
@@ -170,8 +173,8 @@ pub struct Config {
     ///
     /// 开启后同一 `conversationId` 的后续轮次优先沿用上一轮成功的凭据；该凭据不可用
     /// （禁用 / 冷却 / RPM 打满 / 不支持模型 / 不在分组）时才回落到 `load_balancing_mode`。
-    /// 注意：Kiro 上游 prompt cache 按 profile 隔离而非按账号，同 profile 的账号之间换号
-    /// 不会丢缓存；粘性主要在多 profile 部署下保住缓存，单 profile 下作用是会话可追溯。
+    /// 缓存隔离边界不能从账号/profile 相同推断；用原生 cacheReadInputTokens
+    /// 和 pipeline 指纹在正常业务流量中观察，不因换号就假定共享或失效。
     /// 注意：粘性优先于 priority 模式的「高优先级恢复后立即回切」，代价是
     /// 会话在 TTL 内不会主动迁回高优先级凭据。
     #[serde(default = "default_session_affinity_enabled")]
@@ -418,6 +421,7 @@ fn default_usage_log_retention_days() -> u32 {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            request_pipeline: crate::pipeline::config::PipelineConfig::default(),
             host: default_host(),
             port: default_port(),
             region: default_region(),
@@ -507,7 +511,28 @@ impl Config {
             config.update_auto_apply_time = default_update_auto_apply_time();
         }
 
+        config.validate()?;
+
         Ok(config)
+    }
+
+    /// Shared startup/admin-save validation. Validation never changes runtime state.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.request_pipeline.validate()?;
+        anyhow::ensure!(
+            matches!(self.default_endpoint.as_str(), "ide" | "cli"),
+            "defaultEndpoint must be ide or cli"
+        );
+        anyhow::ensure!(
+            !self.request_pipeline.kiro_only
+                || self
+                    .count_tokens_api_url
+                    .as_deref()
+                    .is_none_or(|url| url.trim().is_empty()),
+            "requestPipeline.kiroOnly forbids an external countTokensApiUrl; remove it or explicitly disable kiroOnly"
+        );
+
+        Ok(())
     }
 
     /// 获取配置文件路径（如果有）

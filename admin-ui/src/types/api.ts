@@ -632,6 +632,26 @@ export interface TraceRecord {
 export type StickyOutcome = 'hit' | 'miss_first' | 'miss_unavailable' | 'off'
 export type UsageSource = 'provider' | 'simulated' | 'none'
 
+/** One complete final native snapshot from a provider round. */
+export interface NativeTokenUsage {
+  uncachedInputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheWriteInputTokens: number
+}
+
+export interface TracePipelineEvidence {
+  traceId: string
+  evidence: { kind: string; evidence: unknown }[]
+  summary: {
+    nativeSampleCount: number
+    nativeCacheReadInputTokens: number | null
+    nativeCacheWriteInputTokens: number | null
+    /** Unknown unless every provider round is independently accounted for. */
+    allSamplesNative: boolean | null
+  }
+}
+
 /** 链路查询参数 */
 export interface TraceQuery {
   status?: string

@@ -22,17 +22,14 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, ModelTestRequest,
-        CredentialMetadataSchemaConfig,
-        SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
-        SetGlobalProxyRequest,
-        SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest,
+        CreateClientKeyResponse, CredentialMetadataSchemaConfig, ModelTestRequest,
+        SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
+        SetCacheMeteringConfigRequest, SetCustomModelsRequest, SetDisabledRequest,
+        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetPriorityRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
-        SetCustomModelsRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -48,9 +45,7 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
 }
 
 /// GET /api/admin/config/credential-metadata-schema
-pub async fn get_credential_metadata_schema(
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+pub async fn get_credential_metadata_schema(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_credential_metadata_schema())
 }
 
@@ -761,10 +756,11 @@ pub async fn set_global_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<SetGlobalProxyRequest>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .set_global_proxy(payload.proxy_url, payload.proxy_username, payload.proxy_password)
-    {
+    match state.service.set_global_proxy(
+        payload.proxy_url,
+        payload.proxy_username,
+        payload.proxy_password,
+    ) {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1439,7 +1435,9 @@ pub async fn stats_by_key(
     };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let data = state.usage_aggregator.query_by_key(window, cred_ids.as_ref());
+    let data = state
+        .usage_aggregator
+        .query_by_key(window, cred_ids.as_ref());
     // Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
     let key_name_map: HashMap<u64, String> = state
         .client_keys
@@ -1642,6 +1640,72 @@ pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoRe
         })
         .collect();
     Json(map)
+}
+
+/// GET /api/admin/traces/{trace_id}/pipeline
+/// Only retained native snapshots contribute cache counters. Missing coverage stays unknown.
+pub async fn trace_pipeline_evidence(
+    State(state): State<AdminState>,
+    Path(trace_id): Path<String>,
+) -> Response {
+    if trace_id.is_empty() || trace_id.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "invalid trace identifier",
+            )),
+        )
+            .into_response();
+    }
+    match state.trace_store.pipeline_evidence(&trace_id) {
+        Ok(evidence) => {
+            let summary = super::trace_db::native_usage_summary(&evidence);
+            Json(serde_json::json!({
+                "traceId": trace_id,
+                "evidence": evidence,
+                "summary": summary,
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            tracing::warn!("pipeline evidence query failed: {}", error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(
+                    "pipeline evidence unavailable",
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/admin/request-pipeline — saved/effective config; no runtime mutation.
+pub async fn get_request_pipeline(State(state): State<AdminState>) -> Response {
+    match super::pipeline_config::get(state.service.token_manager()) {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// PUT /api/admin/request-pipeline — persist after validation; restart to apply.
+pub async fn set_request_pipeline(
+    State(state): State<AdminState>,
+    payload: Result<Json<super::pipeline_config::Update>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let update = match payload {
+        Ok(Json(update)) => update,
+        Err(_) => {
+            return super::pipeline_config::SettingsError::Invalid(
+                "请求配置格式无效；请检查 JSON 字段名称、类型和整数范围。".into(),
+            )
+            .into_response();
+        }
+    };
+    match super::pipeline_config::save(state.service.token_manager(), update) {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 // ============ 账号分组（独立实体）============

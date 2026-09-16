@@ -3,7 +3,7 @@
 //! Kiro 在 `metadataEvent.tokenUsage` 中返回本次模型调用的精确 token 用量。
 //! 四个字段是单次调用的最终快照，不是增量事件；调用方应在同一条流内保留最后一份快照。
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::kiro::parser::error::ParseResult;
 use crate::kiro::parser::frame::Frame;
@@ -11,21 +11,39 @@ use crate::kiro::parser::frame::Frame;
 use super::base::EventPayload;
 
 /// 单次 Kiro 模型调用的精确 token 用量。
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     /// 未命中缓存、也未写入缓存的输入 token。
-    #[serde(default)]
+    #[serde(deserialize_with = "nonnegative_counter")]
     pub uncached_input_tokens: i32,
     /// 模型输出 token。
-    #[serde(default)]
+    #[serde(deserialize_with = "nonnegative_counter")]
     pub output_tokens: i32,
     /// 从服务端 prompt cache 读取的输入 token。
-    #[serde(default)]
+    #[serde(deserialize_with = "nonnegative_counter")]
     pub cache_read_input_tokens: i32,
     /// 本次写入服务端 prompt cache 的输入 token。
-    #[serde(default)]
+    #[serde(deserialize_with = "nonnegative_counter")]
     pub cache_write_input_tokens: i32,
+}
+
+fn nonnegative_counter<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i32, D::Error> {
+    let counter = i32::deserialize(deserializer)?;
+    if counter < 0 {
+        return Err(serde::de::Error::custom(
+            "native token counter must be nonnegative",
+        ));
+    }
+    Ok(counter)
+}
+
+/// Incomplete usage must not reject the surrounding metadata event or become zero truth.
+fn optional_native_usage<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TokenUsage>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 impl TokenUsage {
@@ -73,7 +91,7 @@ impl TokenUsage {
 #[serde(rename_all = "camelCase")]
 pub struct MetadataEvent {
     /// 有些 metadataEvent 只携带 stopReason，因此 tokenUsage 必须保持可选。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_native_usage")]
     pub token_usage: Option<TokenUsage>,
 }
 
@@ -117,19 +135,91 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_with_missing_fields_defaults_only_missing_fields_to_zero() {
-        let event: MetadataEvent =
-            serde_json::from_str(r#"{"tokenUsage":{"outputTokens":9}}"#).unwrap();
+    fn incomplete_native_snapshots_remain_unknown() {
+        let complete = serde_json::json!({
+            "uncachedInputTokens": 0,
+            "outputTokens": 9,
+            "cacheReadInputTokens": 0,
+            "cacheWriteInputTokens": 0,
+        });
+        for missing in [
+            "uncachedInputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheWriteInputTokens",
+        ] {
+            let mut usage = complete.clone();
+            usage.as_object_mut().unwrap().remove(missing);
+            let event: MetadataEvent = serde_json::from_value(serde_json::json!({
+                "tokenUsage": usage,
+                "stopReason": "end_turn",
+            }))
+            .unwrap();
+            assert!(event.token_usage.is_none(), "missing {missing} is unknown");
+        }
+    }
 
-        assert_eq!(
-            event.token_usage,
-            Some(TokenUsage {
-                uncached_input_tokens: 0,
-                output_tokens: 9,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-            })
-        );
+    #[test]
+    fn malformed_native_counters_do_not_discard_the_metadata_event() {
+        for field in [
+            "uncachedInputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheWriteInputTokens",
+        ] {
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(null),
+                serde_json::json!("7"),
+                serde_json::json!(1.5),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::json!(2_147_483_648_u64),
+            ] {
+                let mut usage = serde_json::json!({
+                    "uncachedInputTokens": 1,
+                    "outputTokens": 9,
+                    "cacheReadInputTokens": 3,
+                    "cacheWriteInputTokens": 2,
+                });
+                usage[field] = invalid;
+                let event: MetadataEvent = serde_json::from_value(serde_json::json!({
+                    "tokenUsage": usage,
+                    "stopReason": "end_turn",
+                }))
+                .unwrap();
+                assert!(event.token_usage.is_none(), "malformed {field} is unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_malformed_usage_is_unknown_but_complete_zero_usage_is_native() {
+        for usage in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(0),
+            serde_json::json!("unavailable"),
+        ] {
+            let event: MetadataEvent = serde_json::from_value(serde_json::json!({
+                "tokenUsage": usage,
+                "stopReason": "end_turn",
+            }))
+            .unwrap();
+            assert!(event.token_usage.is_none());
+        }
+        let event: MetadataEvent = serde_json::from_value(serde_json::json!({
+            "tokenUsage": {
+                "uncachedInputTokens": 0,
+                "outputTokens": 0,
+                "cacheReadInputTokens": 0,
+                "cacheWriteInputTokens": 0,
+            },
+        }))
+        .unwrap();
+        assert_eq!(event.token_usage, Some(TokenUsage::default()));
     }
 
     #[test]

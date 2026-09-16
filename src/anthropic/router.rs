@@ -84,6 +84,10 @@ pub fn create_router_with_shared_provider(
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
+    let max_body_size = kiro_provider
+        .as_ref()
+        .map(|p| p.pipeline().config.ingress_max_bytes)
+        .unwrap_or(MAX_BODY_SIZE);
     if let Some(provider) = kiro_provider {
         state = state.with_shared_kiro_provider(provider);
     }
@@ -117,6 +121,6 @@ pub fn create_router_with_shared_provider(
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
-        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(DefaultBodyLimit::max(max_body_size))
         .with_state(state)
 }

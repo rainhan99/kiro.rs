@@ -1,11 +1,9 @@
-//! web_search local agentic loop
+//! Local web-search and private context-retrieval agentic loop.
 //!
-//! Handles the case "after mixed tools (web_search + exec...) fall onto the normal chat path, the upstream returns a tool_use with name=web_search":
-//! kiro-rs internally calls /mcp to search -> feeds the results back as a tool_result -> reconverts and resends -> loops until the upstream stops asking to search;
-//! tool_use calls other than web_search (exec, etc.) are returned to the client as usual: they do not enter the loop and are not swallowed.
-//!
-//! Reuses: converter::convert_request (feedback), provider.call_api_stream, EventStreamDecoder,
-//! websearch::{create_mcp_request, call_mcp_api, parse_search_results, generate_search_summary}。
+//! Server-only rounds execute web search or scoped artifact retrieval, append
+//! paired history, and reconvert through the configured request pipeline.
+//! Client tools terminate the local loop and are returned once. Private calls
+//! remain local, while web search uses Anthropic server-tool presentation.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -27,19 +25,20 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::admin::trace_db::outcome;
+use crate::admin::trace_db::{TraceSink, outcome};
 use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
+use crate::pipeline::artifacts::{ContextSession, is_internal_tool};
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_pipeline, get_context_window_size};
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
     map_provider_error,
 };
-use super::stream::{CompletedToolUse, SseEvent};
+use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator, ToolJsonAccumulatorError};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 use crate::model::config::ToolCompatibilityMode;
@@ -92,9 +91,11 @@ struct RoundOutcome {
     last_metering: Option<MeteringEvent>,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
-    /// Upstream body-read error, if any. Content decoded before this error is
-    /// partial and must not be treated as a successful round.
+    /// Upstream read or tool-JSON error. This round cannot execute or forward
+    /// any tool calls, including successfully decoded calls in a mixed round.
     stream_error: Option<String>,
+    /// Preserve the strict accumulator's structured error classification.
+    tool_json_error: Option<ToolJsonAccumulatorError>,
     /// Tool names declared to the upstream this round (original + shortened),
     /// taken from `ConversionResult::known_tool_names`. Used by the shared
     /// `<invoke>` text-leak fault tolerance so a leaked `<invoke name=...>` is only
@@ -203,6 +204,111 @@ fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRoundDisposition {
+    Continue,
+    Flush,
+    ContextUnavailable,
+    ContextLimitExceeded,
+    SearchLimitExceeded,
+}
+
+impl ToolRoundDisposition {
+    fn error(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::ContextUnavailable => Some((
+                "context_unavailable",
+                "Private context retrieval is unavailable for this request.",
+            )),
+            Self::ContextLimitExceeded => Some((
+                "context_round_limit_exceeded",
+                "Private context retrieval reached its configured round limit before the model completed its response.",
+            )),
+            Self::SearchLimitExceeded => Some((
+                "server_tool_round_limit_exceeded",
+                "Web search reached its round limit while private context retrieval was still pending.",
+            )),
+            Self::Continue | Self::Flush => None,
+        }
+    }
+}
+
+fn is_server_tool(name: &str) -> bool {
+    name == "web_search" || is_internal_tool(name)
+}
+
+/// Client calls must be handed back before another model round: their results
+/// are not available locally, so continuing would create unpaired history.
+fn tool_round_disposition(
+    tool_uses: &[CompletedToolUse],
+    context_limit: Option<usize>,
+    context_rounds: usize,
+    search_rounds: usize,
+) -> ToolRoundDisposition {
+    if tool_uses.is_empty() || tool_uses.iter().any(|tool| !is_server_tool(&tool.name)) {
+        return ToolRoundDisposition::Flush;
+    }
+    let has_context = tool_uses.iter().any(|tool| is_internal_tool(&tool.name));
+    if has_context {
+        let Some(limit) = context_limit else {
+            return ToolRoundDisposition::ContextUnavailable;
+        };
+        if context_rounds >= limit {
+            return ToolRoundDisposition::ContextLimitExceeded;
+        }
+        if search_rounds >= MAX_WEB_SEARCH_ROUNDS
+            && tool_uses.iter().any(|tool| tool.name == "web_search")
+        {
+            return ToolRoundDisposition::SearchLimitExceeded;
+        }
+        ToolRoundDisposition::Continue
+    } else if should_search_round(search_rounds, tool_uses) {
+        ToolRoundDisposition::Continue
+    } else {
+        ToolRoundDisposition::Flush
+    }
+}
+
+/// Recover declared calls before deciding whether to continue. In particular,
+/// a client call leaked into text alongside a private call must not be lost by
+/// entering another server-only round.
+fn reclaim_round_tool_uses(round: &mut RoundOutcome) {
+    if round.text.is_empty() {
+        return;
+    }
+    let structured_keys: std::collections::HashSet<(String, String)> = round
+        .tool_uses
+        .iter()
+        .map(|tool| (tool.name.clone(), canonical_input_key(&tool.input)))
+        .collect();
+    let mut text = String::new();
+    for block in super::stream::extract_invoke_content_blocks(
+        &round.text,
+        &round.known_tool_names,
+        &round.tool_name_map,
+    ) {
+        if block["type"] == "tool_use" {
+            let Some(name) = block["name"].as_str() else {
+                continue;
+            };
+            let Some(id) = block["id"].as_str() else {
+                continue;
+            };
+            let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+            if !structured_keys.contains(&(name.to_string(), canonical_input_key(&input))) {
+                round.tool_uses.push(CompletedToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input,
+                });
+            }
+        } else if let Some(part) = block["text"].as_str() {
+            text.push_str(part);
+        }
+    }
+    round.text = text;
+}
+
 /// Whether the request is the continuation immediately following a tool result.
 fn last_message_has_tool_result(payload: &MessagesRequest) -> bool {
     let Some(last) = payload.messages.last() else {
@@ -244,18 +350,19 @@ async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
-    tracer: &RequestTracer,
+    mark_first_token: impl Fn(),
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
     let mut thinking = String::new();
-    // id -> (name, json_buffer), preserving the order of appearance
-    let mut buffers: std::collections::HashMap<String, (String, String)> =
+    let mut tool_accumulator = ToolJsonAccumulator::new();
+    let mut tool_json_error = None;
+    // Retain first-seen order even when interleaved calls complete out of order.
+    let mut completed: std::collections::HashMap<String, Option<CompletedToolUse>> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
     let mut provider_token_usage: Option<TokenUsage> = None;
     let mut credits = 0.0;
@@ -266,7 +373,7 @@ async fn decode_round(
     while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
             Ok(c) => {
-                tracer.mark_first_token();
+                mark_first_token();
                 c
             }
             Err(e) => {
@@ -298,14 +405,19 @@ async fn decode_round(
                     }
                 }
                 Event::ToolUse(tu) => {
-                    let entry = buffers.entry(tu.tool_use_id.clone()).or_insert_with(|| {
+                    let entry = completed.entry(tu.tool_use_id.clone()).or_insert_with(|| {
                         order.push(tu.tool_use_id.clone());
-                        (String::new(), String::new())
+                        None
                     });
-                    if entry.0.is_empty() {
-                        entry.0 = tu.name.clone();
+                    match tool_accumulator.push(&tu, tool_name_map) {
+                        Ok(Some(tool)) => *entry = Some(tool),
+                        Ok(None) => {}
+                        Err(error) => {
+                            if tool_json_error.is_none() {
+                                tool_json_error = Some(error);
+                            }
+                        }
                     }
-                    entry.1.push_str(&tu.input);
                 }
                 Event::Metadata(metadata) => {
                     if let Some(usage) = metadata.token_usage {
@@ -335,21 +447,18 @@ async fn decode_round(
         }
     }
 
-    // Assemble the complete tool_use in order of appearance (restoring the tool_name_map short name)
-    for id in order {
-        if let Some((name, buf)) = buffers.remove(&id) {
-            let input: Value = if buf.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&buf).unwrap_or_else(|e| {
-                    tracing::warn!("failed to parse tool input JSON: {}", e);
-                    json!({})
-                })
-            };
-            // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
-            tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
-        }
+    if tool_json_error.is_none()
+        && let Err(error) = tool_accumulator.finish()
+    {
+        tool_json_error = Some(error);
     }
+    if let Some(error) = &tool_json_error {
+        stream_error = Some(error.message());
+    }
+    let tool_uses = order
+        .into_iter()
+        .filter_map(|id| completed.remove(&id).flatten())
+        .collect();
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
     let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
@@ -364,6 +473,7 @@ async fn decode_round(
         last_metering,
         stop_reason_override,
         stream_error,
+        tool_json_error,
         // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
         known_tool_names: std::collections::HashSet::new(),
         // Populated by the caller (run_round), which holds ConversionResult::tool_name_map.
@@ -378,6 +488,7 @@ struct RoundFailure {
     error_message: String,
     credential_id: u64,
     token_usage: Option<TokenUsage>,
+    usage_from_provider: bool,
     credits: f64,
 }
 
@@ -393,7 +504,8 @@ async fn run_round(
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
-    let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
+    let config = &provider.token_manager().config().request_pipeline;
+    let conversion = match convert_request_with_pipeline(payload, tool_compatibility_mode, config) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
@@ -417,6 +529,7 @@ async fn run_round(
                 error_message,
                 credential_id: 0,
                 token_usage: None,
+                usage_from_provider: false,
                 credits: 0.0,
             });
         }
@@ -427,7 +540,7 @@ async fn run_round(
         profile_arn: None,
         additional_model_request_fields: conversion.additional_model_request_fields,
     };
-    let request_body = match serde_json::to_string(&kiro_request) {
+    let request_body = match crate::pipeline::serialize_request(payload, &kiro_request, config) {
         Ok(b) => b,
         Err(e) => {
             let error_message = format!("failed to serialize request: {}", e);
@@ -441,6 +554,7 @@ async fn run_round(
                 error_message,
                 credential_id: 0,
                 token_usage: None,
+                usage_from_provider: false,
                 credits: 0.0,
             });
         }
@@ -452,17 +566,30 @@ async fn run_round(
     {
         Ok(r) => r,
         Err(e) => {
-            let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
+            let local_limit = e
+                .downcast_ref::<crate::pipeline::LocalPayloadLimit>()
+                .is_some();
+            let error_type = if local_limit {
+                outcome::BAD_REQUEST
+            } else {
+                last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN)
+            };
             let error_message = e.to_string();
+            let token_usage = if local_limit {
+                None
+            } else {
+                Some(TokenUsage {
+                    uncached_input_tokens: fallback_input_tokens.max(0),
+                    ..TokenUsage::default()
+                })
+            };
             return Err(RoundFailure {
                 response: map_provider_error(e),
                 error_type,
                 error_message,
                 credential_id: 0,
-                token_usage: Some(TokenUsage {
-                    uncached_input_tokens: fallback_input_tokens.max(0),
-                    ..TokenUsage::default()
-                }),
+                token_usage,
+                usage_from_provider: false,
                 credits: 0.0,
             });
         }
@@ -472,7 +599,7 @@ async fn run_round(
         call_result.response,
         &payload.model,
         &conversion.tool_name_map,
-        tracer,
+        || tracer.mark_first_token(),
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -480,42 +607,81 @@ async fn run_round(
     outcome.known_tool_names = conversion.known_tool_names;
     // Carry the short->original tool name map so reclaimed <invoke> names get restored.
     outcome.tool_name_map = conversion.tool_name_map;
+    if let Some(usage) = outcome.provider_token_usage {
+        tracer.on_native_usage(usage);
+    }
+    finish_decoded_round(outcome, credential_id, fallback_input_tokens)
+}
+
+/// This gate runs before any local execution or client presentation. A bad call
+/// invalidates the entire buffered round, while retaining observed usage.
+fn finish_decoded_round(
+    mut outcome: RoundOutcome,
+    credential_id: u64,
+    fallback_input_tokens: i32,
+) -> Result<(RoundOutcome, u64), RoundFailure> {
     if let Some(error_message) = outcome.stream_error.take() {
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
         let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
+        let (response_error_type, response_message) = match &outcome.tool_json_error {
+            Some(error) => (error.error_type(), error.message()),
+            None => (
+                "upstream_error",
+                "Upstream response stream ended unexpectedly during the server-tool loop."
+                    .to_string(),
+            ),
+        };
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "upstream_error",
-                    "Upstream response stream ended unexpectedly during the web_search loop."
-                        .to_string(),
-                )),
+                Json(ErrorResponse::new(response_error_type, response_message)),
             )
                 .into_response(),
             error_type: outcome::STREAM_INTERRUPTED,
             error_message,
             credential_id,
             token_usage: Some(token_usage),
+            usage_from_provider: outcome.provider_token_usage.is_some(),
             credits: outcome.credits,
         });
     }
     Ok((outcome, credential_id))
 }
 
-/// Feeds one round of assistant(text + web_search tool_use) + user(tool_result) back into payload.messages,
-/// and appends server_tool_use + web_search_tool_result blocks (Contract A fields) to the presentation.
-///
-/// `searched` corresponds one-to-one (same order) to `round.tool_uses`; the search has already been completed.
-fn append_search_round(
+/// Continue a completed server-only round with exact tool-use/result pairing,
+/// including its reasoning. Only web-search presentation is client-visible.
+/// `searched` has one entry per tool call; private entries are `None`.
+fn append_server_round(
     payload: &mut MessagesRequest,
     round: &RoundOutcome,
+    tool_results: Vec<Value>,
     searched: &[Option<WebSearchResults>],
     presentation: &mut Vec<Value>,
-) {
-    // assistant: text + this round's web_search tool_use (Kiro history requires tool_use<->tool_result pairing)
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        round
+            .tool_uses
+            .iter()
+            .all(|tool| is_server_tool(&tool.name)),
+        "cannot continue a server round with pending client tool calls"
+    );
+    anyhow::ensure!(
+        tool_results.len() == round.tool_uses.len()
+            && round
+                .tool_uses
+                .iter()
+                .zip(&tool_results)
+                .all(|(tool, result)| {
+                    result["type"] == "tool_result" && result["tool_use_id"] == tool.id
+                }),
+        "server tool calls and results must be paired before continuing"
+    );
+    // Kiro history requires every assistant tool_use to have a user tool_result.
     let mut assistant_content: Vec<Value> = Vec::new();
+    if !round.thinking.is_empty() {
+        assistant_content.push(json!({"type": "thinking", "thinking": round.thinking}));
+    }
     if !round.text.is_empty() {
         assistant_content.push(json!({"type": "text", "text": round.text}));
     }
@@ -527,14 +693,11 @@ fn append_search_round(
         content: Value::Array(assistant_content),
     });
 
-    // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
-    let mut user_content: Vec<Value> = Vec::new();
     for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
+        if tu.name != "web_search" {
+            continue;
+        }
         let query = tool_query(tu).unwrap_or_default();
-        let summary = websearch::generate_search_summary(&query, results);
-        user_content.push(json!({
-            "type": "tool_result", "tool_use_id": tu.id, "content": summary
-        }));
 
         // Client presentation: server_tool_use + web_search_tool_result (Contract A)
         let (srv_id, _mcp) = websearch::create_mcp_request(&query);
@@ -550,8 +713,36 @@ fn append_search_round(
     }
     payload.messages.push(Message {
         role: "user".to_string(),
-        content: Value::Array(user_content),
+        content: Value::Array(tool_results),
     });
+    Ok(())
+}
+
+fn execute_context_tool(
+    context: Option<&ContextSession>,
+    tool: &CompletedToolUse,
+    context_rounds: usize,
+) -> Value {
+    let result = match context {
+        Some(context) if context_rounds < context.max_rounds() => {
+            context.execute(&tool.name, &tool.input)
+        }
+        Some(_) => Err(anyhow::anyhow!(
+            "private context retrieval round limit reached"
+        )),
+        None => Err(anyhow::anyhow!(
+            "private context retrieval session is unavailable"
+        )),
+    };
+    match result {
+        Ok(value) => json!({
+            "type": "tool_result", "tool_use_id": tool.id, "content": value.to_string()
+        }),
+        Err(error) => json!({
+            "type": "tool_result", "tool_use_id": tool.id, "is_error": true,
+            "content": json!({"error": "context_retrieval_error", "message": error.to_string()}).to_string()
+        }),
+    }
 }
 
 /// Converts search results into an array of web_search_result blocks (Contract A fields)
@@ -578,11 +769,8 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
     }
 }
 
-/// Splits a round's tool_uses into (web_search calls, client tool calls),
-/// preserving order within each group. This is the structural core of the
-/// invariant "web_search is always handled internally and never leaves kiro-rs
-/// as a raw tool_use": every flush path partitions first, then handles each
-/// group differently (web_search -> presentation blocks, client tools -> raw).
+/// Classify visible search/client calls while excluding private context calls.
+/// Order is preserved within each group.
 fn partition_tool_uses(
     tool_uses: &[CompletedToolUse],
 ) -> (Vec<&CompletedToolUse>, Vec<&CompletedToolUse>) {
@@ -591,7 +779,7 @@ fn partition_tool_uses(
     for tu in tool_uses {
         if tu.name == "web_search" {
             web.push(tu);
-        } else {
+        } else if !is_internal_tool(&tu.name) {
             client.push(tu);
         }
     }
@@ -623,9 +811,9 @@ fn resolve_flush_stop_reason(
     if let Some(r) = override_reason {
         return r.to_string();
     }
-    let has_client_tool_use = content
-        .iter()
-        .any(|c| c["type"] == "tool_use" && c["name"] != "web_search");
+    let has_client_tool_use = content.iter().any(|c| {
+        c["type"] == "tool_use" && c["name"].as_str().is_some_and(|name| !is_server_tool(name))
+    });
     if has_client_tool_use || !client_uses_empty {
         "tool_use".to_string()
     } else {
@@ -679,17 +867,14 @@ fn build_flush_content(
         // streaming fault tolerance). For clean text with no leaked `<invoke>`, this
         // returns a single text block identical to the old behavior.
         //
-        // INVARIANT GUARD: `web_search` must NEVER be reclaimed as a raw client `tool_use`
-        // — the Codex host has no web_search executor and rejects it with
-        // "unsupported call: web_search". `known_tool_names` is copied verbatim from
-        // req.tools and (since we are in the web_search loop) always contains "web_search",
-        // so we strip it from the reclamation tool-table here. A leaked
-        // `<invoke name="web_search">` then fails the tool-table gate and stays as plain
-        // text (ugly but protocol-safe), instead of being upgraded into a raw tool_use that
-        // breaks the loop's core invariant.
+        // Server tools are reclaimed before routing, never as client calls at
+        // flush time. Check original names too, so aliases cannot bypass this.
         let reclaim_tools: std::collections::HashSet<String> = known_tool_names
             .iter()
-            .filter(|n| n.as_str() != "web_search")
+            .filter(|name| {
+                let original = tool_name_map.get(*name).unwrap_or(*name);
+                !is_server_tool(original)
+            })
             .cloned()
             .collect();
         // DEDUP GUARD: a degraded model can emit BOTH a leaked literal `<invoke>` in the
@@ -699,7 +884,7 @@ fn build_flush_content(
         // `tool_uses` for this round. Text blocks (and distinct tool_uses) are kept as-is.
         let structured_keys: std::collections::HashSet<(String, String)> = tool_uses
             .iter()
-            .filter(|t| t.name != "web_search")
+            .filter(|t| !is_server_tool(&t.name))
             .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
             .collect();
         for block in
@@ -738,7 +923,7 @@ fn build_flush_content(
                 "type": "web_search_tool_result",
                 "content": build_result_block(results)
             }));
-        } else {
+        } else if !is_internal_tool(&tu.name) {
             // Client tool (exec, get_time, ...): returned to the client verbatim.
             content.push(tu.to_anthropic_block());
         }
@@ -824,6 +1009,20 @@ impl WebSearchUsageSettlement {
             (UsageSource::Provider, true) => UsageSource::Provider,
             _ => UsageSource::None,
         };
+    }
+
+    fn add_failure(&mut self, failure: &RoundFailure) {
+        self.add(
+            failure.credential_id,
+            failure.token_usage.unwrap_or_default(),
+            failure.credits,
+        );
+        // A preflight failure has no model round to classify. An attempted or
+        // interrupted provider call with estimates invalidates native-only
+        // aggregate attribution even if all earlier rounds were native.
+        if failure.token_usage.is_some() {
+            self.note_source(failure.usage_from_provider);
+        }
     }
 
     fn usage(&self) -> TokenUsage {
@@ -1292,6 +1491,54 @@ pub(super) async fn run_web_search_loop(
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
+    run_server_tool_loop(
+        provider,
+        payload,
+        hook,
+        tracer,
+        stream_client,
+        group,
+        tool_compatibility_mode,
+        None,
+    )
+    .await
+}
+
+/// Execute bounded private context calls through the same cancellation-safe
+/// loop as web search. The session lease lives until this request finishes.
+pub async fn run_context_loop(
+    provider: Arc<KiroProvider>,
+    payload: MessagesRequest,
+    hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
+    stream_client: bool,
+    group: Option<String>,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    context: ContextSession,
+) -> Response {
+    run_server_tool_loop(
+        provider,
+        payload,
+        hook,
+        tracer,
+        stream_client,
+        group,
+        tool_compatibility_mode,
+        Some(context),
+    )
+    .await
+}
+
+async fn run_server_tool_loop(
+    provider: Arc<KiroProvider>,
+    payload: MessagesRequest,
+    hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
+    stream_client: bool,
+    group: Option<String>,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    context: Option<ContextSession>,
+) -> Response {
     if !stream_client {
         return run_web_search_loop_inner(
             provider,
@@ -1300,6 +1547,7 @@ pub(super) async fn run_web_search_loop(
             tracer,
             group,
             tool_compatibility_mode,
+            context,
             None,
         )
         .await;
@@ -1329,6 +1577,7 @@ pub(super) async fn run_web_search_loop(
                 tracer,
                 group,
                 tool_compatibility_mode,
+                context,
                 Some(&mut emitter),
             ))
             .catch_unwind(),
@@ -1369,14 +1618,18 @@ async fn run_web_search_loop_inner(
     tracer: Arc<RequestTracer>,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    context: Option<ContextSession>,
     mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
+    let context_limit = context.as_ref().map(ContextSession::max_rounds);
+    let mut context_rounds = 0usize;
+    let mut search_rounds = 0usize;
 
-    for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
+    loop {
         let mut empty_retries = 0usize;
         let round = loop {
             let round_fallback_input_tokens = token::count_all_tokens(
@@ -1385,7 +1638,7 @@ async fn run_web_search_loop_inner(
                 payload.messages.clone(),
                 payload.tools.clone(),
             ) as i32;
-            let (round, credential_id) = match run_round(
+            let (mut round, credential_id) = match run_round(
                 &provider,
                 &payload,
                 round_fallback_input_tokens,
@@ -1397,15 +1650,7 @@ async fn run_web_search_loop_inner(
             {
                 Ok(v) => v,
                 Err(failure) => {
-                    if let Some(usage) = failure.token_usage {
-                        settlement.add(failure.credential_id, usage, failure.credits);
-                    } else {
-                        settlement.add(
-                            failure.credential_id,
-                            TokenUsage::default(),
-                            failure.credits,
-                        );
-                    }
+                    settlement.add_failure(&failure);
                     settlement.finish(
                         "error",
                         "error",
@@ -1415,6 +1660,7 @@ async fn run_web_search_loop_inner(
                     return failure.response;
                 }
             };
+            reclaim_round_tool_uses(&mut round);
             settlement.add(
                 credential_id,
                 round.resolved_token_usage(round_fallback_input_tokens),
@@ -1432,7 +1678,8 @@ async fn run_web_search_loop_inner(
                 EmptyToolResultDisposition::Retry => {
                     empty_retries += 1;
                     tracing::warn!(
-                        round = round_idx,
+                        context_rounds,
+                        search_rounds,
                         retry = empty_retries,
                         "upstream returned an empty assistant turn after tool_result; retrying"
                     );
@@ -1448,7 +1695,8 @@ async fn run_web_search_loop_inner(
                         ),
                     );
                     tracing::error!(
-                        round = round_idx,
+                        context_rounds,
+                        search_rounds,
                         "upstream repeated an empty assistant turn after tool_result"
                     );
                     return (
@@ -1476,22 +1724,47 @@ async fn run_web_search_loop_inner(
             break round;
         };
 
-        if should_search_round(round_idx, &round.tool_uses) {
-            // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
-            let mut searched: Vec<Option<WebSearchResults>> =
-                Vec::with_capacity(round.tool_uses.len());
-            for tu in &round.tool_uses {
+        let disposition = tool_round_disposition(
+            &round.tool_uses,
+            context_limit,
+            context_rounds,
+            search_rounds,
+        );
+        if let Some((error_type, message)) = disposition.error() {
+            settlement.finish("error", "error", Some(outcome::UNKNOWN), Some(message));
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(error_type, message)),
+            )
+                .into_response();
+        }
+
+        // Every private/search call executes locally, including rounds that
+        // also contain client tools. Only fully paired server rounds continue.
+        let continue_round = disposition == ToolRoundDisposition::Continue;
+        let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
+        let mut tool_results = Vec::with_capacity(round.tool_uses.len());
+        for tu in &round.tool_uses {
+            if tu.name == "web_search" {
                 match execute_web_search(
                     &provider,
                     tu,
                     tracer.as_ref(),
                     group.as_deref(),
-                    false,
+                    !continue_round,
                     &mut emitter,
                 )
                 .await
                 {
-                    Ok(result) => searched.push(result),
+                    Ok(result) => {
+                        tool_results.push(json!({
+                            "type": "tool_result", "tool_use_id": tu.id,
+                            "content": websearch::generate_search_summary(
+                                &tool_query(tu).unwrap_or_default(), &result,
+                            )
+                        }));
+                        searched.push(result);
+                    }
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
                         let error_message = e.to_string();
@@ -1504,54 +1777,46 @@ async fn run_web_search_loop_inner(
                         return map_provider_error(e);
                     }
                 }
+            } else {
+                searched.push(None);
+                if is_internal_tool(&tu.name) {
+                    // Yield between bounded local operations so a disconnected
+                    // SSE receiver can cancel before another retrieval starts.
+                    tokio::task::yield_now().await;
+                    tool_results.push(execute_context_tool(context.as_ref(), tu, context_rounds));
+                }
             }
-            append_search_round(&mut payload, &round, &searched, &mut presentation);
+        }
+        if continue_round {
+            if let Err(error) = append_server_round(
+                &mut payload,
+                &round,
+                tool_results,
+                &searched,
+                &mut presentation,
+            ) {
+                let message = error.to_string();
+                settlement.finish("error", "error", Some(outcome::UNKNOWN), Some(&message));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("internal_error", message)),
+                )
+                    .into_response();
+            }
+            if round
+                .tool_uses
+                .iter()
+                .any(|tool| is_internal_tool(&tool.name))
+            {
+                context_rounds += 1;
+            }
+            if round.tool_uses.iter().any(|tool| tool.name == "web_search") {
+                search_rounds += 1;
+            }
             continue;
         }
 
-        // Terminate: this round is not "pure web_search", or the limit has been reached -> flush to the client.
-        // stop_reason must reflect CLIENT tools only: web_search is handled internally
-        // (presented as server_tool_use, not a pending tool_use), so a round with only
-        // web_search must end as "end_turn", not "tool_use" (otherwise the host would
-        // wait for a client tool call that is never emitted).
         let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
-        // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
-        // as a raw tool_use (the Codex host has no executor for it and rejects it
-        // with "unsupported call: web_search"). This covers the mixed-round case
-        // (web_search + exec) and the round-limit case: search every web_search call
-        // in this final round here, then build the flushed content with web_search
-        // presented as server_tool_use + web_search_tool_result while client tools
-        // (exec, etc.) are returned verbatim.
-        let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
-        for tu in &round.tool_uses {
-            if tu.name == "web_search" {
-                match execute_web_search(
-                    &provider,
-                    tu,
-                    tracer.as_ref(),
-                    group.as_deref(),
-                    true,
-                    &mut emitter,
-                )
-                .await
-                {
-                    Ok(result) => searched.push(result),
-                    Err(e) => {
-                        tracing::warn!("web_search MCP call (final round) failed: {}", e);
-                        let error_message = e.to_string();
-                        settlement.finish(
-                            "error",
-                            "error",
-                            last_attempt_outcome(tracer.as_ref()),
-                            Some(&error_message),
-                        );
-                        return map_provider_error(e);
-                    }
-                }
-            } else {
-                searched.push(None);
-            }
-        }
         let content = build_flush_content(
             presentation.clone(),
             &round.text,
@@ -1595,22 +1860,6 @@ async fn run_web_search_loop_inner(
             )
         };
     }
-
-    // Theoretically unreachable (the loop always returns)
-    settlement.finish(
-        "error",
-        "error",
-        Some(outcome::UNKNOWN),
-        Some("web_search loop exited unexpectedly"),
-    );
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new(
-            "internal_error",
-            "web_search loop exited unexpectedly",
-        )),
-    )
-        .into_response()
 }
 
 /// Single JSON response (non-streaming)
@@ -1844,6 +2093,557 @@ mod tests {
             name: "web_search".to_string(),
             input,
         }
+    }
+
+    fn upstream_response(events: &[(&str, Value)]) -> reqwest::Response {
+        let mut body = Vec::new();
+        for (event_type, payload) in events {
+            let mut headers = Vec::new();
+            for (name, value) in [(":message-type", "event"), (":event-type", *event_type)] {
+                headers.push(name.len() as u8);
+                headers.extend_from_slice(name.as_bytes());
+                headers.push(7); // AWS EventStream string header.
+                headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                headers.extend_from_slice(value.as_bytes());
+            }
+            let payload = serde_json::to_vec(payload).unwrap();
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+            frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&crate::kiro::parser::crc::crc32(&frame).to_be_bytes());
+            frame.extend_from_slice(&headers);
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(&crate::kiro::parser::crc::crc32(&frame).to_be_bytes());
+            body.extend_from_slice(&frame);
+        }
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    #[tokio::test]
+    async fn decode_round_rejects_malformed_json_in_mixed_private_and_client_calls() {
+        for (valid_name, invalid_name) in [
+            ("kiro_context_read", "custom_client"),
+            ("custom_client", "kiro_context_search"),
+        ] {
+            let response = upstream_response(&[
+                (
+                    "toolUseEvent",
+                    json!({"toolUseId":"valid", "name":valid_name, "input":"{}", "stop":true}),
+                ),
+                (
+                    "toolUseEvent",
+                    json!({"toolUseId":"broken", "name":invalid_name, "input":"{not JSON", "stop":true}),
+                ),
+                (
+                    "metadataEvent",
+                    json!({"tokenUsage":{"uncachedInputTokens":11, "outputTokens":3, "cacheReadInputTokens":7, "cacheWriteInputTokens":5}}),
+                ),
+            ]);
+            let round = decode_round(response, "claude-sonnet-4-8", &nomap(), || {}).await;
+            assert!(
+                round.stream_error.is_some(),
+                "malformed {invalid_name} input must fail the round"
+            );
+            assert!(
+                !round.tool_uses.iter().any(|tool| tool.id == "broken"),
+                "malformed input must not become an executable empty object"
+            );
+            assert_eq!(
+                round.provider_token_usage,
+                Some(TokenUsage {
+                    uncached_input_tokens: 11,
+                    output_tokens: 3,
+                    cache_read_input_tokens: 7,
+                    cache_write_input_tokens: 5,
+                })
+            );
+            let failure = finish_decoded_round(round, 7, 99)
+                .err()
+                .expect("invalid round must fail before any tool execution");
+            assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY);
+            assert!(failure.usage_from_provider);
+            let (error_type, message) = response_error_details(failure.response).await;
+            assert_eq!(error_type, "upstream_tool_json_error");
+            assert!(message.contains("invalid JSON"));
+            assert!(
+                !message.contains("{not JSON"),
+                "error must not echo tool input"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_round_requires_stop_even_when_tool_json_is_parseable() {
+        for input in [r#"{"artifact_id":"opaque"}"#, r#"{"artifact_id":"opaque"#] {
+            let response = upstream_response(&[
+                (
+                    "toolUseEvent",
+                    json!({"toolUseId":"unfinished", "name":"kiro_context_read", "input":input, "stop":false}),
+                ),
+                (
+                    "toolUseEvent",
+                    json!({"toolUseId":"client", "name":"custom_client", "input":"{}", "stop":true}),
+                ),
+            ]);
+            let round = decode_round(response, "claude-sonnet-4-8", &nomap(), || {}).await;
+            assert!(
+                round.stream_error.is_some(),
+                "a tool call without stop=true must fail the round"
+            );
+            assert!(!round.tool_uses.iter().any(|tool| tool.id == "unfinished"));
+            let failure = finish_decoded_round(round, 7, 99)
+                .err()
+                .expect("unfinished round must fail before client handoff");
+            assert_eq!(failure.response.status(), StatusCode::BAD_GATEWAY);
+            assert!(!failure.usage_from_provider);
+            let (error_type, message) = response_error_details(failure.response).await;
+            assert_eq!(error_type, "upstream_tool_json_error");
+            assert!(message.contains("before completing"));
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_round_keeps_fragmented_parameters_names_and_first_seen_order() {
+        let mut map = nomap();
+        map.insert("private_alias".to_string(), "kiro_context_read".to_string());
+        map.insert("client_alias".to_string(), "custom_client".to_string());
+        let response = upstream_response(&[
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"read", "name":"private_alias", "input":r#"{"artifact_id":"opaque"#, "stop":false}),
+            ),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"client", "name":"client_alias", "input":r#"{"payload":{"text":"中文\n\"quote\"","values":[1,true,null]}}"#, "stop":true}),
+            ),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"read", "name":"", "input":r#"","offset":2,"limit":64}"#, "stop":true}),
+            ),
+        ]);
+        let round = decode_round(response, "claude-sonnet-4-8", &map, || {}).await;
+        assert!(round.stream_error.is_none());
+        assert_eq!(round.tool_uses.len(), 2);
+        assert_eq!(round.tool_uses[0].id, "read");
+        assert_eq!(round.tool_uses[0].name, "kiro_context_read");
+        assert_eq!(
+            round.tool_uses[0].input,
+            json!({"artifact_id":"opaque", "offset":2, "limit":64})
+        );
+        assert_eq!(round.tool_uses[1].id, "client");
+        assert_eq!(round.tool_uses[1].name, "custom_client");
+        assert_eq!(
+            round.tool_uses[1].input,
+            json!({"payload":{"text":"中文\n\"quote\"", "values":[1,true,null]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_round_accepts_explicitly_completed_no_argument_call() {
+        let response = upstream_response(&[(
+            "toolUseEvent",
+            json!({"toolUseId":"noop", "name":"custom_noop", "input":"", "stop":true}),
+        )]);
+        let round = decode_round(response, "claude-sonnet-4-8", &nomap(), || {}).await;
+        assert!(round.stream_error.is_none());
+        assert_eq!(round.tool_uses.len(), 1);
+        assert_eq!(round.tool_uses[0].input, json!({}));
+    }
+
+    #[test]
+    fn context_tools_never_escape_in_mixed_client_content() {
+        let calls = vec![
+            tu("kiro_context_read"),
+            tu("web_search"),
+            tu("exec"),
+            tu("kiro_context_search"),
+        ];
+        let content = build_flush_content(
+            Vec::new(),
+            "Continue with the client action.",
+            &calls,
+            &[None, fake_results("rust 2026"), None, None],
+            &names(&[
+                "kiro_context_read",
+                "kiro_context_search",
+                "web_search",
+                "exec",
+            ]),
+            &nomap(),
+        );
+        let client_calls: Vec<&Value> = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        assert_eq!(client_calls.len(), 1);
+        assert_eq!(client_calls[0]["id"], "toolu_exec");
+        assert_eq!(client_calls[0]["name"], "exec");
+        assert_eq!(
+            content
+                .iter()
+                .filter(|block| block["type"] == "server_tool_use")
+                .count(),
+            1,
+        );
+        assert!(!content.iter().any(|block| {
+            block["name"] == "kiro_context_read" || block["name"] == "kiro_context_search"
+        }));
+    }
+
+    #[test]
+    fn emitted_contract_a_search_results_replay_with_exact_payloads() {
+        let emitted = build_flush_content(
+            Vec::new(),
+            "Answer using both sources.",
+            &[tu("web_search"), tu("web_search")],
+            &[fake_results("first source"), fake_results("second source")],
+            &names(&["web_search"]),
+            &nomap(),
+        );
+        let result_count = emitted
+            .iter()
+            .filter(|block| block["type"] == "web_search_tool_result")
+            .count();
+        assert_eq!(result_count, 2);
+        assert!(
+            emitted
+                .iter()
+                .filter(|block| block["type"] == "web_search_tool_result")
+                .all(|block| block.get("tool_use_id").is_none())
+        );
+        let mut payload = payload_with_last_block(json!({"type":"text", "text":"question"}));
+        payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: Value::Array(emitted.clone()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("Continue"),
+            },
+        ]);
+        let pipeline = crate::pipeline::RequestPipeline::new(Default::default());
+        assert!(pipeline.prepare(&mut payload, 7).is_ok());
+        for (index, original) in emitted.iter().enumerate() {
+            if original["type"] == "server_tool_use" || original["type"] == "web_search_tool_result"
+            {
+                let quoted = payload.messages[1].content[index]["text"]
+                    .as_str()
+                    .unwrap()
+                    .split_once('\n')
+                    .unwrap()
+                    .1;
+                assert_eq!(serde_json::from_str::<Value>(quoted).unwrap(), *original);
+            }
+        }
+    }
+
+    #[test]
+    fn context_tools_are_not_classified_as_client_calls() {
+        let calls = vec![
+            tu("kiro_context_read"),
+            tu("exec"),
+            tu("kiro_context_search"),
+        ];
+        let (_, client_calls) = partition_tool_uses(&calls);
+        assert_eq!(client_calls.len(), 1);
+        assert_eq!(client_calls[0].name, "exec");
+    }
+
+    #[test]
+    fn continued_server_round_keeps_reasoning_before_tool_pairs() {
+        let mut payload = payload_with_last_block(json!({"type": "text", "text": "search"}));
+        let mut round = round_outcome("Checking the source.", vec![tu("web_search")]);
+        round.thinking = "Need the complete source before answering.".to_string();
+        append_server_round(
+            &mut payload,
+            &round,
+            vec![json!({"type": "tool_result", "tool_use_id": "toolu_web_search", "content": "source"})],
+            &[None],
+            &mut Vec::new(),
+        ).unwrap();
+        let assistant = payload.messages[1].content.as_array().unwrap();
+        assert_eq!(assistant[0]["type"], "thinking");
+        assert_eq!(
+            assistant[0]["thinking"],
+            "Need the complete source before answering."
+        );
+        assert_eq!(assistant[1]["text"], "Checking the source.");
+        assert_eq!(assistant[2]["id"], "toolu_web_search");
+        assert_eq!(
+            payload.messages[2].content[0]["tool_use_id"],
+            "toolu_web_search"
+        );
+    }
+
+    #[test]
+    fn reclaimed_private_alias_cannot_become_a_client_call() {
+        let mut tool_name_map = nomap();
+        tool_name_map.insert("private_alias".to_string(), "kiro_context_read".to_string());
+        let content = build_flush_content(
+            Vec::new(),
+            "<invoke name=\"private_alias\"><parameter name=\"id\">opaque-id</parameter></invoke>",
+            &[],
+            &[],
+            &names(&["private_alias"]),
+            &tool_name_map,
+        );
+        assert!(!content.iter().any(|block| block["type"] == "tool_use"));
+    }
+
+    #[test]
+    fn combined_context_and_search_round_keeps_exact_history_pairs() {
+        let mut payload = payload_with_last_block(json!({"type": "text", "text": "question"}));
+        let mut round = round_outcome(
+            "Read both sources.",
+            vec![tu("kiro_context_read"), tu("web_search")],
+        );
+        round.thinking = "Check the original quotation.".to_string();
+        let results = vec![
+            json!({"type": "tool_result", "tool_use_id": "toolu_kiro_context_read", "content": "Exact original: 中文\\\"\n"}),
+            json!({"type": "tool_result", "tool_use_id": "toolu_web_search", "content": "Search summary"}),
+        ];
+        let mut presentation = Vec::new();
+        append_server_round(
+            &mut payload,
+            &round,
+            results.clone(),
+            &[None, fake_results("source")],
+            &mut presentation,
+        )
+        .unwrap();
+        assert_eq!(payload.messages[1].role, "assistant");
+        assert_eq!(
+            payload.messages[1].content[0]["thinking"],
+            "Check the original quotation."
+        );
+        assert_eq!(
+            payload.messages[1].content[2]["id"],
+            "toolu_kiro_context_read"
+        );
+        assert_eq!(payload.messages[1].content[3]["id"], "toolu_web_search");
+        assert_eq!(payload.messages[2].role, "user");
+        assert_eq!(payload.messages[2].content, Value::Array(results));
+        assert_eq!(presentation.len(), 2);
+        assert_eq!(presentation[0]["name"], "web_search");
+        assert_eq!(presentation[1]["type"], "web_search_tool_result");
+    }
+
+    #[test]
+    fn server_continuation_rejects_unpaired_or_client_calls_without_changing_history() {
+        let mut payload = payload_with_last_block(json!({"type": "text", "text": "question"}));
+        let missing_result = round_outcome("", vec![tu("kiro_context_read")]);
+        let mut presentation = Vec::new();
+        assert!(
+            append_server_round(
+                &mut payload,
+                &missing_result,
+                vec![],
+                &[None],
+                &mut presentation
+            )
+            .is_err()
+        );
+        let pending_client = round_outcome("", vec![tu("kiro_context_read"), tu("exec")]);
+        assert!(
+            append_server_round(
+                &mut payload,
+                &pending_client,
+                vec![],
+                &[None, None],
+                &mut presentation
+            )
+            .is_err()
+        );
+        assert_eq!(payload.messages.len(), 1);
+        assert!(presentation.is_empty());
+    }
+
+    #[test]
+    fn context_round_limit_errors_only_while_internal_work_remains() {
+        let context_only = vec![tu("kiro_context_read")];
+        assert_eq!(
+            tool_round_disposition(&context_only, Some(2), 1, 0),
+            ToolRoundDisposition::Continue
+        );
+        let exhausted = tool_round_disposition(&context_only, Some(2), 2, 0);
+        assert_eq!(exhausted, ToolRoundDisposition::ContextLimitExceeded);
+        assert_eq!(exhausted.error().unwrap().0, "context_round_limit_exceeded");
+        assert_eq!(
+            tool_round_disposition(&[], Some(2), 2, 0),
+            ToolRoundDisposition::Flush
+        );
+        assert_eq!(
+            tool_round_disposition(&context_only, None, 0, 0),
+            ToolRoundDisposition::ContextUnavailable
+        );
+        let mixed = vec![tu("kiro_context_read"), tu("web_search"), tu("exec")];
+        assert_eq!(
+            tool_round_disposition(&mixed, Some(2), 2, 0),
+            ToolRoundDisposition::Flush
+        );
+    }
+
+    #[test]
+    fn context_and_search_have_independent_round_limits() {
+        let combined = vec![tu("kiro_context_read"), tu("web_search")];
+        assert_eq!(
+            tool_round_disposition(&combined, Some(2), 0, 1),
+            ToolRoundDisposition::Continue
+        );
+        assert_eq!(
+            tool_round_disposition(&combined, Some(2), 2, 1),
+            ToolRoundDisposition::ContextLimitExceeded
+        );
+        assert_eq!(
+            tool_round_disposition(&combined, Some(2), 0, MAX_WEB_SEARCH_ROUNDS),
+            ToolRoundDisposition::SearchLimitExceeded
+        );
+        assert_eq!(
+            tool_round_disposition(
+                &[tu("kiro_context_read")],
+                Some(2),
+                0,
+                MAX_WEB_SEARCH_ROUNDS
+            ),
+            ToolRoundDisposition::Continue
+        );
+    }
+
+    #[test]
+    fn leaked_client_call_stops_private_continuation_and_is_returned_once() {
+        // The shared sniffer reclaims calls at line start; inline invocations
+        // are discussion text and must remain non-executable.
+        let mut round = round_outcome(
+            "Next:\n<invoke name=\"exec\"><parameter name=\"cmd\">pwd</parameter></invoke>",
+            vec![tu("kiro_context_read")],
+        );
+        round.known_tool_names = names(&["kiro_context_read", "exec"]);
+        reclaim_round_tool_uses(&mut round);
+        assert_eq!(
+            tool_round_disposition(&round.tool_uses, Some(2), 0, 0),
+            ToolRoundDisposition::Flush
+        );
+        let content = build_flush_content(
+            Vec::new(),
+            &round.text,
+            &round.tool_uses,
+            &[None, None],
+            &round.known_tool_names,
+            &round.tool_name_map,
+        );
+        let calls: Vec<_> = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "exec");
+        assert_eq!(calls[0]["input"]["cmd"], "pwd");
+    }
+
+    #[test]
+    fn inline_invocation_example_does_not_create_a_client_call_before_routing() {
+        let text = "Next: <invoke name=\"exec\"><parameter name=\"cmd\">pwd</parameter></invoke>";
+        let mut round = round_outcome(text, vec![tu("kiro_context_read")]);
+        round.known_tool_names = names(&["kiro_context_read", "exec"]);
+        reclaim_round_tool_uses(&mut round);
+        assert_eq!(round.text, text);
+        assert_eq!(round.tool_uses.len(), 1);
+        assert_eq!(round.tool_uses[0].name, "kiro_context_read");
+        assert_eq!(
+            tool_round_disposition(&round.tool_uses, Some(2), 0, 0),
+            ToolRoundDisposition::Continue,
+        );
+    }
+
+    #[test]
+    fn reclaimed_context_call_is_handled_locally_without_duplicating_structured_call() {
+        let mut round = round_outcome(
+            "<invoke name=\"kiro_context_read\"><parameter name=\"artifact_id\">opaque</parameter></invoke>",
+            vec![CompletedToolUse {
+                id: "native-id".to_string(),
+                name: "kiro_context_read".to_string(),
+                input: json!({"artifact_id":"opaque"}),
+            }],
+        );
+        round.known_tool_names = names(&["kiro_context_read"]);
+        reclaim_round_tool_uses(&mut round);
+        assert_eq!(round.tool_uses.len(), 1);
+        assert_eq!(round.tool_uses[0].id, "native-id");
+        assert!(!round.text.contains("<invoke"));
+        assert_eq!(
+            tool_round_disposition(&round.tool_uses, Some(2), 0, 0),
+            ToolRoundDisposition::Continue
+        );
+    }
+
+    #[test]
+    fn local_context_failures_remain_paired_error_results() {
+        let result = execute_context_tool(None, &tu("kiro_context_read"), 0);
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "toolu_kiro_context_read");
+        assert_eq!(result["is_error"], true);
+        let error: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(error["error"], "context_retrieval_error");
+    }
+
+    #[test]
+    fn local_context_tool_reads_exact_original_and_enforces_round_budget() {
+        let store = Arc::new(crate::pipeline::artifacts::ArtifactStore::new(
+            crate::pipeline::config::ArtifactConfig {
+                enabled: true,
+                threshold_bytes: 8,
+                read_bytes: 1024,
+                max_rounds: 2,
+                ..Default::default()
+            },
+        ));
+        let context = store.begin(7, "loop-test");
+        let original = "Exact original text: 中文🙂\\\"\n";
+        let mut payload = payload_with_last_block(json!({"type":"text", "text":"current"}));
+        payload.messages.insert(
+            0,
+            Message {
+                role: "assistant".to_string(),
+                content: json!("ack"),
+            },
+        );
+        payload.messages.insert(
+            0,
+            Message {
+                role: "user".to_string(),
+                content: json!(original),
+            },
+        );
+        assert_eq!(context.offload(&mut payload).unwrap(), 1);
+        let marker = payload.messages[0].content.as_str().unwrap();
+        let reference: Value = serde_json::from_str(
+            marker
+                .strip_prefix("[kiro-context:")
+                .unwrap()
+                .strip_suffix(']')
+                .unwrap(),
+        )
+        .unwrap();
+        let call = CompletedToolUse {
+            id: "read-original".to_string(),
+            name: "kiro_context_read".to_string(),
+            input: json!({"artifact_id": reference["artifact_id"]}),
+        };
+        let result = execute_context_tool(Some(&context), &call, 0);
+        assert_eq!(result["tool_use_id"], "read-original");
+        assert!(result.get("is_error").is_none());
+        let body: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(body["text"], original);
+        let exhausted = execute_context_tool(Some(&context), &call, 2);
+        assert_eq!(exhausted["tool_use_id"], "read-original");
+        assert_eq!(exhausted["is_error"], true);
+        assert!(
+            exhausted["content"]
+                .as_str()
+                .unwrap()
+                .contains("round limit")
+        );
     }
 
     #[test]
@@ -2247,6 +3047,7 @@ mod tests {
             last_metering: None,
             stop_reason_override: None,
             stream_error: None,
+            tool_json_error: None,
             known_tool_names: std::collections::HashSet::new(),
             tool_name_map: std::collections::HashMap::new(),
         }
@@ -3061,6 +3862,84 @@ mod tests {
         assert_eq!(total.output_tokens, 5 + fallback_usage.output_tokens);
         assert_eq!(total.cache_write_input_tokens, 4);
         assert_eq!(total.cache_read_input_tokens, 7);
+    }
+
+    fn usage_settlement() -> WebSearchUsageSettlement {
+        WebSearchUsageSettlement::without_trace(UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 0,
+            model: "test-model".to_string(),
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    fn failed_round(usage: Option<TokenUsage>, from_provider: bool) -> RoundFailure {
+        RoundFailure {
+            response: StatusCode::BAD_GATEWAY.into_response(),
+            error_type: outcome::STREAM_INTERRUPTED,
+            error_message: "synthetic stream failure".to_string(),
+            credential_id: 7,
+            token_usage: usage,
+            usage_from_provider: from_provider,
+            credits: 0.0,
+        }
+    }
+
+    #[test]
+    fn estimated_failed_round_cannot_leave_aggregate_marked_as_provider_truth() {
+        let mut settlement = usage_settlement();
+        settlement.add(7, token_usage(11, 3), 0.0);
+        settlement.note_source(true);
+        assert_eq!(settlement.source, UsageSource::Provider);
+        settlement.add_failure(&failed_round(Some(token_usage(29, 2)), false));
+        assert_eq!(settlement.source, UsageSource::None);
+        assert_eq!(settlement.usage().uncached_input_tokens, 40);
+        assert_eq!(settlement.usage().output_tokens, 5);
+        settlement.add(7, token_usage(5, 1), 0.0);
+        settlement.note_source(true);
+        assert_eq!(
+            settlement.source,
+            UsageSource::None,
+            "later native evidence cannot fill an earlier unknown round"
+        );
+    }
+
+    #[test]
+    fn missing_successful_round_usage_remains_estimated_after_native_rounds() {
+        let mut settlement = usage_settlement();
+        let mut native = round_outcome("native answer", vec![]);
+        native.provider_token_usage = Some(token_usage(11, 3));
+        let unknown = round_outcome("estimated answer", vec![]);
+        for round in [&native, &unknown, &native] {
+            settlement.add(7, round.resolved_token_usage(19), 0.0);
+            settlement.note_source(round.provider_token_usage.is_some());
+        }
+        assert_eq!(settlement.source, UsageSource::None);
+        assert_eq!(settlement.usage().uncached_input_tokens, 41);
+        assert!(unknown.provider_token_usage.is_none());
+    }
+
+    #[test]
+    fn failure_before_a_provider_round_does_not_invent_missing_usage() {
+        let mut settlement = usage_settlement();
+        settlement.add_failure(&failed_round(None, false));
+        assert_eq!(settlement.source, UsageSource::Unknown);
+        assert_eq!(settlement.usage(), TokenUsage::default());
+        settlement.add(7, token_usage(11, 3), 0.0);
+        settlement.note_source(true);
+        settlement.add_failure(&failed_round(None, false));
+        assert_eq!(settlement.source, UsageSource::Provider);
+        assert_eq!(settlement.usage(), token_usage(11, 3));
+    }
+
+    #[test]
+    fn complete_native_snapshot_survives_stream_failure_as_native_evidence() {
+        let mut settlement = usage_settlement();
+        settlement.add_failure(&failed_round(Some(token_usage(11, 3)), true));
+        assert_eq!(settlement.source, UsageSource::Provider);
+        assert_eq!(settlement.usage(), token_usage(11, 3));
     }
 
     #[test]

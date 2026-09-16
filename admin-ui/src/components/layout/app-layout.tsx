@@ -18,6 +18,7 @@ import {
   Globe,
   PackageOpen,
   ShieldCheck,
+  GitBranch,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -89,6 +90,7 @@ export const TABS: readonly TabItem[] = [
     description: "自动自愈、调度熔断、日志治理与元数据规范",
     icon: SlidersHorizontal,
     children: [
+      { key: "pipeline", label: "请求管线", icon: GitBranch },
       { key: "dispatch", label: "调度策略", icon: Gauge },
       { key: "metadata", label: "凭据字段", icon: Tags },
       { key: "models", label: "模型配置", icon: Cpu },

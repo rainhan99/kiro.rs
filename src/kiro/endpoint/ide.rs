@@ -75,7 +75,16 @@ impl KiroEndpoint for IdeEndpoint {
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
             .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amzn-kiro-agent-mode", "vibe")
+            .header(
+                "x-amzn-kiro-agent-mode",
+                if ctx.config.request_pipeline.mode
+                    == crate::pipeline::config::PipelineMode::Enforce
+                {
+                    ctx.config.request_pipeline.agent_mode.as_str()
+                } else {
+                    "vibe"
+                },
+            )
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))

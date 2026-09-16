@@ -1504,6 +1504,16 @@ impl MultiTokenManager {
         &self.config
     }
 
+    /// Share the same disk-config lock with startup-only admin settings, without
+    /// mutating this manager's effective runtime configuration.
+    pub(crate) fn with_config_file_lock<T>(
+        &self,
+        operation: impl FnOnce(Option<&std::path::Path>) -> T,
+    ) -> T {
+        let _guard = self.config_write_lock.lock();
+        operation(self.config.config_path())
+    }
+
     /// 串行执行一次 config.json 读改写，供所有 Admin 运行时配置入口复用。
     pub fn update_config_file(&self, updater: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
         use anyhow::Context;

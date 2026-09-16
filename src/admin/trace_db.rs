@@ -15,6 +15,9 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::kiro::model::events::TokenUsage;
 
 /// trace 记录默认保留天数
 const DEFAULT_RETENTION_DAYS: u64 = 7;
@@ -22,6 +25,9 @@ const DEFAULT_RETENTION_DAYS: u64 = 7;
 const ERROR_SNIPPET_MAX: usize = 2048;
 /// 查询默认返回条数
 pub const DEFAULT_QUERY_LIMIT: usize = 200;
+/// Evidence is bounded independently of request length and internal tool rounds.
+const PIPELINE_EVIDENCE_LIMIT: i64 = 256;
+const PIPELINE_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 
 /// 单次上游尝试的结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +223,39 @@ pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
     /// 凭据选择结果（粘性命中 / 换号）。默认空实现，非 trace 场景零开销。
     fn on_route(&self, _route: TraceRoute) {}
+    /// Metadata-only final-wire audit; callers must not include request bodies or header values.
+    fn on_wire_audit(&self, _audit: Value) {}
+    /// The final complete native snapshot for one actual provider round, never each metadata event.
+    fn on_native_usage(&self, _usage: TokenUsage) {}
+}
+
+/// Summarize retained native snapshots without inferring coverage or cache-hit acceptance.
+/// The producer settles one snapshot per provider round; equal snapshots from different
+/// rounds remain independent samples. Attempts and wire audits do not prove usage coverage.
+pub fn native_usage_summary(evidence: &[Value]) -> Value {
+    let mut count = 0_u64;
+    let mut read = 0_u64;
+    let mut write = 0_u64;
+    for sample in evidence {
+        if sample.get("kind").and_then(Value::as_str) != Some("native_usage") {
+            continue;
+        }
+        let Some(value) = sample.get("evidence") else {
+            continue;
+        };
+        let Ok(usage) = serde_json::from_value::<TokenUsage>(value.clone()) else {
+            continue;
+        };
+        count += 1;
+        read = read.saturating_add(usage.cache_read_input_tokens as u64);
+        write = write.saturating_add(usage.cache_write_input_tokens as u64);
+    }
+    serde_json::json!({
+        "nativeSampleCount": count,
+        "nativeCacheReadInputTokens": (count > 0).then_some(read),
+        "nativeCacheWriteInputTokens": (count > 0).then_some(write),
+        "allSamplesNative": null,
+    })
 }
 
 /// 查询过滤条件
@@ -310,6 +349,7 @@ impl TraceStore {
     /// 旧库迁移：为 traces 表补齐新增列（幂等，缺哪列加哪列）。
     /// 老版本的 traces.db 只有基础列，新增的 token/credits/first_token_ms/key_source 需在此 ALTER。
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(PIPELINE_EVIDENCE_SCHEMA)?;
         let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
         {
             let mut stmt = conn.prepare("PRAGMA table_info(traces)")?;
@@ -338,10 +378,7 @@ impl TraceStore {
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
             if !existing.contains(name) {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE traces ADD COLUMN {} {};",
-                    name, def
-                ))?;
+                conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {} {};", name, def))?;
             }
         }
         // session_id / client_ip 索引放在 migrate 里而不是 SCHEMA：老库补列之后才能建
@@ -378,6 +415,67 @@ impl TraceStore {
     pub fn set_retention_days(&self, days: u32) {
         self.retention_days
             .store(days.max(1) as u64, Ordering::Relaxed);
+    }
+
+    /// Attach bounded, redacted evidence only after the owning trace has been inserted.
+    /// Disabled tracing or a missing trace is a no-op; failed writes are returned, never panicked.
+    pub fn record_pipeline_evidence(
+        &self,
+        trace_id: &str,
+        kind: &str,
+        evidence: &Value,
+    ) -> anyhow::Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !trace_id.is_empty() && trace_id.len() <= 128,
+            "invalid trace identifier"
+        );
+        anyhow::ensure!(
+            !kind.is_empty() && kind.len() <= 64,
+            "invalid evidence kind"
+        );
+        let encoded = serde_json::to_string(evidence)?;
+        anyhow::ensure!(
+            encoded.len() <= PIPELINE_EVIDENCE_MAX_BYTES,
+            "pipeline evidence exceeds byte limit"
+        );
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO trace_pipeline_evidence (trace_id, kind, evidence) \
+             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM traces WHERE trace_id = ?1)",
+            rusqlite::params![trace_id, kind, encoded],
+        )?;
+        tx.execute(
+            "DELETE FROM trace_pipeline_evidence WHERE trace_id = ?1 AND id NOT IN \
+             (SELECT id FROM trace_pipeline_evidence WHERE trace_id = ?1 \
+              ORDER BY id DESC LIMIT ?2)",
+            rusqlite::params![trace_id, PIPELINE_EVIDENCE_LIMIT],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Chronological evidence for an existing trace; the query remains bounded even for old DBs.
+    pub fn pipeline_evidence(&self, trace_id: &str) -> anyhow::Result<Vec<Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.kind, e.evidence FROM trace_pipeline_evidence e \
+             INNER JOIN traces t ON t.trace_id = e.trace_id \
+             WHERE e.trace_id = ?1 ORDER BY e.id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![trace_id, PIPELINE_EVIDENCE_LIMIT],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        rows.map(|row| {
+            let (kind, encoded) = row?;
+            let evidence: Value = serde_json::from_str(&encoded)?;
+            Ok(serde_json::json!({"kind": kind, "evidence": evidence}))
+        })
+        .collect()
     }
 
     /// 写入一条完整链路（traces + attempts 在一个事务里）。失败仅 warn，不阻塞请求。
@@ -563,7 +661,12 @@ impl TraceStore {
         // 与其让用户先想清楚该填哪个字段，不如一个框同时匹配这几处。
         // LIKE 无法走索引，但已被上面的时间窗口把扫描范围收窄。
         if let Some(kw) = &q.keyword {
-            let pattern = format!("%{}%", kw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let pattern = format!(
+                "%{}%",
+                kw.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            );
             clauses.push(
                 "(model LIKE ? ESCAPE '\\' OR trace_id LIKE ? ESCAPE '\\' \
                  OR IFNULL(error_message, '') LIKE ? ESCAPE '\\' \
@@ -681,6 +784,11 @@ impl TraceStore {
                 [cutoff],
             )?;
             let n = tx.execute("DELETE FROM traces WHERE ts_epoch < ?1", [cutoff])?;
+            tx.execute(
+                "DELETE FROM trace_pipeline_evidence \
+                 WHERE NOT EXISTS (SELECT 1 FROM traces t WHERE t.trace_id = trace_pipeline_evidence.trace_id)",
+                [],
+            )?;
             Ok(n)
         })();
         match res {
@@ -718,6 +826,11 @@ impl TraceStore {
             let n = tx.execute(
                 "DELETE FROM traces WHERE final_credential_id = ?1",
                 [credential_id],
+            )?;
+            tx.execute(
+                "DELETE FROM trace_pipeline_evidence \
+                 WHERE NOT EXISTS (SELECT 1 FROM traces t WHERE t.trace_id = trace_pipeline_evidence.trace_id)",
+                [],
             )?;
             Ok(n)
         })();
@@ -789,6 +902,16 @@ pub struct FailureStats {
 
 /// 共享存储句柄
 pub type SharedTraceStore = Arc<TraceStore>;
+
+const PIPELINE_EVIDENCE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS trace_pipeline_evidence (
+    id INTEGER PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    evidence TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_evidence_trace ON trace_pipeline_evidence(trace_id, id);
+";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS traces (
@@ -911,11 +1034,243 @@ mod tests {
     fn mem_store() -> TraceStore {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        TraceStore::migrate(&conn).unwrap();
         TraceStore {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         }
+    }
+
+    #[test]
+    fn native_evidence_summary_does_not_convert_estimates_or_missing_fields_to_truth() {
+        let evidence = vec![
+            serde_json::json!({"kind": "wire_audit", "evidence": {"cacheReadInputTokens": 999}}),
+            serde_json::json!({"kind": "simulated", "evidence": {
+                "uncachedInputTokens": 1, "outputTokens": 2,
+                "cacheReadInputTokens": 999, "cacheWriteInputTokens": 999,
+            }}),
+            serde_json::json!({"kind": "native_usage", "evidence": {"outputTokens": 2}}),
+            serde_json::json!({"kind": "native_usage", "evidence": null}),
+            serde_json::json!({"kind": "native_usage", "evidence": {
+                "uncachedInputTokens": -1, "outputTokens": 2,
+                "cacheReadInputTokens": 20, "cacheWriteInputTokens": 10,
+            }}),
+        ];
+        assert_eq!(
+            native_usage_summary(&evidence),
+            serde_json::json!({
+                "nativeSampleCount": 0,
+                "nativeCacheReadInputTokens": null,
+                "nativeCacheWriteInputTokens": null,
+                "allSamplesNative": null,
+            })
+        );
+    }
+
+    #[test]
+    fn native_evidence_summary_aggregates_only_complete_native_rounds() {
+        let evidence = vec![
+            serde_json::json!({"kind": "native_usage", "evidence": {
+                "uncachedInputTokens": 1, "outputTokens": 2,
+                "cacheReadInputTokens": 20, "cacheWriteInputTokens": 10,
+            }}),
+            serde_json::json!({"kind": "native_usage", "evidence": {
+                "uncachedInputTokens": 2, "outputTokens": 3,
+                "cacheReadInputTokens": 30, "cacheWriteInputTokens": 0,
+            }}),
+        ];
+        assert_eq!(
+            native_usage_summary(&evidence),
+            serde_json::json!({
+                "nativeSampleCount": 2,
+                "nativeCacheReadInputTokens": 50,
+                "nativeCacheWriteInputTokens": 10,
+                "allSamplesNative": null,
+            })
+        );
+    }
+
+    #[test]
+    fn native_evidence_summary_preserves_explicit_zero_counters() {
+        let evidence = vec![serde_json::json!({"kind": "native_usage", "evidence": {
+            "uncachedInputTokens": 0, "outputTokens": 0,
+            "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0,
+        }})];
+        assert_eq!(
+            native_usage_summary(&evidence),
+            serde_json::json!({
+                "nativeSampleCount": 1,
+                "nativeCacheReadInputTokens": 0,
+                "nativeCacheWriteInputTokens": 0,
+                "allSamplesNative": null,
+            })
+        );
+    }
+
+    #[test]
+    fn pipeline_evidence_roundtrip_preserves_unknown_values() {
+        let store = mem_store();
+        store.insert(&sample_at("pipeline", "m1", 0));
+        let audit = serde_json::json!({
+            "serializedBytes": 1438,
+            "bodySha256": "redacted-fingerprint",
+            "cacheReadInputTokens": null,
+        });
+        store
+            .record_pipeline_evidence("pipeline", "wire_audit", &audit)
+            .unwrap();
+        store
+            .record_pipeline_evidence("pipeline", "native_usage", &serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(
+            store.pipeline_evidence("pipeline").unwrap(),
+            vec![
+                serde_json::json!({"kind": "wire_audit", "evidence": audit}),
+                serde_json::json!({"kind": "native_usage", "evidence": null}),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_evidence_obeys_trace_switch_and_never_creates_orphans() {
+        let store = mem_store();
+        let audit = serde_json::json!({"serializedBytes": 1});
+        store
+            .record_pipeline_evidence("missing", "wire_audit", &audit)
+            .unwrap();
+        store.insert(&sample_at("pipeline", "m1", 0));
+        store.set_enabled(false);
+        store
+            .record_pipeline_evidence("pipeline", "wire_audit", &audit)
+            .unwrap();
+        assert!(store.pipeline_evidence("pipeline").unwrap().is_empty());
+        let count: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM trace_pipeline_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        store.set_enabled(true);
+        store
+            .record_pipeline_evidence("pipeline", "wire_audit", &audit)
+            .unwrap();
+        assert_eq!(store.pipeline_evidence("pipeline").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pipeline_evidence_is_bounded_per_trace_and_rejects_oversized_values() {
+        let store = mem_store();
+        store.insert(&sample_at("pipeline", "m1", 0));
+        for round in 0..270 {
+            store
+                .record_pipeline_evidence(
+                    "pipeline",
+                    "wire_audit",
+                    &serde_json::json!({"round": round}),
+                )
+                .unwrap();
+        }
+        let evidence = store.pipeline_evidence("pipeline").unwrap();
+        assert_eq!(evidence.len(), 256);
+        assert_eq!(evidence[0]["evidence"]["round"], 14);
+        assert_eq!(evidence[255]["evidence"]["round"], 269);
+        assert!(
+            store
+                .record_pipeline_evidence(
+                    "pipeline",
+                    "wire_audit",
+                    &serde_json::json!({"oversized": "x".repeat(70_000)})
+                )
+                .is_err()
+        );
+        assert_eq!(store.pipeline_evidence("pipeline").unwrap().len(), 256);
+    }
+
+    #[test]
+    fn pipeline_evidence_cleanup_follows_trace_retention() {
+        let store = mem_store();
+        store.insert(&sample_at("old", "m1", 8 * 24 * 60 * 60));
+        store.insert(&sample_at("recent", "m1", 0));
+        for trace_id in ["old", "recent"] {
+            store
+                .record_pipeline_evidence(
+                    trace_id,
+                    "wire_audit",
+                    &serde_json::json!({"serializedBytes": 1}),
+                )
+                .unwrap();
+        }
+        store.cleanup();
+        assert!(store.pipeline_evidence("old").unwrap().is_empty());
+        assert_eq!(store.pipeline_evidence("recent").unwrap().len(), 1);
+        let count: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM trace_pipeline_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pipeline_evidence_is_deleted_with_its_credential() {
+        let store = mem_store();
+        for (trace_id, credential_id) in [("removed", 5), ("kept", 6)] {
+            store.insert(&sample(TraceSample {
+                trace_id,
+                status: "success",
+                credential_id,
+                model: "m1",
+            }));
+            store
+                .record_pipeline_evidence(
+                    trace_id,
+                    "wire_audit",
+                    &serde_json::json!({"serializedBytes": 1}),
+                )
+                .unwrap();
+        }
+        store.delete_for_credential(5);
+        assert!(store.pipeline_evidence("removed").unwrap().is_empty());
+        assert_eq!(store.pipeline_evidence("kept").unwrap().len(), 1);
+        let count: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM trace_pipeline_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pipeline_evidence_persistence_errors_are_returned_without_panicking() {
+        let store = mem_store();
+        store.insert(&sample_at("pipeline", "m1", 0));
+        store
+            .conn
+            .lock()
+            .execute_batch("DROP TABLE trace_pipeline_evidence")
+            .unwrap();
+        assert!(
+            store
+                .record_pipeline_evidence("pipeline", "wire_audit", &serde_json::json!({}))
+                .is_err()
+        );
+        assert!(store.pipeline_evidence("pipeline").is_err());
+        assert_eq!(
+            store
+                .query(&TraceQuery {
+                    limit: 1,
+                    ..Default::default()
+                })
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1192,7 +1547,10 @@ mod tests {
             ..Default::default()
         });
         let turn3 = out.iter().find(|r| r.trace_id == "s1-turn3").unwrap();
-        assert_eq!(turn3.sticky_outcome.as_deref(), Some(sticky::MISS_UNAVAILABLE));
+        assert_eq!(
+            turn3.sticky_outcome.as_deref(),
+            Some(sticky::MISS_UNAVAILABLE)
+        );
         assert_eq!(turn3.previous_credential_id, Some(5));
         assert_eq!(turn3.usage_source.as_deref(), Some(usage_source::SIMULATED));
     }
@@ -1294,6 +1652,15 @@ mod tests {
         assert_eq!(out[0].session_id.as_deref(), Some("sess-1"));
         assert_eq!(out[0].sticky_outcome.as_deref(), Some(sticky::HIT));
         assert_eq!(out[0].client_ip.as_deref(), Some("203.0.113.9"));
+        store
+            .record_pipeline_evidence("t1", "wire_audit", &serde_json::json!({"limits": null}))
+            .unwrap();
+        assert_eq!(
+            store.pipeline_evidence("t1").unwrap(),
+            vec![serde_json::json!({"kind": "wire_audit", "evidence": {"limits": null}})]
+        );
+        TraceStore::migrate(&store.conn.lock()).unwrap();
+        assert_eq!(store.pipeline_evidence("t1").unwrap().len(), 1);
     }
 
     #[test]

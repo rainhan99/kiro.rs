@@ -1,0 +1,35 @@
+{
+  "toolCompatibilityMode": "raw",
+  "cacheMeteringEnabled": false,
+  "requestPipeline": {
+    "mode": "enforce",
+    "stripBillingHeader": true,
+    "cacheStrategy": "static-prefix",
+    "agentMode": "vibe",
+    "ingressMaxBytes": 52428800,
+    "limits": {
+      "bodyBytes": 8000000,
+      "textFieldBytes": 600000,
+      "toolResultBytes": 600000,
+      "imageBase64Bytes": 400000
+    },
+    "artifacts": {
+      "enabled": true,
+      "thresholdBytes": 131072,
+      "maxStoreBytes": 67108864,
+      "maxArtifactBytes": 16777216,
+      "ttlSecs": 3600,
+      "readBytes": 16384,
+      "maxRounds": 4
+    },
+    "images": {
+      "strategy": "lossless-tiles",
+      "tileMaxBase64Bytes": 400000,
+      "maxTiles": 32,
+      "maxPixels": 40000000
+    },
+    "auditEnabled": true,
+    "allowSimulatedCache": false,
+    "kiroOnly": true
+  }
+}
