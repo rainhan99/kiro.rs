@@ -54,19 +54,26 @@ Files: `src/pipeline/mod.rs`, `src/kiro/provider.rs`, `src/kiro/model/available_
 
 Files: `src/anthropic/converter.rs`, `src/pipeline/config.rs`.
 
-- [ ] RED: tests asserting that concatenating emitted parts reproduces the original octets exactly, that boundaries fall on UTF-8 character boundaries, that pairing with `tool_use_id` survives, and that the feature is inert while disabled.
-- [ ] GREEN: emit multiple content entries within one tool result when the text exceeds the configured per-field budget, instead of joining every part into one string.
-- [ ] Gate behind configuration, default off, in the same revocable posture as the static-prefix cache strategy. Document the unverified upstream acceptance plainly; add no automatic reshaping or retry on rejection.
-- [ ] Confirm chunking neither offloads nor summarizes, and that artifact retrieval remains a separate opt-in mechanism.
+- [x] RED: tests asserting that concatenating emitted parts reproduces the original octets exactly, that boundaries fall on UTF-8 character boundaries, that pairing with `tool_use_id` survives, and that the feature is inert while disabled.
+- [x] GREEN: emit multiple content entries within one tool result when the text exceeds the configured per-field budget, instead of joining every part into one string.
+- [x] Gate behind configuration, default off, in the same revocable posture as the static-prefix cache strategy. Document the unverified upstream acceptance plainly; add no automatic reshaping or retry on rejection.
+- [x] Confirm chunking neither offloads nor summarizes, and that artifact retrieval remains a separate opt-in mechanism.
 
 ### Task 5: Integrate, verify, document
 
-- [ ] Surface the new token dimensions in the admin request-pipeline evidence view beside the existing byte measurements, labelled as estimate.
-- [ ] Update `docs/request-pipeline.md` and `docs/request-pipeline-coverage.md` to the post-phase-1 truth, including what remains unimplemented in phases 2 and 3.
-- [ ] Run focused regressions, both feature modes, clippy on touched files, the admin UI build, and the offline `--check-config` / `--inspect-request` fixtures.
-- [ ] Review the complete diff for security, compatibility and information loss; fix important findings and rerun covering tests.
+- [x] Surface the new token dimensions in the admin request-pipeline evidence view beside the existing byte measurements, labelled as estimate.
+- [x] Update `docs/request-pipeline.md` and `docs/request-pipeline-coverage.md` to the post-phase-1 truth, including what remains unimplemented in phases 2 and 3.
+- [x] Run focused regressions, both feature modes, clippy on touched files, the admin UI build, and the offline `--check-config` / `--inspect-request` fixtures.
+- [x] Review the complete diff for security, compatibility and information loss; fix important findings and rerun covering tests.
 
 ## Execution record
 
 - Takeover session: the prior Codex session's temporary toolchain is gone; Rust 1.98.1 installed at `~/.rustup`, so the `contracts.md` environment-prefix command form no longer applies.
 - No live Kiro requests or account experiments authorized or performed.
+- Task 1 observed real RED: every nested position counted zero, and a full agentic round scored identically to the one-line question preceding it. No existing assertion moved — nothing had ever pinned the input estimate, which is why the defect survived.
+- Task 2 found the concrete defect behind the substring classification: the formatted error string is not valid JSON, so the endpoint layer's field-confirmation branch always failed to parse and degraded to a bare `contains`. An existing test had pinned that defect as the contract and was rewritten against the typed error.
+- Task 3 did not observe a behavioural RED: the new tests could not compile before `audit()` gained its parameter. Mutation substituted — removing the section reassignment broke the disjointness and image-estimator tests. Recorded rather than claimed as TDD.
+- Task 4: the existing `inactive_tile_budget_does_not_prevent_small_ingress` test caught a real mistake, a `chunkBytes` bound applied even while the strategy was inactive. The same trap the lossless image tiles already guard against.
+- Task 5: the settings form rebuilds the whole `requestPipeline` on save, so a new backend field absent from the form would be silently reset on any web save. `toolResults` was given full form controls and two validation regressions rather than relying on that not happening.
+- Final: Rust 867 unit + 3 CLI passing in both feature modes, 1 ignored; clippy 117 binary warnings (118 before this work, all pre-existing style); admin UI 19 tests and production build passing; release binary offline `--check-config` and `--inspect-request` return `networkRequests:0`, `localBudgetAccepted:true`, `nativeCacheEvidence:null`, `evidenceType:construction-only`, body 1080 bytes, with no prompt text in the evidence output.
+- Diff review: no information loss (chunking byte-exact, error `Display` preserved verbatim, corrected counting affects estimates only); no new disclosure surface (`tokenMetrics` are counts, the retained upstream body is never echoed to clients); config additions carry the project's existing `deny_unknown_fields` downgrade hazard, now documented.

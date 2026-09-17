@@ -22,6 +22,10 @@
       "readBytes": 16384,
       "maxRounds": 4
     },
+    "toolResults": {
+      "strategy": "join",
+      "chunkBytes": 400000
+    },
     "images": {
       "strategy": "lossless-tiles",
       "tileMaxBase64Bytes": 400000,

@@ -6,6 +6,7 @@ const config = () => ({
   ingressMaxBytes: 52428800,
   limits: { bodyBytes: null, textFieldBytes: null, toolResultBytes: null, imageBase64Bytes: null },
   artifacts: { enabled: false, thresholdBytes: 131072, maxStoreBytes: 67108864, maxArtifactBytes: 16777216, ttlSecs: 3600, readBytes: 16384, maxRounds: 4 },
+  toolResults: { strategy: 'join', chunkBytes: 400000 },
   images: { strategy: 'preserve', tileMaxBase64Bytes: 400000, maxTiles: 32, maxPixels: 40000000 },
   auditEnabled: true, allowSimulatedCache: false, kiroOnly: true,
 })
@@ -35,6 +36,22 @@ describe('pipeline configuration editor', () => {
     expect(result.errors['limits.bodyBytes']).toBeTruthy()
     expect(result.errors['artifacts.thresholdBytes']).toBeTruthy()
     expect(result.errors['artifacts.maxArtifactBytes']).toBeTruthy()
+  })
+  test('inactive chunk budget does not block a small ingress', () => {
+    // 与后端 validate() 同一陷阱：关着的预算不得让配置无法保存。
+    const { draft } = createEditor(snapshot())
+    draft.ingressMaxBytes = '1024'
+    expect(validateDraft(draft).config?.toolResults.strategy).toBe('join')
+    draft['toolResults.strategy'] = 'lossless-chunks'
+    expect(validateDraft(draft).errors['toolResults.chunkBytes']).toBeTruthy()
+  })
+  test('active chunk budget must fit the tool-result limit or chunking is pointless', () => {
+    const { draft } = createEditor(snapshot())
+    draft['toolResults.strategy'] = 'lossless-chunks'
+    draft['limits.toolResultBytes'] = '100000'
+    expect(validateDraft(draft).errors['toolResults.chunkBytes']).toBeTruthy()
+    draft['toolResults.chunkBytes'] = '50000'
+    expect(validateDraft(draft).errors['toolResults.chunkBytes']).toBeFalsy()
   })
   test('active tile budget must fit ingress; inactive budget remains valid', () => {
     const { draft } = createEditor(snapshot())

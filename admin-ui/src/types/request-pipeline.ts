@@ -6,6 +6,7 @@ export interface PipelineConfig {
   ingressMaxBytes: number
   limits: { bodyBytes: number | null; textFieldBytes: number | null; toolResultBytes: number | null; imageBase64Bytes: number | null }
   artifacts: { enabled: boolean; thresholdBytes: number; maxStoreBytes: number; maxArtifactBytes: number; ttlSecs: number; readBytes: number; maxRounds: number }
+  toolResults: { strategy: 'join' | 'lossless-chunks'; chunkBytes: number }
   images: { strategy: 'preserve' | 'lossless-tiles'; tileMaxBase64Bytes: number; maxTiles: number; maxPixels: number }
   auditEnabled: boolean
   allowSimulatedCache: boolean

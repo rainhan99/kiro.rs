@@ -1,5 +1,6 @@
 import { useTracePipelineEvidence } from '@/hooks/use-traces'
 import type { NativeTokenUsage } from '@/types/api'
+import { tokenBudgetRows } from './trace-token-budget'
 
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -23,6 +24,7 @@ function numberLabel(value: unknown): string {
 
 function WireAudit({ value, index }: { value: Record<string, unknown>; index: number }) {
   const metrics = objectValue(value.metrics)
+  const tokenRows = tokenBudgetRows(value.tokenMetrics)
   const fields: [string, unknown][] = [
     ['完整请求指纹', value.wireFingerprint],
     ['语义请求指纹', value.semanticFingerprint],
@@ -58,6 +60,24 @@ function WireAudit({ value, index }: { value: Record<string, unknown>; index: nu
           </div>
         ))}
       </dl>
+      {tokenRows
+        ? (
+          <div className="mt-2 rounded border border-border/40 px-2 py-1.5">
+            <p className="text-[11px] font-medium">Token 预算分项</p>
+            <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[11px]">
+              {tokenRows.map((row) => (
+                <div key={row.label} className="contents">
+                  <dt className="text-muted-foreground">{row.label}</dt>
+                  <dd className="font-mono">{row.value}</dd>
+                </div>
+              ))}
+            </dl>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              本地估算，非上游 metadataEvent.tokenUsage；字节预算与 token 预算是两个口径，互不替代。本阶段只展示，不参与准入。
+            </p>
+          </div>
+        )
+        : null}
       {Array.isArray(value.violations) && value.violations.length > 0
         ? <p className="mt-2 break-all text-[11px] text-destructive">本地预算超限：{value.violations.filter((item) => typeof item === 'string').join('; ')}</p>
         : null}

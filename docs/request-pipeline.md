@@ -32,8 +32,15 @@
 | `images.strategy: preserve` | 原样保留图片，不走旧有损压缩/历史去重 |
 | `images.strategy: lossless-tiles` | 静态 PNG/JPEG/WebP 解码后按像素无损 PNG 切片；另附坐标；动画、容量不足明确报错 |
 | `artifacts.enabled` | 仅卸载超长历史用户文本和工具结果文本，保留原文，注入本地 read/search 工具 |
+| `toolResults.strategy: join/lossless-chunks` | `join` 为默认与既有行为（单个 text 条目）；`lossless-chunks` 把超过 `chunkBytes` 的工具结果切成多个 text 条目，逐字节可还原、切点落在 UTF-8 边界、与 `tool_use_id` 的配对不变。**不是卸载也不是摘要**：全文照发 |
 | `allowSimulatedCache:false` | 无论旧计量开关如何，客户端路径不采用模拟缓存分摊；原生用量缺失不补出“命中” |
 | `kiroOnly:true` | 拒绝配置外部 countTokensApiUrl；推理/搜索仍走现有 Kiro 路径 |
+
+`toolResults.strategy: lossless-chunks` 是**接受性未验证**的实验特性，默认关闭。上游 `toolResults[].content` 在 schema 上本就是数组，此前恒为单条目是转换器的选择；但本仓库从未向 Kiro 发送过多于一个条目的载荷，本项目也不允许为探测而发试探流量，因此**无法离线证明上游接受它**。与 `static-prefix` 同为可撤销策略：开启后若出现 400，改回 `join`，不会自动改形或重试去绕过拒绝。开启前可用离线检查肉眼验收线上形状——`--inspect-request` 输出的 `metrics.toolResultEntryCount` 大于 `toolResultCount` 即表示分片已生效，同时 `largestTextBytes` 应降到 `chunkBytes` 以内。
+
+Token 预算报告随请求构造审计一并输出（`tokenMetrics`）：按当前轮 / 历史 / 工具声明 / 工具结果 / 图片 / 其它给出互不重叠的分项，总量等于各项之和；该凭据已缓存的模型列表声明了 `maxInputTokens` 时附上限与余量，余量可为负（已越界）且不夹到 0。未缓存或上游未声明时上限与余量都是 `null`——**未知就是未知**，不按模型名推断，也不从上游拒绝反推；上限查询只读缓存，不会为了填一个报告字段去触发刷新或阻塞真实请求。这些数字全部标注 `source:"estimate"`：它们是本地估算，不是 `metadataEvent.tokenUsage`，不构成缓存或计费证据；**字节预算与 token 预算是两个口径，互不替代**。本阶段只展示不参与准入，按 `maxInputTokens` 做准入属于阶段 2。
+
+输入 token 估算已修正为递归遍历整棵内容树。此前只统计第一层 `text`，`tool_result` 正文、`tool_use.input`、`thinking` 与图片实际按 0 计——一个带大段文件内容的完整 agentic 轮次与仅一句提问估得一样多。修正后这些请求的估算值会上升；上游返回原生用量时仍以原生为准，修正只影响原生用量缺失时的兜底值，已落盘的历史用量日志不会重算。
 
 `agentMode` 的 body 和 IDE header 使用同一配置（vibe/spec）；不要为测缓存而反复切换。`toolCompatibilityMode:raw` 是示例中的独立选择：保留客户端工具定义；继续使用原来的 `claude-code` 模式则仍按既有兼容规则映射内置工具和 schema。
 
@@ -87,4 +94,6 @@ cachePoint 的 wire 形状参考 Kiro-account-manager 的 translator/types（研
 
 ## 回滚
 
-先把 `cacheStrategy` 改为 `off`、`artifacts.enabled` 改为 `false`、图片改为 `preserve` 并重启，可分别回退变换。若需要完全旧转换，设 `mode:off`；该模式也会恢复旧图像/工具描述转换行为，不适合作为保真模式。真实/估算来源校验与敏感日志修正不回退。SQLite 仅增加独立证据表，不改旧 trace 字段；证据随 trace 清理，未发布或自动重启运行中的实例。
+先把 `cacheStrategy` 改为 `off`、`artifacts.enabled` 改为 `false`、图片改为 `preserve`、`toolResults.strategy` 改为 `join` 并重启，可分别回退变换。
+
+注意二进制回退：`requestPipeline` 使用 `deny_unknown_fields`，因此新版本写过（或网页保存过）的配置文件含有旧版本不认识的字段时，旧二进制会**拒绝启动**而不是忽略它们。回退二进制前需同步删除对应配置段。这不是本次新增的行为，历次配置扩展都有同样性质。若需要完全旧转换，设 `mode:off`；该模式也会恢复旧图像/工具描述转换行为，不适合作为保真模式。真实/估算来源校验与敏感日志修正不回退。SQLite 仅增加独立证据表，不改旧 trace 字段；证据随 trace 清理，未发布或自动重启运行中的实例。

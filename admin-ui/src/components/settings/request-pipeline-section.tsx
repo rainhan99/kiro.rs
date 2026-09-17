@@ -17,10 +17,12 @@ const choices: Record<string, { value: string; label: string }[]> = {
   cacheStrategy: [{ value: 'off', label: '关闭' }, { value: 'static-prefix', label: '静态前缀（实验性）' }],
   agentMode: [{ value: 'vibe', label: 'Vibe' }, { value: 'spec', label: 'Spec' }],
   'images.strategy': [{ value: 'preserve', label: '保留原图' }, { value: 'lossless-tiles', label: '无损切片' }],
+  'toolResults.strategy': [{ value: 'join', label: '合并为单条目（默认）' }, { value: 'lossless-chunks', label: '无损分片（接受性未验证）' }],
 }
 const labels: Record<string, string> = {
   mode: '执行模式', stripBillingHeader: '移除计费标记头', cacheStrategy: '缓存策略', agentMode: '代理模式',
-  'artifacts.enabled': '启用原文分页读取', 'images.strategy': '图片策略', auditEnabled: '记录管线审计',
+  'artifacts.enabled': '启用原文分页读取', 'images.strategy': '图片策略',
+  'toolResults.strategy': '工具结果线上形状', auditEnabled: '记录管线审计',
   kiroOnly: '仅使用 Kiro', allowSimulatedCache: '允许模拟缓存',
   ...Object.fromEntries(numericFields.map((field) => [field.key, field.label])),
 }
@@ -180,6 +182,11 @@ export function RequestPipelineSection() {
           <SettingGroup title="原文存储与分页读取" description="仅转存历史用户文本和工具结果文本，不转存当前指令、系统提示、工具 schema、推理或工具输入。原文保存在当前进程内存中，由内部工具分页读取；保留可检索性，不保证与一次性输入全文有相同推理效果。有效期结束、容量淘汰或进程重启后可能不可用，这不是持久化记忆。转存阈值 ≤ 单个内容上限 ≤ 内存存储总上限。">
             {toggle('artifacts.enabled', '启用后，达到阈值的历史用户文本和工具结果文本可转为引用，通过内部读取轮次获取原文。')}
             {numbers(numericFields.filter((field) => field.key.startsWith('artifacts.')).map((field) => field.key))}
+          </SettingGroup>
+
+          <SettingGroup title="工具结果线上形状" description="默认把工具结果的所有片段合并成单个 text 条目，与既有行为一致。无损分片把超过分片上限的正文切成多个 text 条目：逐字节可还原、切点落在 UTF-8 字符边界、与 tool_use_id 的配对不变，全文照发，既不是转存也不是摘要。上游 content 字段本就是数组，但本项目从未向上游发送过多于一个条目的载荷，也不允许为探测而发试探流量，因此上游是否接受未经验证；开启后若出现 400，请改回合并，不会自动改形或重试。可先用离线检查验收形状。">
+            {select('toolResults.strategy', '合并为单条目，或把超过分片上限的工具结果切成多个无损条目。启用前建议先用 --inspect-request 确认线上形状。')}
+            {numbers(numericFields.filter((field) => field.key.startsWith('toolResults.')).map((field) => field.key))}
           </SettingGroup>
 
           <SettingGroup title="图片处理" description="无损切片保留解码后的像素，不保证与原压缩文件字节相同。切片、解码像素和 Base64 字节均受本地预算约束；启用切片时单块预算不能超过入口上限。">
