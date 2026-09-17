@@ -151,14 +151,21 @@ impl RequestPipeline {
         hex::encode(outer.finalize())
     }
 
+    /// 构造最终线上证据。
+    ///
+    /// `max_input_tokens` 是该模型声明的输入上限；调用方拿不到时传 `None`，报告如实
+    /// 记为未知。审计发生在本地预算检查与 HTTP 发送**之前**，因此它证明的是构造，
+    /// 不是已经发出。
     pub fn audit(
         &self,
         body: &str,
         endpoint: &str,
         credential_id: u64,
         headers: &http::HeaderMap,
+        max_input_tokens: Option<i64>,
     ) -> anyhow::Result<Value> {
         let metrics = measure_wire(body)?;
+        let token_metrics = measure_wire_tokens(body)?.with_ceiling(max_input_tokens);
         let wire: Value = serde_json::from_str(body)?;
         let mut semantic = wire.clone();
         if let Some(state) = semantic
@@ -207,6 +214,20 @@ impl RequestPipeline {
             "semanticFingerprint": self.fingerprint(b"semantic",&serde_json::to_vec(&semantic)?),
             "staticPrefixFingerprint": prefix.map(|v| self.fingerprint(b"prefix",&serde_json::to_vec(&v).unwrap())),
             "metrics": metrics, "violations": violations(&metrics,&self.config),
+            // token 与字节是两个并列口径，互不替代。`source` 固定为 estimate：
+            // 这些数字永远不是原生 tokenUsage，不构成缓存或计费证据。
+            "tokenMetrics": {
+                "source": "estimate",
+                "total": token_metrics.total,
+                "current": token_metrics.current,
+                "history": token_metrics.history,
+                "tools": token_metrics.tools,
+                "toolResults": token_metrics.tool_results,
+                "images": token_metrics.images,
+                "other": token_metrics.other,
+                "maxInputTokens": token_metrics.max_input_tokens,
+                "headroom": token_metrics.headroom
+            },
             "headerNames": header_names, "headerBytes": header_bytes,
             "cacheHitProven": false, "evidenceType": "construction-only"
         }))
@@ -466,6 +487,121 @@ fn violations(m: &WireMetrics, c: &PipelineConfig) -> Vec<String> {
             .map(|limit| format!("{name}={actual} exceeds {limit}"))
     })
     .collect()
+}
+
+/// 最终线上请求的 token 分项。
+///
+/// 与 [`WireMetrics`] 的字节口径**并列而非替代**：字节预算不是 token 预算，两者都不能
+/// 互相推导。本结构全部为**估算**（见 [`crate::token::count_tokens`]），不是原生
+/// `metadataEvent.tokenUsage`，也不会被当作缓存或计费证据。
+///
+/// 分项互不重叠：`tools` / `toolResults` / `images` 虽然嵌在 `currentMessage` 或
+/// `history` 之下，但归属会在进入这些子树时改判，因此 `total` 恰等于各分项之和。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireTokenMetrics {
+    pub total: u64,
+    /// 当前这一轮的用户消息文本（不含其下的工具/结果/图片）。
+    pub current: u64,
+    /// 历史消息文本（不含其下的工具/结果/图片）。
+    pub history: u64,
+    /// 工具声明（名称、描述、schema）。
+    pub tools: u64,
+    /// 工具结果正文。agentic 会话里通常是最大的一项。
+    pub tool_results: u64,
+    /// 图片，按共享估算器的 `(w×h)/750` 口径，不按 base64 串长度。
+    pub images: u64,
+    /// 未归入上述分项的线上字段。
+    pub other: u64,
+    /// 模型声明的输入上限。未知即为 `None`——不猜测、不按模型名推断、
+    /// 不从上游拒绝反推。本阶段只展示，不参与准入。
+    pub max_input_tokens: Option<i64>,
+    /// `max_input_tokens - total`。上限未知时为 `None`；可为负值表示已越界，
+    /// 不夹到 0，否则会掩盖越界的程度。
+    pub headroom: Option<i64>,
+}
+
+/// 线上 JSON 的分项归属。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WireSection {
+    Current,
+    History,
+    Tools,
+    ToolResults,
+    Images,
+    Other,
+}
+
+impl WireTokenMetrics {
+    fn add(&mut self, section: WireSection, tokens: u64) {
+        let slot = match section {
+            WireSection::Current => &mut self.current,
+            WireSection::History => &mut self.history,
+            WireSection::Tools => &mut self.tools,
+            WireSection::ToolResults => &mut self.tool_results,
+            WireSection::Images => &mut self.images,
+            WireSection::Other => &mut self.other,
+        };
+        *slot = slot.saturating_add(tokens);
+        self.total = self.total.saturating_add(tokens);
+    }
+
+    fn with_ceiling(mut self, max_input_tokens: Option<i64>) -> Self {
+        self.max_input_tokens = max_input_tokens;
+        self.headroom = max_input_tokens.map(|limit| limit - self.total as i64);
+        self
+    }
+}
+
+/// 统计最终线上请求的 token 分项。
+///
+/// 描述的是**实际发送的形状**（endpoint 转换之后），不是入站的 Anthropic 请求。
+pub fn measure_wire_tokens(body: &str) -> anyhow::Result<WireTokenMetrics> {
+    let value: Value = serde_json::from_str(body)?;
+    let mut m = WireTokenMetrics::default();
+
+    fn visit(value: &Value, key: Option<&str>, section: WireSection, m: &mut WireTokenMetrics) {
+        // 进入被识别的子树时改判归属，从而保证分项互不重叠。
+        let section = match key {
+            Some("history") => WireSection::History,
+            Some("currentMessage") => WireSection::Current,
+            Some("tools") => WireSection::Tools,
+            Some("toolResults") => WireSection::ToolResults,
+            Some("images") => WireSection::Images,
+            _ => section,
+        };
+
+        // 图片整体按估算器计一次，不下探——否则 base64 会被当作文本严重高估。
+        if section == WireSection::Images
+            && let Some(data) = value.pointer("/source/bytes").and_then(Value::as_str)
+        {
+            let format = value.get("format").and_then(Value::as_str).unwrap_or("png");
+            let media_type = format!("image/{format}");
+            m.add(
+                WireSection::Images,
+                crate::image_resize::estimate_image_tokens(&media_type, data) as u64,
+            );
+            return;
+        }
+
+        match value {
+            Value::Object(object) => {
+                for (k, v) in object {
+                    visit(v, Some(k), section, m);
+                }
+            }
+            Value::Array(items) => {
+                for v in items {
+                    visit(v, None, section, m);
+                }
+            }
+            Value::String(text) => m.add(section, crate::token::count_tokens(text)),
+            _ => {}
+        }
+    }
+
+    visit(&value, None, WireSection::Other, &mut m);
+    Ok(m)
 }
 
 pub fn measure_wire(body: &str) -> anyhow::Result<WireMetrics> {

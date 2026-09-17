@@ -744,6 +744,9 @@ impl KiroProvider {
                         "pre-credential",
                         0,
                         &http::HeaderMap::new(),
+                        // 选号之前没有凭据，也就没有该凭据的模型缓存可查；
+                        // 上限如实记为未知，不从别的凭据借一个值来充数。
+                        None,
                     ) {
                         audit["stage"] = serde_json::json!("local-rejection-before-credentials");
                         sink.on_wire_audit(audit);
@@ -882,11 +885,17 @@ impl KiroProvider {
                 .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
             if config.request_pipeline.audit_enabled {
                 if let Some(sink) = sink {
+                    // 只读该凭据已缓存的模型上限；查不到就是未知，不为一个报告字段
+                    // 去触发上游刷新或阻塞真实请求。
+                    let max_input_tokens = model.as_deref().and_then(|m| {
+                        self.token_manager.cached_model_max_input_tokens(ctx.id, m)
+                    });
                     sink.on_wire_audit(self.request_pipeline.audit(
                         &body,
                         endpoint_name,
                         ctx.id,
                         request.headers(),
+                        max_input_tokens,
                     )?);
                 }
             }

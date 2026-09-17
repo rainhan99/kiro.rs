@@ -66,18 +66,18 @@ fn fingerprints_ignore_headers_but_separate_wire_from_static_prefix() {
     let p = RequestPipeline::new(config::PipelineConfig::default());
     let mut body = json!({"profileArn":"secret-profile", "conversationState":{"conversationId":"a", "agentTaskType":"vibe", "history":[{"userInputMessage":{"content":"static","cachePoint":{"type":"default"}}}], "currentMessage":{"userInputMessage":{"content":"one","modelId":"m"}}}});
     let a = p
-        .audit(&body.to_string(), "ide", 1, &http::HeaderMap::new())
+        .audit(&body.to_string(), "ide", 1, &http::HeaderMap::new(), None)
         .unwrap();
     body["conversationState"]["currentMessage"]["userInputMessage"]["content"] = json!("two");
     let b = p
-        .audit(&body.to_string(), "ide", 1, &http::HeaderMap::new())
+        .audit(&body.to_string(), "ide", 1, &http::HeaderMap::new(), None)
         .unwrap();
     assert_ne!(a["wireFingerprint"], b["wireFingerprint"]);
     assert_eq!(a["staticPrefixFingerprint"], b["staticPrefixFingerprint"]);
     let mut headers = http::HeaderMap::new();
     headers.insert("amz-sdk-invocation-id", "changed".parse().unwrap());
     headers.insert("authorization", "Bearer SECRET".parse().unwrap());
-    let c = p.audit(&body.to_string(), "ide", 2, &headers).unwrap();
+    let c = p.audit(&body.to_string(), "ide", 2, &headers, None).unwrap();
     assert_eq!(b["wireFingerprint"], c["wireFingerprint"]);
     assert!(!c.to_string().contains("SECRET"));
     assert!(!c.to_string().contains("secret-profile"));
@@ -92,7 +92,7 @@ fn fingerprints_ignore_headers_but_separate_wire_from_static_prefix() {
     ] {
         let mut next = body.clone();
         *next.pointer_mut(pointer).unwrap() = json!(changed);
-        let audit = p.audit(&next.to_string(), "ide", 2, &headers).unwrap();
+        let audit = p.audit(&next.to_string(), "ide", 2, &headers, None).unwrap();
         assert_ne!(audit["scopeFingerprint"], c["scopeFingerprint"]); // G diagnostic partition only.
     }
 }
@@ -144,8 +144,8 @@ fn offline_abce_prove_construction_not_cache_hits() {
         },
     ]);
     let c = fixture_wire(&p, &mut c);
-    let aa = p.audit(&a, "ide", 1, &http::HeaderMap::new()).unwrap();
-    let cc = p.audit(&c, "ide", 1, &http::HeaderMap::new()).unwrap();
+    let aa = p.audit(&a, "ide", 1, &http::HeaderMap::new(), None).unwrap();
+    let cc = p.audit(&c, "ide", 1, &http::HeaderMap::new(), None).unwrap();
     assert_eq!(aa["staticPrefixFingerprint"], cc["staticPrefixFingerprint"]);
     assert_eq!(aa["metrics"]["cachePointCount"], 1);
     assert_eq!(aa["cacheHitProven"], false);
@@ -399,4 +399,109 @@ fn legacy_gateway_search_result_without_id_is_preserved_but_ambiguity_fails() {
         json!({"type":"server_tool_use","id":"search2","name":"web_search","input":{"query":"q2"}}),
     );
     assert!(p.prepare(&mut request, 1).is_err());
+}
+
+/// 线上 token 分项必须互不重叠：tools / toolResults / images 嵌在 current 或 history
+/// 之下，若不显式改判归属就会被重复计入父分项，总量对不上各项之和。
+#[test]
+fn wire_tokens_are_attributed_to_disjoint_sections() {
+    let wire = json!({"conversationState":{
+        "history":[
+            {"userInputMessage":{"content":"历史提问内容"}},
+            {"assistantResponseMessage":{"content":"历史回答内容"}}
+        ],
+        "currentMessage":{"userInputMessage":{
+            "content":"当前这一轮的提问",
+            "modelId":"claude-sonnet-4",
+            "images":[{"format":"png","source":{"bytes":"bm90LXZhbGlkLWJhc2U2NA=="}}],
+            "userInputMessageContext":{
+                "tools":[{"toolSpecification":{"name":"Read","description":"读取文件内容"}}],
+                "toolResults":[{"toolUseId":"t","content":[{"text":"工具返回的大段正文"}]}]
+            }
+        }}
+    }})
+    .to_string();
+
+    let t = measure_wire_tokens(&wire).unwrap();
+    assert!(t.current > 0, "当前轮文本应计入");
+    assert!(t.history > 0, "历史应计入");
+    assert!(t.tools > 0, "工具声明应计入");
+    assert!(t.tool_results > 0, "工具结果应计入");
+    assert!(t.images > 0, "图片应计入");
+    assert_eq!(
+        t.total,
+        t.current + t.history + t.tools + t.tool_results + t.images + t.other,
+        "分项必须互不重叠，总量等于各项之和"
+    );
+}
+
+/// 图片按共享的 (w×h)/750 口径计，不得把 base64 串当文本数——后者会离谱高估。
+#[test]
+fn image_tokens_use_shared_estimator_not_base64_text_length() {
+    let data = "A".repeat(20_000);
+    let wire = json!({"conversationState":{"currentMessage":{"userInputMessage":{
+        "content":"",
+        "images":[{"format":"png","source":{"bytes":data}}]
+    }}}})
+    .to_string();
+
+    let t = measure_wire_tokens(&wire).unwrap();
+    let as_text = crate::token::count_tokens(&"A".repeat(20_000));
+    assert_eq!(
+        t.images,
+        crate::image_resize::estimate_image_tokens("image/png", &"A".repeat(20_000)) as u64
+    );
+    assert!(
+        t.images < as_text,
+        "把 base64 当文本数会高估：估算器={} 文本口径={}",
+        t.images,
+        as_text
+    );
+}
+
+/// 模型上限未知时必须如实报未知，不得猜测、不得从拒绝反推。
+#[test]
+fn unknown_model_ceiling_is_reported_as_unknown() {
+    let p = RequestPipeline::new(config::PipelineConfig::default());
+    let wire = json!({"conversationState":{"currentMessage":{"userInputMessage":{
+        "content":"问题","modelId":"某个没有缓存上限的模型"
+    }}}});
+    let audit = p
+        .audit(&wire.to_string(), "ide", 1, &http::HeaderMap::new(), None)
+        .unwrap();
+    assert_eq!(audit["tokenMetrics"]["maxInputTokens"], serde_json::Value::Null);
+    assert_eq!(audit["tokenMetrics"]["headroom"], serde_json::Value::Null);
+    assert!(audit["tokenMetrics"]["total"].as_u64().unwrap() > 0);
+}
+
+/// 已知上限时给出余量；余量可为负（已超出），不夹到 0，否则会掩盖越界程度。
+#[test]
+fn known_ceiling_yields_headroom_that_may_go_negative() {
+    let p = RequestPipeline::new(config::PipelineConfig::default());
+    let wire = json!({"conversationState":{"currentMessage":{"userInputMessage":{
+        "content":"问题正文".repeat(50)
+    }}}});
+    let audit = p
+        .audit(&wire.to_string(), "ide", 1, &http::HeaderMap::new(), Some(1))
+        .unwrap();
+    let total = audit["tokenMetrics"]["total"].as_i64().unwrap();
+    assert_eq!(audit["tokenMetrics"]["maxInputTokens"], 1);
+    assert_eq!(audit["tokenMetrics"]["headroom"], 1 - total);
+    assert!(audit["tokenMetrics"]["headroom"].as_i64().unwrap() < 0);
+}
+
+/// 字节与 token 是两个口径，必须并列且各自标注，任何一方都不得替代另一方。
+#[test]
+fn byte_and_token_dimensions_stay_separately_labelled() {
+    let p = RequestPipeline::new(config::PipelineConfig::default());
+    let wire = json!({"conversationState":{"currentMessage":{"userInputMessage":{"content":"问题"}}}});
+    let audit = p
+        .audit(&wire.to_string(), "ide", 1, &http::HeaderMap::new(), None)
+        .unwrap();
+    assert!(audit["metrics"]["bodyBytes"].as_u64().unwrap() > 0, "字节口径仍在");
+    assert!(audit["tokenMetrics"]["total"].as_u64().unwrap() > 0, "token 口径并列");
+    assert_eq!(
+        audit["tokenMetrics"]["source"], "estimate",
+        "token 分项是估算，必须自带标注，不得被读成原生用量"
+    );
 }

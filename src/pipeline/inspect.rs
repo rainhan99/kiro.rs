@@ -63,7 +63,7 @@ pub fn run(config_path: &str, request_path: Option<&str>) -> anyhow::Result<()> 
             &config,
         );
         result["audit"] =
-            pipeline.audit(&wire, &config.default_endpoint, 0, &http::HeaderMap::new())?;
+            pipeline.audit(&wire, &config.default_endpoint, 0, &http::HeaderMap::new(), None)?;
         result["stage"] = json!(
             "offline-endpoint-without-credentials; final profile/header inspection occurs on normal traffic only"
         );

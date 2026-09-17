@@ -1560,6 +1560,26 @@ impl MultiTokenManager {
         })
     }
 
+    /// 读取该凭据缓存中某个模型声明的最大输入 token 数。
+    ///
+    /// **只读缓存**：不触发上游刷新，也不等待刷新完成——它服务于发送前的证据构造，
+    /// 不能为了一个报告字段去阻塞真实请求。缓存缺失、条目缺失或上游未声明该字段时
+    /// 一律返回 `None`，由调用方如实记为「未知」；绝不按模型名推断或从拒绝反推。
+    ///
+    /// 这里刻意不校验 TTL 新鲜度：过期的上限值仍然远比「未知」有参考价值，而模型的
+    /// 声明上限本身极少变动。
+    pub(crate) fn cached_model_max_input_tokens(&self, id: u64, model_id: &str) -> Option<i64> {
+        self.model_cache.lock().get(&id).and_then(|entry| {
+            entry
+                .response
+                .models
+                .iter()
+                .find(|m| m.model_id == model_id)
+                .and_then(|m| m.token_limits.as_ref())
+                .and_then(|limits| limits.max_input_tokens)
+        })
+    }
+
     fn model_cache_generation(&self, id: u64) -> u64 {
         self.model_cache_generations
             .lock()
