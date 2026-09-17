@@ -183,7 +183,89 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
+/// `redacted_thinking` 块的固定计量。输入侧与输出侧共用，避免两边漂移。
+const REDACTED_THINKING_TOKENS: u64 = 8;
+
+/// 内容块递归深度上限。
+///
+/// 畸形或恶意客户端可以构造任意深的嵌套 `tool_result`，递归计数必须有界终止而不是
+/// 打爆栈。超过上限的层不再深入（即宁可少算也不崩）；这只影响**估算数值**，不会
+/// 丢弃任何实际发送的内容——内容的取舍由 pipeline 负责，不由计数器负责。
+const MAX_CONTENT_DEPTH: usize = 16;
+
+/// 取块内某个字符串字段的 token 数。
+fn block_text_tokens(block: &serde_json::Value, key: &str) -> u64 {
+    block
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(count_tokens)
+        .unwrap_or(0)
+}
+
+/// 按序列化后的 JSON 计量结构化字段，与 [`estimate_output_tokens`] 对 `tool_use.input`
+/// 的口径一致。
+fn json_value_tokens(value: &serde_json::Value) -> u64 {
+    count_tokens(&serde_json::to_string(value).unwrap_or_default())
+}
+
+/// 图片块按 [`crate::image_resize::estimate_image_tokens`] 计量。
+///
+/// 这里不另造公式：该函数已对齐 Anthropic 的 `tokens ≈ (w×h)/750` 并带非零保底，
+/// 图片按 0 token 计会直接破坏 cache 口径精度。
+fn image_block_tokens(block: &serde_json::Value) -> u64 {
+    let Some(source) = block.get("source") else {
+        return 0;
+    };
+    let media_type = source
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("image/png");
+    let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    crate::image_resize::estimate_image_tokens(media_type, data) as u64
+}
+
+/// 递归统计单个内容块。
+fn count_content_block(block: &serde_json::Value, depth: usize) -> u64 {
+    match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "text" => block_text_tokens(block, "text"),
+        "thinking" => block_text_tokens(block, "thinking"),
+        "redacted_thinking" => REDACTED_THINKING_TOKENS,
+        "tool_use" => block.get("input").map(json_value_tokens).unwrap_or(0),
+        "tool_result" => block
+            .get("content")
+            .map(|content| count_content_value(content, depth + 1))
+            .unwrap_or(0),
+        "image" => image_block_tokens(block),
+        // 未知块只数显式 text，不为不透明载荷臆造公式。document 块在 enforce
+        // 模式下由 pipeline 直接拒绝（见 pipeline::tests），不会到达线上。
+        _ => block_text_tokens(block, "text"),
+    }
+}
+
+/// 递归统计 content 字段：它可能是裸字符串、块数组，或单个块对象。
+fn count_content_value(content: &serde_json::Value, depth: usize) -> u64 {
+    if depth > MAX_CONTENT_DEPTH {
+        return 0;
+    }
+    match content {
+        serde_json::Value::String(text) => count_tokens(text),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .map(|block| count_content_block(block, depth))
+            .sum(),
+        serde_json::Value::Object(_) => count_content_block(content, depth),
+        _ => 0,
+    }
+}
+
 /// 本地计算请求的输入 tokens
+///
+/// 递归遍历整棵内容树。此前只数第一层 `text`，导致 agentic 会话中最大的一块
+/// —— `tool_result` 正文 —— 连同 `tool_use.input`、`thinking` 和图片一起被完全
+/// 漏计（实测：一个带大段文件内容的完整轮次，与仅一句用户提问计得一样多）。
+///
+/// 本函数始终是**估算**：它不是、也不会被当作原生 `metadataEvent.tokenUsage`。
+/// 上游给出原生用量时以原生为准，缺失字段保持未知而非用估算填补。
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -198,17 +280,9 @@ fn count_all_tokens_local(
         }
     }
 
-    // 用户消息
+    // 对话消息：整棵内容树
     for msg in &messages {
-        if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
-        } else if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
-            }
-        }
+        total += count_content_value(&msg.content, 0);
     }
 
     // 工具定义
@@ -236,7 +310,7 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
             total += count_tokens(thinking) as i32;
         }
         if block.get("type").and_then(|v| v.as_str()) == Some("redacted_thinking") {
-            total += 8;
+            total += REDACTED_THINKING_TOKENS as i32;
         }
         if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
             // 工具调用开销
@@ -254,6 +328,127 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn user(content: serde_json::Value) -> Message {
+        Message {
+            role: "user".to_string(),
+            content,
+        }
+    }
+
+    fn assistant(content: serde_json::Value) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content,
+        }
+    }
+
+    /// 同一结构、只有嵌套位置的内容不同时，token 必须随之上升。
+    /// 用「空内容版本」做基线，隔离掉结构本身的开销。
+    fn nested_must_count(filled: serde_json::Value, empty: serde_json::Value, what: &str) {
+        let filled = count_all_tokens_local(None, vec![user(filled)], None);
+        let empty = count_all_tokens_local(None, vec![user(empty)], None);
+        assert!(
+            filled > empty,
+            "{what} 必须计入输入 token：填充={filled} 基线={empty}"
+        );
+    }
+
+    #[test]
+    fn counts_tool_result_string_content() {
+        let long = "工具输出内容".repeat(200);
+        nested_must_count(
+            json!([{"type": "tool_result", "tool_use_id": "t1", "content": long}]),
+            json!([{"type": "tool_result", "tool_use_id": "t1", "content": ""}]),
+            "tool_result 的字符串 content",
+        );
+    }
+
+    #[test]
+    fn counts_tool_result_array_content() {
+        let long = "嵌套数组里的工具输出".repeat(200);
+        nested_must_count(
+            json!([{"type": "tool_result", "tool_use_id": "t1",
+                    "content": [{"type": "text", "text": long}]}]),
+            json!([{"type": "tool_result", "tool_use_id": "t1",
+                    "content": [{"type": "text", "text": ""}]}]),
+            "tool_result 的数组 content",
+        );
+    }
+
+    #[test]
+    fn counts_tool_use_input() {
+        let long = "x".repeat(4000);
+        nested_must_count(
+            json!([{"type": "tool_use", "id": "t1", "name": "Bash",
+                    "input": {"command": long}}]),
+            json!([{"type": "tool_use", "id": "t1", "name": "Bash",
+                    "input": {"command": ""}}]),
+            "tool_use 的 input",
+        );
+    }
+
+    #[test]
+    fn counts_thinking_blocks() {
+        let long = "推理过程".repeat(200);
+        nested_must_count(
+            json!([{"type": "thinking", "thinking": long, "signature": "s"}]),
+            json!([{"type": "thinking", "thinking": "", "signature": "s"}]),
+            "thinking 块",
+        );
+    }
+
+    /// 图片不得按 0 token 计，且必须复用 image_resize 的 Anthropic 口径估算，
+    /// 不得在本模块另造一套公式。用保底路径验证委托关系，避免跨模块复制造图辅助。
+    #[test]
+    fn counts_image_blocks_with_shared_estimator() {
+        let data = "not-valid-base64!!!";
+        let tokens = count_all_tokens_local(
+            None,
+            vec![user(json!([{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": data}
+            }]))],
+            None,
+        );
+        let expected = crate::image_resize::estimate_image_tokens("image/png", data) as u64;
+        assert!(expected > 0, "共享估算器自身必须保底非零");
+        assert!(
+            tokens >= expected,
+            "图片 token 必须按共享估算器计入：实测={tokens} 期望至少={expected}"
+        );
+    }
+
+    /// 真实 agentic 轮次里，嵌套内容才是大头；只数第一层 text 会严重低估。
+    #[test]
+    fn agentic_round_is_dominated_by_nested_content() {
+        let bulk = "文件内容行".repeat(2000);
+        let messages = vec![
+            user(json!("读一下这个文件")),
+            assistant(json!([
+                {"type": "thinking", "thinking": "先调用工具"},
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/a"}}
+            ])),
+            user(json!([{"type": "tool_result", "tool_use_id": "t1", "content": bulk}])),
+        ];
+        let surface_only = count_all_tokens_local(None, vec![user(json!("读一下这个文件"))], None);
+        let full = count_all_tokens_local(None, messages, None);
+        assert!(
+            full > surface_only * 10,
+            "嵌套内容应主导总量：完整={full} 仅首层={surface_only}"
+        );
+    }
+
+    /// 病态深嵌套不得打爆栈；计数必须有界终止。
+    #[test]
+    fn deeply_nested_content_terminates() {
+        let mut nested = json!([{"type": "text", "text": "底"}]);
+        for _ in 0..512 {
+            nested = json!([{"type": "tool_result", "tool_use_id": "t", "content": nested}]);
+        }
+        let tokens = count_all_tokens_local(None, vec![user(nested)], None);
+        assert!(tokens >= 1);
+    }
 
     #[test]
     fn estimate_output_tokens_counts_thinking_blocks() {
