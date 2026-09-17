@@ -14,7 +14,7 @@ use tokio::time::sleep;
 use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{UpstreamRateLimitError, UpstreamRequestError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -558,7 +558,7 @@ impl KiroProvider {
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(UpstreamRequestError::mcp(status, &body).into());
                 continue;
             }
 
@@ -574,7 +574,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                return Err(UpstreamRequestError::mcp(status, &body).into());
             }
 
             // 401/403 凭据问题
@@ -638,7 +638,7 @@ impl KiroProvider {
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(UpstreamRequestError::mcp(status, &body).into());
                 continue;
             }
 
@@ -667,7 +667,7 @@ impl KiroProvider {
                     }
                     Some(rate_limit.into())
                 } else {
-                    Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body))
+                    Some(UpstreamRequestError::mcp(status, &body).into())
                 };
                 if attempt + 1 < max_retries {
                     // 429 限流用更长退避；408/5xx 仍用通用快速退避
@@ -693,7 +693,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                return Err(UpstreamRequestError::mcp(status, &body).into());
             }
 
             // 兜底
@@ -707,7 +707,7 @@ impl KiroProvider {
                 Some(&body),
                 attempt_start,
             );
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            last_error = Some(UpstreamRequestError::mcp(status, &body).into());
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -999,12 +999,7 @@ impl KiroProvider {
                     );
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(UpstreamRequestError::api(api_type, status, &body).into());
                 continue;
             }
 
@@ -1020,7 +1015,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamRequestError::api(api_type, status, &body).into());
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -1114,12 +1109,7 @@ impl KiroProvider {
                     );
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(UpstreamRequestError::api(api_type, status, &body).into());
                 continue;
             }
 
@@ -1197,7 +1187,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamRequestError::api(api_type, status, &body).into());
             }
 
             // 524 / gateway timeout：上游边缘层超时，继续在本次请求内重试通常只会
@@ -1215,7 +1205,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamRequestError::api(api_type, status, &body).into());
             }
 
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
@@ -1244,12 +1234,7 @@ impl KiroProvider {
                     }
                     Some(rate_limit.into())
                 } else {
-                    Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ))
+                    Some(UpstreamRequestError::api(api_type, status, &body).into())
                 };
                 if attempt + 1 < max_retries {
                     // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
@@ -1275,7 +1260,7 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamRequestError::api(api_type, status, &body).into());
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -1296,12 +1281,7 @@ impl KiroProvider {
                 Some(&body),
                 attempt_start,
             );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
+            last_error = Some(UpstreamRequestError::api(api_type, status, &body).into());
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }

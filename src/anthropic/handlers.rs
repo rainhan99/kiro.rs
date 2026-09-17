@@ -442,53 +442,66 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
-    // This undocumented error does not identify body, field or token-window limits.
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!("Kiro input length threshold rejection; no retry or model downgrade");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Kiro rejected input length (CONTENT_LENGTH_EXCEEDS_THRESHOLD). The upstream did not specify whether the limit concerns total body, a text/tool-result/image field, or model context. Inspect pipeline evidence; this request was not retried, truncated or downgraded.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-
-    // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
-    // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
-    // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
-    // Detection is centralized in the endpoint layer (single source of truth for the markers); the provider
-    // already bails out without retry on these, and this mapping is the client-facing safety net.
-    if crate::kiro::endpoint::default_is_client_validation_error(&err_str) {
-        tracing::warn!(
-            error = %err,
-            "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
-        );
-        // Return a stable, client-facing message and avoid echoing the raw upstream
-        // error string (which can carry request IDs or internal validation details).
-        // The full error is already logged above for diagnostics.
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
-            )),
-        )
-            .into_response();
+    // Upstream request-level rejections arrive typed. Classification already happened once,
+    // against the raw upstream body, where the JSON field confirmation actually works.
+    // Re-deriving it here from the formatted error string is what previously bypassed that
+    // confirmation: the formatted string is not valid JSON, so the endpoint layer's parse
+    // branch always failed and silently degraded to a bare substring match.
+    if let Some(rejection) = err.downcast_ref::<crate::kiro::error::UpstreamRequestError>() {
+        use crate::kiro::error::UpstreamRejectionKind;
+        match rejection.kind() {
+            // This undocumented error does not identify body, field or token-window limits.
+            UpstreamRejectionKind::ContentLengthThreshold => {
+                tracing::warn!(
+                    status = %rejection.status(),
+                    "Kiro input length threshold rejection; no retry or model downgrade"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        "Kiro rejected input length (CONTENT_LENGTH_EXCEEDS_THRESHOLD). The upstream did not specify whether the limit concerns total body, a text/tool-result/image field, or model context. Inspect pipeline evidence; this request was not retried, truncated or downgraded.",
+                    )),
+                )
+                    .into_response();
+            }
+            // 单次输入太长（请求体本身超出上游限制）
+            UpstreamRejectionKind::InputTooLong => {
+                tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        "Input is too long. Reduce the size of your messages.",
+                    )),
+                )
+                    .into_response();
+            }
+            // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid
+            // message sequence, etc.). The root cause is the client's own messages array, not an
+            // upstream failure, so it must not map to 5xx — otherwise it triggers an upstream
+            // cooldown that amplifies one client error into a 30+ burst of 503s. The provider
+            // already bails out without retry on these; this mapping is the client-facing net.
+            UpstreamRejectionKind::ClientValidation => {
+                tracing::warn!(
+                    error = %err,
+                    "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
+                );
+                // Return a stable, client-facing message and avoid echoing the raw upstream
+                // body (which can carry request IDs or internal validation details).
+                // The full error is already logged above for diagnostics.
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+            // The upstream refused for a reason it did not label. Do not guess one.
+            UpstreamRejectionKind::Unclassified => {}
+        }
     }
 
     tracing::error!("Kiro API 调用失败: {}", err);
@@ -2488,23 +2501,60 @@ mod tests {
         );
     }
 
+    fn upstream_rejection(status: u16, body: &str) -> anyhow::Error {
+        crate::kiro::error::UpstreamRequestError::api(
+            "非流式",
+            StatusCode::from_u16(status).unwrap(),
+            body,
+        )
+        .into()
+    }
+
     #[test]
     fn bedrock_client_validation_errors_map_to_400() {
         // 客户端校验错误必须映射为 400（而非 5xx），否则会被 provider 当作上游
-        // 瞬态错误触发冷却，放大成 503 风暴。识别逻辑集中在 endpoint 层。
-        for needle in [
-            // 精确 reason（provider 错误串里嵌着上游 body）
-            "非流式 API 请求失败: 500 {\"reason\":\"TOOL_USE_RESULT_MISMATCH\"}",
+        // 瞬态错误触发冷却，放大成 503 风暴。
+        //
+        // 分类现在由 provider 在读取**原始报文**时一次完成并随类型携带下来；
+        // 本测试因此构造 typed error，而不是像以前那样构造一条拼接字符串——
+        // 在拼接串上分类正是被修掉的缺陷（串不是合法 JSON，字段确认必然失败）。
+        for body in [
+            // 精确 reason
+            r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#,
             // message 级特异短语（纯文本报文）
             "Expected toolResult blocks but found none",
         ] {
-            let resp = map_provider_error(anyhow::anyhow!(needle.to_string()));
+            let resp = map_provider_error(upstream_rejection(500, body));
             assert_eq!(
                 resp.status(),
                 StatusCode::BAD_REQUEST,
-                "错误串 `{needle}` 应映射为 400"
+                "报文 `{body}` 应映射为 400"
             );
         }
+    }
+
+    /// 回归：关键词只是被报文的其它字段回显时，不得再判成客户端校验错误。
+    /// 旧实现在拼接字符串上做裸 `contains`，会把这种响应误杀成 400。
+    #[test]
+    fn echoed_validation_keyword_is_not_a_client_error() {
+        let resp = map_provider_error(upstream_rejection(
+            500,
+            r#"{"reason":"INTERNAL_SERVER_ERROR","message":"tool output mentioned TOOL_USE_RESULT_MISMATCH"}"#,
+        ));
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "偶然提及不等于该 reason 成立，应按上游错误走 502 而非误杀为 400"
+        );
+    }
+
+    #[test]
+    fn content_length_rejection_maps_to_400_without_attributing_a_limit() {
+        let resp = map_provider_error(upstream_rejection(
+            400,
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
