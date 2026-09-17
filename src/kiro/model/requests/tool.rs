@@ -94,6 +94,31 @@ impl ToolResult {
         }
     }
 
+    /// 用多个 text 条目构造工具结果。
+    ///
+    /// `content` 在上游本就是数组；[`Self::success`] / [`Self::error`] 恒写单条目是
+    /// 转换器的选择，不是 schema 限制。**上游是否接受多于一个条目尚未验证**，因此
+    /// 只有显式开启 `toolResults.strategy = lossless-chunks` 才会走到这里。
+    pub fn from_parts(tool_use_id: impl Into<String>, parts: &[&str], is_error: bool) -> Self {
+        let content = parts
+            .iter()
+            .map(|part| {
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "text".to_string(),
+                    serde_json::Value::String((*part).to_string()),
+                );
+                map
+            })
+            .collect();
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content,
+            status: Some(if is_error { "error" } else { "success" }.to_string()),
+            is_error,
+        }
+    }
+
     /// 创建错误的工具结果
     pub fn error(tool_use_id: impl Into<String>, error_message: impl Into<String>) -> Self {
         let mut map = serde_json::Map::new();

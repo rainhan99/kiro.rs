@@ -50,6 +50,40 @@ impl Default for ArtifactConfig {
     }
 }
 
+/// 工具结果的线上形状策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolResultStrategy {
+    /// 既有行为：把全部片段用换行拼成单个 text 条目。
+    #[default]
+    Join,
+    /// 超过 `chunkBytes` 的正文切成多个 text 条目，**字节完全保留**。
+    ///
+    /// 上游 `toolResults[].content` 本就是数组，此前恒为单条目是转换器的选择而非
+    /// schema 限制。但**上游是否接受多于一个条目尚未验证**：本仓库从未发送过这种
+    /// 载荷，且不允许为探测而发试探流量。因此该策略默认关闭，与 static-prefix
+    /// cachePoint 同为可撤销的实验特性；若开启后出现 400，应改回 `join`，不得
+    /// 自动改形或重试去绕过拒绝。
+    LosslessChunks,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolResultConfig {
+    pub strategy: ToolResultStrategy,
+    /// 单个 text 条目的字节上限。单个字符本身超过该值时整体成为一个分片，
+    /// 宁可超限也不切断 UTF-8 字符。
+    pub chunk_bytes: usize,
+}
+impl Default for ToolResultConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ToolResultStrategy::Join,
+            chunk_bytes: 400_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageConfig {
@@ -89,6 +123,7 @@ pub struct PipelineConfig {
     pub limits: WireLimits,
     pub artifacts: ArtifactConfig,
     pub images: ImageConfig,
+    pub tool_results: ToolResultConfig,
     pub audit_enabled: bool,
     pub allow_simulated_cache: bool,
     pub kiro_only: bool,
@@ -104,6 +139,7 @@ impl Default for PipelineConfig {
             limits: WireLimits::default(),
             artifacts: ArtifactConfig::default(),
             images: ImageConfig::default(),
+            tool_results: ToolResultConfig::default(),
             audit_enabled: true,
             allow_simulated_cache: false,
             kiro_only: true,
@@ -157,6 +193,25 @@ impl PipelineConfig {
             anyhow::ensure!(
                 i.tile_max_base64_bytes <= self.ingress_max_bytes,
                 "active lossless tile budget must fit ingressMaxBytes"
+            );
+        }
+        let t = &self.tool_results;
+        // 未启用的预算不得卡住配置：与 lossless-tiles 同理，只做与策略无关的下界校验。
+        anyhow::ensure!(
+            (1024..=100 * 1024 * 1024).contains(&t.chunk_bytes),
+            "requestPipeline.toolResults.chunkBytes must be between 1024 and 104857600"
+        );
+        if t.strategy == ToolResultStrategy::LosslessChunks {
+            anyhow::ensure!(
+                t.chunk_bytes <= self.ingress_max_bytes,
+                "active toolResults.chunkBytes must fit ingressMaxBytes"
+            );
+            // 分片是为了绕开单字段预算；分片本身还大于该预算就没有意义。
+            anyhow::ensure!(
+                self.limits
+                    .tool_result_bytes
+                    .is_none_or(|limit| t.chunk_bytes <= limit),
+                "active toolResults.chunkBytes must fit limits.toolResultBytes"
             );
         }
         Ok(())

@@ -714,7 +714,12 @@ pub fn convert_request_with_mode(
     req: &MessagesRequest,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
-    convert_request_inner(req, tool_compatibility_mode, false)
+    convert_request_inner(
+        req,
+        tool_compatibility_mode,
+        false,
+        crate::pipeline::config::ToolResultConfig::default(),
+    )
 }
 
 pub fn convert_request_with_pipeline(
@@ -726,6 +731,7 @@ pub fn convert_request_with_pipeline(
         req,
         mode,
         config.mode == crate::pipeline::config::PipelineMode::Enforce,
+        config.tool_results.clone(),
     )
 }
 
@@ -733,6 +739,7 @@ fn convert_request_inner(
     req: &MessagesRequest,
     tool_compatibility_mode: ToolCompatibilityMode,
     preserve: bool,
+    tool_results_config: crate::pipeline::config::ToolResultConfig,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model).ok_or_else(|| {
@@ -782,7 +789,7 @@ fn convert_request_inner(
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) =
-        process_message_content_dedup(&last_message.content, None, preserve)?;
+        process_message_content_dedup(&last_message.content, None, preserve, &tool_results_config)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
@@ -813,6 +820,7 @@ fn convert_request_inner(
         &mut tool_name_map,
         tool_compatibility_mode,
         preserve,
+        &tool_results_config,
     )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
@@ -903,6 +911,7 @@ fn process_message_content_dedup(
     content: &serde_json::Value,
     mut dedup: Option<&mut std::collections::HashSet<String>>,
     preserve: bool,
+    tool_results_config: &crate::pipeline::config::ToolResultConfig,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -939,13 +948,26 @@ fn process_message_content_dedup(
                                 );
                                 let is_error = block.is_error.unwrap_or(false);
 
-                                let mut result = if is_error {
+                                // 默认 join：与改造前逐字一致的单条目形状。
+                                // 开启 lossless-chunks 且超过 chunkBytes 时才切成多条目；
+                                // 切分逐字节保留原文，不摘要、不卸载、不引用替代。
+                                let result = if tool_results_config.strategy
+                                    == crate::pipeline::config::ToolResultStrategy::LosslessChunks
+                                    && result_content.len() > tool_results_config.chunk_bytes
+                                {
+                                    ToolResult::from_parts(
+                                        &tool_use_id,
+                                        &split_lossless(
+                                            &result_content,
+                                            tool_results_config.chunk_bytes,
+                                        ),
+                                        is_error,
+                                    )
+                                } else if is_error {
                                     ToolResult::error(&tool_use_id, result_content)
                                 } else {
                                     ToolResult::success(&tool_use_id, result_content)
                                 };
-                                result.status =
-                                    Some(if is_error { "error" } else { "success" }.to_string());
 
                                 tool_results.push(result);
                             }
@@ -1014,6 +1036,45 @@ fn extract_kiro_image(
 /// Text elements remain as tool_result placeholder text; blocks with `type=="image"` are extracted into a `KiroImage`
 /// and lifted to the top-level `images` (Amazon Q's `ToolResult` has no image field, so images can only go through the top-level channel).
 /// If a tool_result has only images and no text, the placeholder text "[image attached]" is used.
+/// 按字节上限把正文切成多个分片，切点落在 UTF-8 字符边界上。
+///
+/// **字节完全保留**：按序拼接所有分片必须逐字节还原原文——不插入分隔符、不丢弃、
+/// 不重排、不重新编码。这与 artifact 卸载是两回事：卸载要模型主动来读，分片则是
+/// 把全文一次性发出去，只是换了个线上形状。
+///
+/// 单个字符本身超过上限时整体成为一个分片：宁可该分片超限，也不切断字符产生非法
+/// UTF-8。调用方据此不能假设每片都 ≤ 上限。
+fn split_lossless(text: &str, max_bytes: usize) -> Vec<&str> {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return vec![text];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let remaining = &text[start..];
+        if remaining.len() <= max_bytes {
+            parts.push(remaining);
+            break;
+        }
+        // 从上限处向前退到最近的字符边界。
+        let mut cut = max_bytes;
+        while cut > 0 && !remaining.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == 0 {
+            // 首字符本身就超过上限。
+            cut = remaining
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(remaining.len());
+        }
+        parts.push(&remaining[..cut]);
+        start += cut;
+    }
+    parts
+}
+
 fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
@@ -1729,6 +1790,7 @@ fn build_history(
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
     preserve: bool,
+    tool_results_config: &crate::pipeline::config::ToolResultConfig,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
@@ -1800,7 +1862,7 @@ fn build_history(
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
                 let merged_user =
-                    merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve)?;
+                    merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve, tool_results_config)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -1817,7 +1879,7 @@ fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve, tool_results_config)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -1834,6 +1896,7 @@ fn merge_user_messages(
     model_id: &str,
     dedup: &mut std::collections::HashSet<String>,
     preserve: bool,
+    tool_results_config: &crate::pipeline::config::ToolResultConfig,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
@@ -1841,7 +1904,7 @@ fn merge_user_messages(
 
     for msg in messages {
         let (text, images, tool_results) =
-            process_message_content_dedup(&msg.content, Some(dedup), preserve)?;
+            process_message_content_dedup(&msg.content, Some(dedup), preserve, tool_results_config)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -3839,5 +3902,135 @@ mod tests {
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
         );
+    }
+
+    fn request_with_tool_result(body: &str) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+        MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": body}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    fn chunked_config(chunk_bytes: usize) -> crate::pipeline::config::PipelineConfig {
+        let mut config = crate::pipeline::config::PipelineConfig::default();
+        config.tool_results.strategy =
+            crate::pipeline::config::ToolResultStrategy::LosslessChunks;
+        config.tool_results.chunk_bytes = chunk_bytes;
+        config
+    }
+
+    /// 分片必须逐字节还原：拼接所有条目等于原文，不插入、不丢弃、不重排。
+    /// 切点落在 UTF-8 字符边界上，每个条目单独都是合法 UTF-8。
+    #[test]
+    fn lossless_chunking_emits_multiple_entries_that_reassemble_exactly() {
+        let body = "工具输出的一行内容\n".repeat(2000);
+        let converted =
+            convert_request_with_pipeline(&request_with_tool_result(&body), ToolCompatibilityMode::Raw, &chunked_config(4096))
+                .unwrap();
+        let tr = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+
+        assert_eq!(tr.len(), 1, "仍是同一个 tool_result，配对不变");
+        assert_eq!(tr[0].tool_use_id, "tool-1");
+        let parts: Vec<&str> = tr[0]
+            .content
+            .iter()
+            .map(|m| m.get("text").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert!(parts.len() > 1, "超过 chunkBytes 的正文应切成多个条目");
+        assert!(
+            parts.iter().all(|p| p.len() <= 4096),
+            "除非单字符超限，否则每片不得超过 chunkBytes"
+        );
+        assert_eq!(parts.concat(), body, "拼接必须逐字节还原原文");
+    }
+
+    /// 默认（join）下必须与改造前完全一致：单条目、内容原样。
+    #[test]
+    fn chunking_is_inert_while_disabled() {
+        let body = "工具输出的一行内容\n".repeat(2000);
+        let converted = convert_request_with_pipeline(
+            &request_with_tool_result(&body),
+            ToolCompatibilityMode::Raw,
+            &crate::pipeline::config::PipelineConfig::default(),
+        )
+        .unwrap();
+        let tr = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(tr[0].content.len(), 1, "关闭时必须仍是单个 text 条目");
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some(body.as_str())
+        );
+    }
+
+    /// 未超过阈值的正文不分片，避免为小结果引入无谓的多条目形状。
+    #[test]
+    fn short_tool_result_stays_a_single_entry_even_when_enabled() {
+        let converted = convert_request_with_pipeline(
+            &request_with_tool_result("short"),
+            ToolCompatibilityMode::Raw,
+            &chunked_config(4096),
+        )
+        .unwrap();
+        let tr = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(tr[0].content.len(), 1);
+    }
+
+    #[test]
+    fn split_lossless_never_cuts_a_character_and_keeps_bytes() {
+        // 每个汉字 3 字节；上限 4 字节时每片只能放一个字。
+        let text = "汉字测试";
+        let parts = split_lossless(text, 4);
+        assert_eq!(parts, vec!["汉", "字", "测", "试"]);
+        assert_eq!(parts.concat(), text);
+
+        // 单字符本身超过上限：整体成片，宁可超限也不产生非法 UTF-8。
+        let parts = split_lossless("汉", 2);
+        assert_eq!(parts, vec!["汉"]);
+
+        // 上限大于全文：不分片。
+        assert_eq!(split_lossless(text, 1024), vec![text]);
     }
 }

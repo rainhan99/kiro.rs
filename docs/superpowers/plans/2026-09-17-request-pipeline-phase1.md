@@ -26,29 +26,29 @@
 
 Files: `src/token.rs`.
 
-- [ ] RED: fixtures whose tokens live only in nested positions — `tool_result.content` as string and as array, `tool_use.input`, `thinking`, image and document blocks — assert the current counter under-reports each, and assert a mixed agentic fixture where nested content dominates the total.
-- [ ] GREEN: walk the whole content tree for input counting, reaching parity with the output estimator, which already counts `thinking` and `tool_use.input`.
-- [ ] Add final-wire counting over the constructed request so later tasks can report what is sent rather than what arrived.
-- [ ] Update the existing assertions that move to the corrected values; record the before/after figure for the mixed fixture. Do not bend the counter to preserve an old assertion.
-- [ ] Mutation-check that the new nested-position tests fail when each traversal branch is removed.
+- [x] RED: fixtures whose tokens live only in nested positions — `tool_result.content` as string and as array, `tool_use.input`, `thinking`, image and document blocks — assert the current counter under-reports each, and assert a mixed agentic fixture where nested content dominates the total.
+- [x] GREEN: walk the whole content tree for input counting, reaching parity with the output estimator, which already counts `thinking` and `tool_use.input`.
+- [x] Add final-wire counting over the constructed request so later tasks can report what is sent rather than what arrived.
+- [x] Update the existing assertions that move to the corrected values; record the before/after figure for the mixed fixture. Do not bend the counter to preserve an old assertion.
+- [x] Mutation-check that the new nested-position tests fail when each traversal branch is removed.
 
 ### Task 2: Structured upstream rejection
 
 Files: `src/kiro/error.rs`, `src/kiro/provider.rs`, `src/anthropic/handlers.rs`.
 
-- [ ] RED: tests asserting that an upstream rejection is classified from typed fields, including a body whose *prompt text* contains `CONTENT_LENGTH_EXCEEDS_THRESHOLD` or `Input is too long` and must not be misclassified by the current substring match.
-- [ ] GREEN: typed error carrying status, upstream code, message and retained raw body, in the shape of the existing typed rate-limit error; classify once where the body is read; select handler responses by downcast.
-- [ ] Preserve existing policy exactly: `CONTENT_LENGTH_EXCEEDS_THRESHOLD` stays unattributed between body, field, image and context window; client validation errors still terminate without rotation whatever status carried them; no retry, truncation or downgrade is introduced.
-- [ ] Confirm the error carries enough to state which local budget line a rejection is consistent with, and nothing beyond that.
+- [x] RED: tests asserting that an upstream rejection is classified from typed fields, including a body whose *prompt text* contains `CONTENT_LENGTH_EXCEEDS_THRESHOLD` or `Input is too long` and must not be misclassified by the current substring match.
+- [x] GREEN: typed error carrying status, upstream code, message and retained raw body, in the shape of the existing typed rate-limit error; classify once where the body is read; select handler responses by downcast.
+- [x] Preserve existing policy exactly: `CONTENT_LENGTH_EXCEEDS_THRESHOLD` stays unattributed between body, field, image and context window; client validation errors still terminate without rotation whatever status carried them; no retry, truncation or downgrade is introduced.
+- [x] Confirm the error carries enough to state which local budget line a rejection is consistent with, and nothing beyond that.
 
 ### Task 3: Token budget report
 
 Files: `src/pipeline/mod.rs`, `src/kiro/provider.rs`, `src/kiro/model/available_models.rs` plumbing.
 
-- [ ] RED: tests asserting per-section token attribution over a fixture, an unknown model ceiling reported as unknown rather than guessed, and byte and token dimensions remaining separately labelled.
-- [ ] GREEN: extend the final-wire metrics with token dimensions per section — system, tool declarations, history, current turn, tool results, images — plus measured total, declared `maxInputTokens` where the model list supplies it, and resulting headroom.
-- [ ] Emit through the existing wire-audit sink before the local budget check and transmission, inheriting its redaction rules; keep the existing stage marker on entries rejected before sending.
-- [ ] Verify no enforcement path reads the new fields in this phase.
+- [x] RED: tests asserting per-section token attribution over a fixture, an unknown model ceiling reported as unknown rather than guessed, and byte and token dimensions remaining separately labelled.
+- [x] GREEN: extend the final-wire metrics with token dimensions per section — system, tool declarations, history, current turn, tool results, images — plus measured total, declared `maxInputTokens` where the model list supplies it, and resulting headroom.
+- [x] Emit through the existing wire-audit sink before the local budget check and transmission, inheriting its redaction rules; keep the existing stage marker on entries rejected before sending.
+- [x] Verify no enforcement path reads the new fields in this phase.
 
 ### Task 4: Lossless tool-result chunking
 

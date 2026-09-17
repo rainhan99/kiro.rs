@@ -27,6 +27,9 @@ pub struct WireMetrics {
     pub largest_text_bytes: usize,
     pub largest_text_wire_bytes: usize,
     pub tool_result_count: usize,
+    /// 所有工具结果的 text 条目总数。等于 `tool_result_count` 表示每个结果都是单
+    /// 条目（默认形状）；大于它说明无损分片已生效，可据此在发送前肉眼验收线上形状。
+    pub tool_result_entry_count: usize,
     pub largest_tool_result_bytes: usize,
     pub image_count: usize,
     pub image_base64_bytes: usize,
@@ -642,6 +645,9 @@ pub fn measure_wire(body: &str) -> anyhow::Result<WireMetrics> {
                     m.tool_result_count += 1;
                     m.largest_tool_result_bytes =
                         m.largest_tool_result_bytes.max(value.to_string().len());
+                }
+                ["userInputMessageContext", "toolResults", "*", "content", "*"] => {
+                    m.tool_result_entry_count += 1;
                 }
                 ["cachePoint"] | ["userInputMessageContext", "tools", "*", "cachePoint"]
                     if value.is_object() =>
