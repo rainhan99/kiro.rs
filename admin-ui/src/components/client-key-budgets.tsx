@@ -109,7 +109,7 @@ function EditBudget({ keyId, existing }: { keyId: number; existing: Budget[] }) 
       )}
       <SettingRow
         label="强制方式"
-        hint="硬额度要求每条路都能算出保证不被突破的上界；算不出就拒绝该路，而不是用估算冒充保证。"
+        hint="硬额度要求每条路都能算出保证不被突破的上界；算不出就拒绝该路，而不是用估算冒充保证。软额度**允许**没有上界的预留——原生积分本来就没有可证的调用前上界——所以带上限的软额度是会被突破的，它是警戒线不是闸门。"
       >
         <select
           value={enforcement}

@@ -1353,3 +1353,54 @@ async fn a_bad_request_neither_falls_back_nor_leaks_its_reservation() {
     assert_eq!(credit.customer_pending, 0);
     assert_eq!(credit.used, crate::gateway::Amount::ZERO);
 }
+
+/// 账本里留作证据的用量**只含用量**，不含模型输出。
+///
+/// 这个值经结算写进账本，再由 `GET /gateway/requests` 读出来。账本是财务记录；
+/// 把整条响应存进去，等于让任何能看管理面的人读到所有回答内容与工具参数。
+#[tokio::test]
+async fn the_usage_evidence_stored_in_the_ledger_carries_no_model_output() {
+    let secret_text = "SENSITIVE-MODEL-OUTPUT-DO-NOT-STORE";
+    let router = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move || async move {
+            axum::Json(serde_json::json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "real-model",
+                "content": [{"type": "text", "text": secret_text}],
+                "usage": {
+                    "input_tokens": 1_000, "output_tokens": 500,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0
+                }
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let f = fixture(&format!("http://{addr}"), true);
+    f.entry
+        .handle(
+            WireProtocol::Anthropic,
+            serde_json::json!({
+                "model": "opus5", "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            7,
+            "r1".into(),
+            &[],
+        )
+        .await
+        .into_response_or_panic();
+
+    let requests = f.service.ledger().unwrap().list_requests(7, 10).unwrap();
+    let rendered = serde_json::to_string(&requests).unwrap();
+    assert!(
+        rendered.contains("1000") && rendered.contains("500"),
+        "用量本身要留下来：{rendered}"
+    );
+    assert!(
+        !rendered.contains(secret_text),
+        "账本里不得出现模型输出：{rendered}"
+    );
+}

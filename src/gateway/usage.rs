@@ -131,6 +131,20 @@ pub fn token_cost(prices: &TokenPrices, usage: &NativeUsage) -> anyhow::Result<A
     Ok(total)
 }
 
+/// 留作证据的原始用量。
+///
+/// **只取用量那一块**。传进来的往往是整条上游响应，里面有模型输出与工具参数；
+/// 这个值会经结算写进账本，再由管理接口读出来。账本是财务记录，不该装内容。
+///
+/// 没有 `usage` 键时原样返回：那种形状下 `normalize_*` 找不到必需的计数，
+/// 根本构造不出 `NativeUsage`，所以走不到这里。
+fn evidence(raw: &Value) -> Value {
+    match raw.get("usage") {
+        Some(usage) => usage.clone(),
+        None => raw.clone(),
+    }
+}
+
 fn usage_object(raw: &Value) -> anyhow::Result<Option<&serde_json::Map<String, Value>>> {
     match raw.get("usage") {
         Some(value) => value
@@ -203,7 +217,7 @@ fn normalize_kiro(raw: &Value, policy: CacheUsagePolicy) -> anyhow::Result<Optio
                 cache_write: EvidenceKind::Missing,
                 cache_write_1h: EvidenceKind::Missing,
             },
-            raw: raw.clone(),
+            raw: evidence(raw),
         }));
     };
     let Some(input) = required_counter(tokens, "uncachedInputTokens")? else {
@@ -245,7 +259,7 @@ fn normalize_kiro(raw: &Value, policy: CacheUsagePolicy) -> anyhow::Result<Optio
             cache_write: write_evidence,
             cache_write_1h: write_1h_evidence,
         },
-        raw: raw.clone(),
+        raw: evidence(raw),
     }))
 }
 
@@ -365,7 +379,7 @@ fn normalize_anthropic(
             cache_write: write_evidence,
             cache_write_1h: write_1h_evidence,
         },
-        raw: raw.clone(),
+        raw: evidence(raw),
     }))
 }
 
@@ -429,7 +443,7 @@ fn normalize_openai(
             cache_write: write_evidence,
             cache_write_1h: write_1h_evidence,
         },
-        raw: raw.clone(),
+        raw: evidence(raw),
     }))
 }
 
