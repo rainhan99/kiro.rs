@@ -45,7 +45,7 @@ impl IntoResponse for GatewayAdminError {
             Self::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "gateway_not_configured",
-                "多上游网关未配置；创建 gateway.json 后重启即可启用".to_string(),
+                "本服务未启用多上游网关".to_string(),
             ),
             Self::InvalidConfiguration(m) => (StatusCode::BAD_REQUEST, "invalid_configuration", m),
             Self::Conflict(m) => (StatusCode::CONFLICT, "configuration_conflict", m),
@@ -62,17 +62,17 @@ impl IntoResponse for GatewayAdminError {
 
 /// 「未配置」不只是没注入网关对象：缺少 `gateway.json` 时网关处于惰性状态，
 /// 既没有上游也没有模型，更没有账本。那时回一个空壳配置会让人以为配好了。
+/// 网关对象本身。**不要求已配置**——配置编辑器正是要在"还没配"的时候用，
+/// 否则只能先手写 gateway.json 再重启才进得去，而编辑器要编辑的就是那份文件。
+///
+/// 账本相关的端点另走 `ledger()`：没有账本时它们确实无话可说。
 fn gateway(
     state: &AdminState,
 ) -> Result<&crate::gateway::service::GatewayService, GatewayAdminError> {
-    let service = state
+    state
         .gateway
         .as_deref()
-        .ok_or(GatewayAdminError::NotConfigured)?;
-    if !service.is_configured() {
-        return Err(GatewayAdminError::NotConfigured);
-    }
-    Ok(service)
+        .ok_or(GatewayAdminError::NotConfigured)
 }
 
 fn ledger(state: &AdminState) -> Result<&crate::gateway::ledger::Ledger, GatewayAdminError> {
@@ -93,6 +93,7 @@ pub async fn get_config(State(state): State<AdminState>) -> Response {
     match service.config_store().redacted() {
         Ok(mut view) => {
             if let Some(object) = view.as_object_mut() {
+                object.insert("configured".into(), json!(service.is_configured()));
                 object.insert(
                     "managedModels".into(),
                     json!(
@@ -135,6 +136,14 @@ pub async fn put_config(
             .into_response();
         }
     };
+    // 账本打不开与配置不合法要让人做完全不同的事：一个去看磁盘，一个去改表单。
+    // 靠在错误文本里搜关键词区分太脆，所以在这里先单独问一次账本。
+    // `update_config` 内部仍会再确认一遍——那是真正的保证，这里只为把错误归对类。
+    if (!update.config.upstreams.is_empty() || !update.config.models.is_empty())
+        && let Err(error) = service.ensure_ledger()
+    {
+        return GatewayAdminError::Persistence(format!("{error:#}")).into_response();
+    }
     match service.update_config(update.revision, update.config) {
         Ok(outcome) => Json(json!({
             "revision": outcome.revision,

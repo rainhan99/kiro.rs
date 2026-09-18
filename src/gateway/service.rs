@@ -17,8 +17,9 @@
 //! 一次请求的模型映射、资费、路由模式与重试期限在开始时一次冻结。运行中改配置不影响
 //! 已经在飞的请求，而下一个请求会看到新配置——否则一次请求可能按 A 计价、按 B 路由。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -70,7 +71,10 @@ pub struct StartupAdoption {
 pub struct GatewayService {
     config: ConfigStore,
     routing: RoutingEngine,
-    ledger: Option<Ledger>,
+    /// 账本。惰性网关启动时为空，**第一次写入配置时按需打开**——否则管理界面
+    /// 会陷进一个死角：编辑器要求配置已存在，而配置只能靠手写文件再重启产生。
+    ledger: OnceLock<Ledger>,
+    ledger_path: PathBuf,
 }
 
 impl GatewayService {
@@ -82,21 +86,22 @@ impl GatewayService {
     pub fn open(config_path: &Path, ledger_path: &Path) -> Result<Self> {
         let config = ConfigStore::open(config_path)?;
         let snapshot = config.snapshot();
-        let ledger = if snapshot.config.upstreams.is_empty() && snapshot.config.models.is_empty() {
-            None
-        } else {
-            Some(Ledger::open(ledger_path).with_context(|| {
+        let ledger = OnceLock::new();
+        if !snapshot.config.upstreams.is_empty() || !snapshot.config.models.is_empty() {
+            let opened = Ledger::open(ledger_path).with_context(|| {
                 format!(
                     "网关已配置上游或模型，但账本 {} 无法打开；记不了账就不能收费，因此拒绝启动",
                     ledger_path.display()
                 )
-            })?)
-        };
+            })?;
+            let _ = ledger.set(opened);
+        }
         let routing = RoutingEngine::new(Duration::from_secs(snapshot.config.affinity_ttl_secs));
         Ok(Self {
             config,
             routing,
             ledger,
+            ledger_path: ledger_path.to_path_buf(),
         })
     }
 
@@ -111,7 +116,7 @@ impl GatewayService {
     ///
     /// 二、为尚未立户的遗留 Key 建立积分开账余额（见 [`super::import`]）。
     pub fn adopt_legacy_state(&self, keys: &[LegacyKeyBalance]) -> Result<StartupAdoption> {
-        let Some(ledger) = self.ledger.as_ref() else {
+        let Some(ledger) = self.ledger.get() else {
             return Ok(StartupAdoption::default());
         };
         Ok(StartupAdoption {
@@ -125,7 +130,7 @@ impl GatewayService {
     /// 用来防止已删 Key 的 id 被重新分配——那会把前一个同 id Key 的余额与历史
     /// 交给一个毫无关系的新 Key。
     pub fn highest_recorded_key_id(&self) -> Result<Option<u64>> {
-        match self.ledger.as_ref() {
+        match self.ledger.get() {
             Some(ledger) => ledger.max_recorded_key_id(),
             None => Ok(None),
         }
@@ -141,7 +146,26 @@ impl GatewayService {
 
     /// 账本。惰性网关下为 `None`——此时不存在需要记账的请求。
     pub fn ledger(&self) -> Option<&Ledger> {
-        self.ledger.as_ref()
+        self.ledger.get()
+    }
+
+    /// 确保账本可用，必要时当场打开。
+    ///
+    /// 只在**写入配置之前**调用：配置一旦声明了上游或模型，这个进程立刻就要为
+    /// 请求记账。打不开就拒绝那次写入——宁可保存失败，也不要让网关接管了模型
+    /// 却记不了账。
+    pub fn ensure_ledger(&self) -> Result<()> {
+        if self.ledger.get().is_some() {
+            return Ok(());
+        }
+        let opened = Ledger::open(&self.ledger_path).with_context(|| {
+            format!(
+                "账本 {} 无法打开；记不了账就不能收费，因此拒绝保存这份配置",
+                self.ledger_path.display()
+            )
+        })?;
+        let _ = self.ledger.set(opened);
+        Ok(())
     }
 
     pub fn config_store(&self) -> &ConfigStore {
@@ -235,6 +259,11 @@ impl GatewayService {
         expected_revision: u64,
         incoming: GatewayConfig,
     ) -> Result<super::config_store::UpdateOutcome> {
+        // 这份配置一旦声明了东西，本进程立刻要为请求记账，所以账本必须先就位。
+        // 顺序不可颠倒：先换配置再开账本，中间那一瞬网关已经接管却无账可记。
+        if !incoming.upstreams.is_empty() || !incoming.models.is_empty() {
+            self.ensure_ledger()?;
+        }
         let ttl = Duration::from_secs(incoming.affinity_ttl_secs);
         let outcome = self.config.update(expected_revision, incoming)?;
         self.routing.set_ttl(ttl);

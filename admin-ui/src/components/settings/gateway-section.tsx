@@ -367,13 +367,15 @@ export function GatewaySection() {
 
   if (isLoading) return <Loader2 className="h-4 w-4 animate-spin" />
   if (error) {
-    const notConfigured = isAxiosError(error) && error.response?.status === 404
+    // 404 只剩一种含义：这个服务根本没启用网关（启动时没传进来）。
+    // 「还没配」不再是错误——那正是要在这里配的。
+    const disabled = isAxiosError(error) && error.response?.status === 404
     return (
       <SettingGroup
         title="多上游网关"
         description={
-          notConfigured
-            ? '未配置。在缓存目录下创建 gateway.json 并重启即可启用；未配置时所有请求原样走既有 Kiro 路径，行为与从前完全一致。'
+          disabled
+            ? '本服务未启用多上游网关。所有请求原样走既有 Kiro 路径，行为与从前完全一致。'
             : '读取配置失败。'
         }
       >
@@ -416,6 +418,18 @@ export function GatewaySection() {
         <SettingReadout label="已保存版本">
           <span className="font-mono">{editor.revision}</span>
         </SettingReadout>
+        {!data.configured && (
+          <p className="rounded-md border border-dashed p-3 text-xs leading-relaxed text-muted-foreground">
+            还没有任何配置。先在下面「上游」里添加一个上游（
+            <span className="font-mono">anthropic</span> /
+            <span className="font-mono"> openai_chat</span> /
+            <span className="font-mono"> openai_responses</span> 走直连，填 baseUrl 与密钥；
+            <span className="font-mono"> kiro</span> 用既有凭据池，不填地址和密钥），再在「公开别名」
+            里建一个客户端要请求的模型名并挂上绑定。保存即生效，不需要重启。
+            <br />
+            保存之前，网关不接管任何模型，所有请求原样走既有 Kiro 路径。
+          </p>
+        )}
         <SettingReadout label="当前接管的别名">
           {editor.managedModels.length === 0 ? (
             <span className="text-muted-foreground">无（定义了但全部停用的模型不算接管）</span>

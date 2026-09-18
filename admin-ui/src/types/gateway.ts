@@ -74,6 +74,8 @@ export interface GatewayConfig {
 
 export interface GatewayConfigView {
   revision: number
+  /** 配置里是否真的声明了上游或模型。false 表示还是一张白纸。 */
+  configured: boolean
   config: GatewayConfig
   /** 当前真正被接管的别名；定义了却全部停用的不在其中。 */
   managedModels: string[]

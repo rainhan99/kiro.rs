@@ -283,20 +283,85 @@ async fn an_invalid_configuration_is_rejected_without_writing() {
     );
 }
 
-/// 未配置网关时，这些端点一律 404——而不是回一个空壳让人以为配好了。
+/// 未配置时，**账本相关**的端点一律 404——它们确实无话可说；
+/// 而配置端点必须可用，否则编辑器进不去（见 `a_fresh_install_can_be_configured_from_the_web`）。
 #[tokio::test]
-async fn an_unconfigured_gateway_reports_that_plainly() {
+async fn ledger_endpoints_report_plainly_that_there_is_no_ledger() {
     let f = Fixture::new(false).await;
-    for path in [
-        "/gateway/config",
-        "/gateway/requests?keyId=1",
-        "/client-keys/1/budgets",
-    ] {
+    for path in ["/gateway/requests?keyId=1", "/client-keys/1/budgets"] {
         let response = f.get(path).await;
         assert_eq!(response.status(), 404, "{path}");
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["error"]["code"], "gateway_not_configured", "{path}");
     }
+    // 配置端点是例外：还没配才更需要它。
+    assert_eq!(f.get("/gateway/config").await.status(), 200);
+}
+
+/// 全新安装必须能**从网页把配置创建出来**。
+///
+/// 否则运维要先手写 gateway.json 再重启才进得去编辑器——而编辑器要编辑的
+/// 正是那份文件。账本在这一刻按需打开，保存完立即可用，不需要重启。
+#[tokio::test]
+async fn a_fresh_install_can_be_configured_from_the_web() {
+    let f = Fixture::new(false).await;
+
+    // 还没配时，读接口给出空配置并如实标记，而不是 404 把人挡在门外。
+    let before: Value = f.get("/gateway/config").await.json().await.unwrap();
+    assert_eq!(before["configured"], false);
+    assert_eq!(before["config"]["models"], json!([]));
+    assert!(f.gateway.ledger().is_none(), "此时还不该有账本");
+
+    let response = f
+        .send(
+            reqwest::Method::PUT,
+            "/gateway/config",
+            &json!({
+                "revision": before["revision"],
+                "config": sample_config("https://api.example.test")
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "{:?}", response.text().await);
+
+    // 账本按需开出来了，网关立即可用——不需要重启。
+    assert!(f.gateway.ledger().is_some(), "保存时应当把账本打开");
+    let after: Value = f.get("/gateway/config").await.json().await.unwrap();
+    assert_eq!(after["configured"], true);
+    assert_eq!(after["managedModels"], json!(["opus5"]));
+
+    // 账本可用，额度端点也就通了。
+    assert_eq!(f.get("/client-keys/7/budgets").await.status(), 200);
+}
+
+/// 账本打不开就**拒绝保存**，而不是让网关接管了模型却记不了账。
+#[tokio::test]
+async fn a_configuration_is_refused_when_the_ledger_cannot_be_opened() {
+    let f = Fixture::new(false).await;
+    // 把账本路径占成目录，保证打不开。
+    std::fs::create_dir_all(f.directory.join("billing.db")).unwrap();
+
+    let before: Value = f.get("/gateway/config").await.json().await.unwrap();
+    let response = f
+        .send(
+            reqwest::Method::PUT,
+            "/gateway/config",
+            &json!({
+                "revision": before["revision"],
+                "config": sample_config("https://api.example.test")
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), 500);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "persistence_error");
+
+    // 配置没被改动：网关仍然什么都不接管。
+    assert!(
+        f.gateway.public_models().is_empty(),
+        "拒绝的保存不得留下半份配置"
+    );
+    assert!(f.gateway.ledger().is_none());
 }
 
 /// 额度用十进制字符串来回传递，绝不经过浮点。
