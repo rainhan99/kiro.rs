@@ -49,13 +49,16 @@ const choices: Record<string, { value: string; label: string }[]> = {
   agentMode: [{ value: 'vibe', label: 'Vibe' }, { value: 'spec', label: 'Spec' }],
   'images.strategy': [{ value: 'preserve', label: '保留原图' }, { value: 'lossless-tiles', label: '无损切片' }],
   'toolResults.strategy': [{ value: 'join', label: '合并为单条目（默认）' }, { value: 'lossless-chunks', label: '无损分片（接受性未验证）' }],
+  'toolCatalog.strategy': [{ value: 'inline', label: '一次性发送全部（默认）' }, { value: 'on-demand', label: '超预算时改为分页目录' }],
+  'chunkedMap.strategy': [{ value: 'off', label: '不提供（默认）' }, { value: 'model-invoked', label: '提供给模型调用（非无损）' }],
   admission: [{ value: 'off', label: '不拦截（默认）' }, { value: 'declared-ceiling', label: '按上游声明上限拦截' }],
   recovery: [{ value: 'off', label: '不重试（默认）' }, { value: 'lossless-retry', label: '无损修正后重发一次' }],
 }
 const labels: Record<string, string> = {
   mode: '执行模式', stripBillingHeader: '移除计费标记头', cacheStrategy: '缓存策略', agentMode: '代理模式',
   'artifacts.enabled': '启用原文分页读取', 'images.strategy': '图片策略',
-  'toolResults.strategy': '工具结果线上形状', admission: '发送前 token 准入',
+  'toolResults.strategy': '工具结果线上形状', 'toolCatalog.strategy': '工具声明发送方式',
+  'chunkedMap.strategy': '分块处理（非无损）', admission: '发送前 token 准入',
   recovery: '长度拒绝后的恢复', auditEnabled: '记录管线审计',
   kiroOnly: '仅使用 Kiro', allowSimulatedCache: '允许模拟缓存',
   ...Object.fromEntries(numericFields.map((field) => [field.key, field.label])),
@@ -219,6 +222,16 @@ export function RequestPipelineSection() {
           </SettingGroup>
 
           <CalibrationObservations />
+
+          <SettingGroup title="按需工具发现" description="声明的工具 schema 体积超过预算时，改为提供分页目录与按需揭示接口。可达性无损：没有工具被移除，网关也不替模型判断哪些工具重要，未揭示的工具随时可以再列目录索取。真实代价有两条：选工具时看到的是名称与描述而不是完整 schema；够到一个工具需要多花轮次。目录原样透传客户端的名称与描述，不摘要、不改写、不按相关性排序。">
+            {select('toolCatalog.strategy', '超预算时改为分页目录 + 按需揭示；被揭示的工具与客户端声明逐字一致。')}
+            {numbers(['toolCatalog.budgetBytes'])}
+          </SettingGroup>
+
+          <SettingGroup title="分块处理（不是无损机制）" description="⚠ 这一项会降低推理完整性，且无法靠实现质量弥补。切块后没有任何一轮同时看到超过一块，任何需要把两块原文放在一起才能得出的结论，在这个机制下都得不出来。它不是「不降智」的实现，也不应被这样理解。默认关闭；开启后也只是把工具提供给模型，由模型显式调用，网关不会背着模型自动套用。无损的替代路径是原文分页读取（kiro_context_read），能读得下就应该用它。每一块都是一次真实的上游轮次，按同一模型计费；块数超限直接报错，绝不静默只处理一部分。每块结果都带字节区间，合并由模型在自己的上下文里完成。">
+            {select('chunkedMap.strategy', '提供分块工具给模型调用。这不是无损机制，开启前请确认任务能接受跨块推理缺失。')}
+            {numbers(['chunkedMap.chunkBytes', 'chunkedMap.maxChunks'])}
+          </SettingGroup>
 
           <SettingGroup title="发送前准入与拒绝后恢复" description="两者都默认关闭，因为它们会改变请求的实际走向。准入按上游声明的 maxInputTokens 在发送前拒绝：判据是本地启发式估算而不是上游自己的计数，因此可能拒掉上游本来会接受的请求；上游没有声明上限时不拦截——未知不是无限也不是零。写死的模型名窗口表永远不会被当作上限。恢复只在拒绝分类明确指向长度预算时触发，对 payload 施加一次无损修正后同模型重发一次，没有第三次、不换补救手段、不换账号；它不改变正常请求的形状，修正只作用于这一次重试；修正后字节毫无变化时不重发。">
             {select('admission', '按上游声明的 maxInputTokens 在发送前拒绝。判据是估算，可能误拦。')}

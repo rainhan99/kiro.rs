@@ -7,6 +7,8 @@ const config = () => ({
   limits: { bodyBytes: null, textFieldBytes: null, toolResultBytes: null, imageBase64Bytes: null },
   artifacts: { enabled: false, thresholdBytes: 131072, maxStoreBytes: 67108864, maxArtifactBytes: 16777216, ttlSecs: 3600, readBytes: 16384, maxRounds: 4 },
   toolResults: { strategy: 'join', chunkBytes: 400000 },
+  toolCatalog: { strategy: 'inline', budgetBytes: 131072 },
+  chunkedMap: { strategy: 'off', chunkBytes: 32768, maxChunks: 8 },
   admission: 'off', recovery: 'off',
   images: { strategy: 'preserve', tileMaxBase64Bytes: 400000, maxTiles: 32, maxPixels: 40000000 },
   auditEnabled: true, allowSimulatedCache: false, kiroOnly: true,
@@ -45,6 +47,15 @@ describe('pipeline configuration editor', () => {
     const config = validateDraft(draft).config
     expect(config?.admission).toBe('declared-ceiling')
     expect(config?.recovery).toBe('lossless-retry')
+  })
+  test('tool catalog and chunked map survive a save', () => {
+    const { draft } = createEditor(snapshot())
+    draft['toolCatalog.strategy'] = 'on-demand'
+    draft['chunkedMap.strategy'] = 'model-invoked'
+    const config = validateDraft(draft).config
+    expect(config?.toolCatalog.strategy).toBe('on-demand')
+    expect(config?.chunkedMap.strategy).toBe('model-invoked')
+    expect(config?.chunkedMap.maxChunks).toBe(8)
   })
   test('inactive chunk budget does not block a small ingress', () => {
     // 与后端 validate() 同一陷阱：关着的预算不得让配置无法保存。

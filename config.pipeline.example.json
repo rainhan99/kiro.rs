@@ -26,6 +26,15 @@
       "strategy": "join",
       "chunkBytes": 400000
     },
+    "toolCatalog": {
+      "strategy": "inline",
+      "budgetBytes": 131072
+    },
+    "chunkedMap": {
+      "strategy": "off",
+      "chunkBytes": 32768,
+      "maxChunks": 8
+    },
     "admission": "off",
     "recovery": "off",
     "images": {
