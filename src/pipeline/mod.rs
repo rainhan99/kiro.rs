@@ -1,6 +1,7 @@
 //! Configurable request preparation and final-wire inspection. No upstream probes.
 pub mod artifacts;
 pub mod calibration;
+pub mod chunked_map;
 pub mod tool_catalog;
 pub mod config;
 pub mod images;
@@ -525,6 +526,45 @@ fn semantic_key(body: &str) -> Option<String> {
         state.remove("agentContinuationId");
     }
     serde_json::to_string(&value).ok()
+}
+
+/// 按字节上限把正文切成多个分片，切点落在 UTF-8 字符边界上。
+///
+/// **字节完全保留**：按序拼接所有分片必须逐字节还原原文——不插入分隔符、不丢弃、
+/// 不重排、不重新编码。这与 artifact 卸载是两回事：卸载要模型主动来读，分片则是
+/// 把全文一次性发出去，只是换了个线上形状。
+///
+/// 单个字符本身超过上限时整体成为一个分片：宁可该分片超限，也不切断字符产生非法
+/// UTF-8。调用方据此不能假设每片都 ≤ 上限。
+pub fn split_lossless(text: &str, max_bytes: usize) -> Vec<&str> {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return vec![text];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let remaining = &text[start..];
+        if remaining.len() <= max_bytes {
+            parts.push(remaining);
+            break;
+        }
+        // 从上限处向前退到最近的字符边界。
+        let mut cut = max_bytes;
+        while cut > 0 && !remaining.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == 0 {
+            // 首字符本身就超过上限。
+            cut = remaining
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(remaining.len());
+        }
+        parts.push(&remaining[..cut]);
+        start += cut;
+    }
+    parts
 }
 
 pub fn serialize_request(

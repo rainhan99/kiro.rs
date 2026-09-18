@@ -287,6 +287,19 @@ impl ContextSession {
         }
     }
 
+    /// 取某个原文的完整内容，供分块处理使用。
+    ///
+    /// 与分页读取走同一条租约与 scope 校验，因此同样受租户/会话隔离与过期约束；
+    /// 它不绕过任何边界，只是把已经可读的内容一次取全。
+    pub fn artifact_text(&self, artifact_id: &str) -> Result<Arc<str>> {
+        ensure!(
+            self.lease.store.config.enabled,
+            "context artifacts are disabled"
+        );
+        let entry = self.resolve(parse_id(artifact_id)?)?;
+        Ok(Arc::from(entry.text.as_ref()))
+    }
+
     fn resolve(&self, id: ArtifactId) -> Result<Arc<StoredArtifact>> {
         let mut lease = self.lease.state.lock();
         if let Some(entry) = lease.pins.get(&id) {

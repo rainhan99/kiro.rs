@@ -847,6 +847,9 @@ pub async fn post_messages(
     // 按需工具发现：声明的 schema 体积超预算时，改为提供分页目录 + 揭示接口。
     // 没有任何工具被移除；未揭示的工具仍可随时列目录索取，只是需要多花轮次。
     let catalog = take_tool_catalog(&mut payload, &provider.pipeline().config);
+    // 分块处理工具只在有原文会话时才有意义，且必须排在目录替换之后——否则它会被
+    // 当成客户端工具塞进目录里。默认关闭。
+    offer_chunked_map(&mut payload, &provider.pipeline().config, context.is_some());
     if context.is_some() || catalog.is_some() {
         let stream = payload.stream;
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -1086,6 +1089,29 @@ pub async fn post_messages(
         )
         .await
     }
+}
+
+/// 在有原文会话时提供分块处理工具（默认关闭）。
+///
+/// 只是**提供**：网关不会自动套用分块，模型必须显式调用。这样模型才不会在不知情的
+/// 情况下拿到由碎片推出的结论——工具描述里也写明了它不是无损机制。
+fn offer_chunked_map(
+    payload: &mut crate::anthropic::types::MessagesRequest,
+    config: &crate::pipeline::config::PipelineConfig,
+    has_context: bool,
+) {
+    if !has_context
+        || config.chunked_map.strategy != crate::pipeline::config::ChunkedMapStrategy::ModelInvoked
+    {
+        return;
+    }
+    payload
+        .tools
+        .get_or_insert_with(Vec::new)
+        .push(crate::pipeline::chunked_map::map_tool(
+            config.chunked_map.chunk_bytes,
+            config.chunked_map.max_chunks,
+        ));
 }
 
 /// 按需工具发现：超预算时把客户端工具换成目录接口，并把原始声明交给会话保管。
@@ -2032,6 +2058,9 @@ pub async fn post_messages_cc(
     // 按需工具发现：声明的 schema 体积超预算时，改为提供分页目录 + 揭示接口。
     // 没有任何工具被移除；未揭示的工具仍可随时列目录索取，只是需要多花轮次。
     let catalog = take_tool_catalog(&mut payload, &provider.pipeline().config);
+    // 分块处理工具只在有原文会话时才有意义，且必须排在目录替换之后——否则它会被
+    // 当成客户端工具塞进目录里。默认关闭。
+    offer_chunked_map(&mut payload, &provider.pipeline().config, context.is_some());
     if context.is_some() || catalog.is_some() {
         let stream = payload.stream;
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -2757,6 +2786,40 @@ mod tests {
 
         let mut payload = request_with_tools(0);
         assert!(take_tool_catalog(&mut payload, &on_demand_config(1024)).is_none());
+    }
+
+    fn model_invoked_map() -> crate::pipeline::config::PipelineConfig {
+        let mut config = crate::pipeline::config::PipelineConfig::default();
+        config.chunked_map.strategy = crate::pipeline::config::ChunkedMapStrategy::ModelInvoked;
+        config
+    }
+
+    /// 只在有原文会话且策略开启时提供；默认关闭，且无会话时不提供。
+    #[test]
+    fn chunked_map_is_offered_only_with_a_context_session_and_when_enabled() {
+        let has_map = |payload: &crate::anthropic::types::MessagesRequest| {
+            payload.tools.as_ref().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| crate::pipeline::chunked_map::is_map_tool(&t.name))
+            })
+        };
+
+        let mut payload = request_with_tools(1);
+        offer_chunked_map(&mut payload, &model_invoked_map(), true);
+        assert!(has_map(&payload), "开启且有会话时应提供");
+
+        let mut payload = request_with_tools(1);
+        offer_chunked_map(&mut payload, &model_invoked_map(), false);
+        assert!(!has_map(&payload), "没有原文会话时分块无对象可切");
+
+        let mut payload = request_with_tools(1);
+        offer_chunked_map(
+            &mut payload,
+            &crate::pipeline::config::PipelineConfig::default(),
+            true,
+        );
+        assert!(!has_map(&payload), "默认必须关闭");
     }
 
     fn rejection(body: &str) -> anyhow::Error {

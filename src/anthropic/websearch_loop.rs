@@ -234,11 +234,17 @@ impl ToolRoundDisposition {
 }
 
 fn is_server_tool(name: &str) -> bool {
-    name == "web_search" || is_internal_tool(name) || crate::pipeline::tool_catalog::is_catalog_tool(name)
+    name == "web_search"
+        || is_internal_tool(name)
+        || crate::pipeline::tool_catalog::is_catalog_tool(name)
+        || crate::pipeline::chunked_map::is_map_tool(name)
 }
 
 /// 目录轮次上限。模型可以反复列目录与索取 schema，但不能无限循环下去。
 const MAX_CATALOG_ROUNDS: usize = 8;
+
+/// 每块从属调用的输出上限。分块处理是抽取式的，不需要长输出。
+const CHUNK_MAP_MAX_TOKENS: i32 = 2048;
 
 /// Client calls must be handed back before another model round: their results
 /// are not available locally, so continuing would create unpaired history.
@@ -263,7 +269,9 @@ fn tool_round_disposition(
             ToolRoundDisposition::ContextLimitExceeded
         };
     }
-    let has_context = tool_uses.iter().any(|tool| is_internal_tool(&tool.name));
+    let has_context = tool_uses
+        .iter()
+        .any(|tool| is_internal_tool(&tool.name) || crate::pipeline::chunked_map::is_map_tool(&tool.name));
     if has_context {
         let Some(limit) = context_limit else {
             return ToolRoundDisposition::ContextUnavailable;
@@ -731,6 +739,88 @@ fn append_server_round(
         content: Value::Array(tool_results),
     });
     Ok(())
+}
+
+/// 执行分块处理：切分 → 每块一次真实上游轮次（同模型）→ 带区间返回。
+///
+/// **合并不在这里发生**：各块结果一起返回给模型，由模型在自己的上下文里关联，所以只有
+/// map 阶段是碎片化的。每块都是一次计费轮次，用量与普通轮次同样经 tracer 记录。
+async fn execute_chunked_map(
+    provider: &Arc<KiroProvider>,
+    context: Option<&ContextSession>,
+    tool: &CompletedToolUse,
+    model: &str,
+    tracer: &RequestTracer,
+    group: Option<&str>,
+    tool_compatibility_mode: ToolCompatibilityMode,
+) -> Value {
+    use crate::pipeline::chunked_map;
+    let error = |message: String| {
+        json!({"type":"tool_result","tool_use_id":tool.id,"is_error":true,
+            "content": json!({"error":"chunked_map_error","message":message}).to_string()})
+    };
+    let config = &provider.token_manager().config().request_pipeline.chunked_map;
+    let Some(context) = context else {
+        return error("chunked map requires an active context artifact session".into());
+    };
+    let (Some(artifact_id), Some(instruction)) = (
+        tool.input.get("artifact_id").and_then(Value::as_str),
+        tool.input.get("instruction").and_then(Value::as_str),
+    ) else {
+        return error("artifact_id and instruction are required".into());
+    };
+    let text = match context.artifact_text(artifact_id) {
+        Ok(text) => text,
+        Err(e) => return error(e.to_string()),
+    };
+    let ranges = match chunked_map::plan_chunks(&text, config.chunk_bytes, config.max_chunks) {
+        Ok(ranges) => ranges,
+        Err(e) => return error(e.to_string()),
+    };
+
+    let mut outputs = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        // 让出执行权：断开的 SSE 接收端应能在下一块开始前取消。
+        tokio::task::yield_now().await;
+        let request = chunked_map::chunk_request(
+            model,
+            instruction,
+            range,
+            text.len(),
+            &text[range.0..range.1],
+            CHUNK_MAP_MAX_TOKENS,
+        );
+        let fallback = token::count_all_tokens(
+            request.model.clone(),
+            request.system.clone(),
+            request.messages.clone(),
+            None,
+        ) as i32;
+        match run_round(
+            provider,
+            &request,
+            fallback,
+            tracer,
+            group,
+            tool_compatibility_mode,
+        )
+        .await
+        {
+            Ok((round, _)) => outputs.push(chunked_map::ChunkOutput {
+                range,
+                output: round.text,
+            }),
+            // 中途失败不静默丢块：直接报错，否则模型会以为它看过全部区间。
+            Err(failure) => {
+                return error(format!(
+                    "chunk {}-{} failed: {}",
+                    range.0, range.1, failure.error_message
+                ));
+            }
+        }
+    }
+    json!({"type":"tool_result","tool_use_id":tool.id,
+        "content": chunked_map::build_result(artifact_id, text.len(), &outputs).to_string()})
 }
 
 fn execute_catalog_tool(
@@ -1830,6 +1920,19 @@ async fn run_web_search_loop_inner(
                 } else if crate::pipeline::tool_catalog::is_catalog_tool(&tu.name) {
                     tokio::task::yield_now().await;
                     tool_results.push(execute_catalog_tool(catalog.as_mut(), tu));
+                } else if crate::pipeline::chunked_map::is_map_tool(&tu.name) {
+                    tool_results.push(
+                        execute_chunked_map(
+                            &provider,
+                            context.as_ref(),
+                            tu,
+                            &payload.model,
+                            tracer.as_ref(),
+                            group.as_deref(),
+                            tool_compatibility_mode,
+                        )
+                        .await,
+                    );
                 }
             }
         }

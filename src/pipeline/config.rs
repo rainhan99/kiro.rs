@@ -50,6 +50,40 @@ impl Default for ArtifactConfig {
     }
 }
 
+/// 分块处理策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChunkedMapStrategy {
+    /// 既有行为：不提供分块处理。
+    #[default]
+    Off,
+    /// 提供由**模型自己调用**的分块工具。
+    ///
+    /// **这不是无损机制**：切块后没有任何一轮同时看到超过一块，依赖跨块原文的结论
+    /// 无法得出。它不是"不降智"的实现，也不应被这样描述。网关不会背着模型自动套用，
+    /// 模型必须显式调用，才不会在不知情的情况下拿到由碎片推出的结论。
+    ModelInvoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChunkedMapConfig {
+    pub strategy: ChunkedMapStrategy,
+    /// 单块字节上限。
+    pub chunk_bytes: usize,
+    /// 块数上限。超过即报错，绝不静默只处理一部分。每块都是一次真实上游轮次。
+    pub max_chunks: usize,
+}
+impl Default for ChunkedMapConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ChunkedMapStrategy::Off,
+            chunk_bytes: 32_768,
+            max_chunks: 8,
+        }
+    }
+}
+
 /// 工具声明的发送策略。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -187,6 +221,7 @@ pub struct PipelineConfig {
     pub admission: AdmissionStrategy,
     pub recovery: RecoveryStrategy,
     pub tool_catalog: ToolCatalogConfig,
+    pub chunked_map: ChunkedMapConfig,
     pub audit_enabled: bool,
     pub allow_simulated_cache: bool,
     pub kiro_only: bool,
@@ -206,6 +241,7 @@ impl Default for PipelineConfig {
             admission: AdmissionStrategy::Off,
             recovery: RecoveryStrategy::Off,
             tool_catalog: ToolCatalogConfig::default(),
+            chunked_map: ChunkedMapConfig::default(),
             audit_enabled: true,
             allow_simulated_cache: false,
             kiro_only: true,
@@ -284,6 +320,11 @@ impl PipelineConfig {
         anyhow::ensure!(
             (1024..=100 * 1024 * 1024).contains(&c.budget_bytes),
             "requestPipeline.toolCatalog.budgetBytes must be between 1024 and 104857600"
+        );
+        let m = &self.chunked_map;
+        anyhow::ensure!(
+            (1024..=10 * 1024 * 1024).contains(&m.chunk_bytes) && (1..=64).contains(&m.max_chunks),
+            "requestPipeline.chunkedMap chunkBytes must be 1024..=10485760 and maxChunks 1..=64"
         );
         Ok(())
     }

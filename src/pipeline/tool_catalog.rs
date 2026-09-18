@@ -174,6 +174,8 @@ impl CatalogSession {
         self.declared.len()
     }
 
+    /// 仅供测试断言使用；运行期没有消费者，所以不留在正式接口上。
+    #[cfg(test)]
     pub fn revealed_count(&self) -> usize {
         self.revealed.len()
     }
