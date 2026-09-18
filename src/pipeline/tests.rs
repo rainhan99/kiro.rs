@@ -505,3 +505,62 @@ fn byte_and_token_dimensions_stay_separately_labelled() {
         "token 分项是估算，必须自带标注，不得被读成原生用量"
     );
 }
+
+fn admission_wire(repeat: usize) -> String {
+    json!({"conversationState":{"currentMessage":{"userInputMessage":{
+        "content": "问题正文".repeat(repeat), "modelId": "claude-sonnet-4"
+    }}}})
+    .to_string()
+}
+
+fn admitting_pipeline() -> RequestPipeline {
+    let mut cfg = config::PipelineConfig::default();
+    cfg.admission = config::AdmissionStrategy::DeclaredCeiling;
+    RequestPipeline::new(cfg)
+}
+
+/// 开启后，估算超过声明上限即在发送前拒绝，并说明这是估算。
+#[test]
+fn admission_refuses_above_the_declared_ceiling() {
+    let p = admitting_pipeline();
+    let wire = admission_wire(500);
+    let estimated = measure_wire_tokens(&wire).unwrap().total;
+    assert!(p.admit(&wire, Some(estimated as i64)).is_ok(), "恰好等于上限应放行");
+    let err = p.admit(&wire, Some(estimated as i64 - 1)).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("local_token_admission"));
+    assert!(
+        message.contains("local heuristic"),
+        "错误必须说明判据是本地估算，可能拒掉上游本会接受的请求：{message}"
+    );
+}
+
+/// 上限未知时不拦截：未知不是无限，也不是零，它只是没有依据去拦。
+#[test]
+fn admission_does_not_refuse_without_a_declared_ceiling() {
+    let p = admitting_pipeline();
+    let wire = admission_wire(5000);
+    assert!(p.admit(&wire, None).is_ok(), "未知上限不得拦截");
+    assert!(p.admit(&wire, Some(0)).is_ok(), "0 视为无有效声明，不得当成零配额拦死");
+    assert!(p.admit(&wire, Some(-1)).is_ok());
+}
+
+/// 关闭时（默认）行为与改造前完全一致，任何大小都不拦。
+#[test]
+fn admission_is_inert_while_disabled() {
+    let p = RequestPipeline::new(config::PipelineConfig::default());
+    let wire = admission_wire(5000);
+    assert!(p.admit(&wire, Some(1)).is_ok());
+}
+
+/// 写死的模型名窗口表永远不得充当上限：即便它给出一个很小的值，
+/// 只要上游没有声明，就不拦——拿猜测做拦截等于把猜测升级成门禁。
+#[test]
+fn hardcoded_window_table_is_never_used_as_a_ceiling() {
+    let p = admitting_pipeline();
+    let wire = admission_wire(5000);
+    let guessed = crate::anthropic::converter::get_context_window_size("claude-sonnet-4");
+    assert!(guessed > 0, "该模型确实有一个写死的窗口值");
+    // admit 只接受显式传入的声明上限；没有任何路径会把猜测表喂进来。
+    assert!(p.admit(&wire, None).is_ok());
+}

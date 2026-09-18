@@ -50,6 +50,21 @@ impl Default for ArtifactConfig {
     }
 }
 
+/// 发送前的 token 准入策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdmissionStrategy {
+    /// 既有行为：不做 token 层面的本地拦截。
+    #[default]
+    Off,
+    /// 估算输入 token 超过**上游声明**的 `maxInputTokens` 时，发送前拒绝。
+    ///
+    /// 判据是本地启发式估算，不是上游自己的计数，因此**可能拒掉上游本来会接受的
+    /// 请求**。这就是它默认关闭的原因。写死的模型名窗口表永远不得充当这里的上限：
+    /// 它是一个猜测，拿猜测做拦截等于把猜测升级成门禁。
+    DeclaredCeiling,
+}
+
 /// 工具结果的线上形状策略。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -124,6 +139,7 @@ pub struct PipelineConfig {
     pub artifacts: ArtifactConfig,
     pub images: ImageConfig,
     pub tool_results: ToolResultConfig,
+    pub admission: AdmissionStrategy,
     pub audit_enabled: bool,
     pub allow_simulated_cache: bool,
     pub kiro_only: bool,
@@ -140,6 +156,7 @@ impl Default for PipelineConfig {
             artifacts: ArtifactConfig::default(),
             images: ImageConfig::default(),
             tool_results: ToolResultConfig::default(),
+            admission: AdmissionStrategy::Off,
             audit_enabled: true,
             allow_simulated_cache: false,
             kiro_only: true,

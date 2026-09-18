@@ -883,22 +883,26 @@ impl KiroProvider {
             let request = request
                 .build()
                 .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
-            if config.request_pipeline.audit_enabled {
-                if let Some(sink) = sink {
-                    // 只读该凭据已缓存的模型上限；查不到就是未知，不为一个报告字段
-                    // 去触发上游刷新或阻塞真实请求。
-                    let max_input_tokens = model.as_deref().and_then(|m| {
-                        self.token_manager.cached_model_max_input_tokens(ctx.id, m)
-                    });
-                    sink.on_wire_audit(self.request_pipeline.audit(
-                        &body,
-                        endpoint_name,
-                        ctx.id,
-                        request.headers(),
-                        max_input_tokens,
-                    )?);
-                }
+            // 只读该凭据已缓存的模型上限；查不到就是未知，不为一个报告字段或一次
+            // 准入判定去触发上游刷新或阻塞真实请求。审计与准入共用同一次查询，
+            // 且准入不依赖审计开关——关掉审计不该悄悄关掉门禁。
+            let max_input_tokens = model
+                .as_deref()
+                .and_then(|m| self.token_manager.cached_model_max_input_tokens(ctx.id, m));
+            if config.request_pipeline.audit_enabled
+                && let Some(sink) = sink
+            {
+                sink.on_wire_audit(self.request_pipeline.audit(
+                    &body,
+                    endpoint_name,
+                    ctx.id,
+                    request.headers(),
+                    max_input_tokens,
+                )?);
             }
+            // 发送前按上游声明的上限拒绝（默认关闭）。放在 preflight 之前，
+            // 与字节预算一样属于"本地判定，未发出任何请求"。
+            self.request_pipeline.admit(&body, max_input_tokens)?;
             self.request_pipeline.preflight(&body)?;
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,

@@ -44,6 +44,20 @@ pub struct WireMetrics {
 )]
 pub struct LocalPayloadLimit(pub String);
 
+/// 发送前按声明上限拒绝。
+///
+/// 与 [`LocalPayloadLimit`] 分开成两个类型，因为两者的判据性质不同：字节预算是运维
+/// 自己配置的策略，而这里比的是**本地估算**与**上游声明的上限**。错误文案必须把
+/// 「估算」说清楚——它可能拒掉上游本来会接受的请求。
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "local_token_admission: estimated {estimated} input tokens exceed the model's declared maxInputTokens {ceiling}. The estimate is a local heuristic, not the upstream's own count, so this can refuse a request the upstream would have accepted; no request was sent and no content was truncated"
+)]
+pub struct LocalTokenAdmission {
+    pub estimated: u64,
+    pub ceiling: i64,
+}
+
 impl RequestPipeline {
     pub fn new(config: PipelineConfig) -> Self {
         let mut fingerprint_key = [0u8; 32];
@@ -108,6 +122,28 @@ impl RequestPipeline {
             user_id: Some(format!("pipeline_session_{session_id}")),
         });
         Ok(Some(session))
+    }
+
+    /// 发送前的 token 准入检查。
+    ///
+    /// `max_input_tokens` 必须来自**上游声明**（凭据缓存里的模型列表）。上限未知时
+    /// 不拦截：未知不是无限，也不是零，它只是「没有依据去拦」。写死的窗口表不是上限，
+    /// 不得传进来。
+    ///
+    /// 策略关闭（默认）时本函数永不拒绝，行为与改造前完全一致。
+    pub fn admit(&self, body: &str, max_input_tokens: Option<i64>) -> anyhow::Result<()> {
+        if self.config.admission != config::AdmissionStrategy::DeclaredCeiling {
+            return Ok(());
+        }
+        let Some(ceiling) = max_input_tokens.filter(|value| *value > 0) else {
+            return Ok(());
+        };
+        let estimated = measure_wire_tokens(body)?.total;
+        anyhow::ensure!(
+            estimated <= ceiling as u64,
+            LocalTokenAdmission { estimated, ceiling }
+        );
+        Ok(())
     }
 
     pub fn preflight(&self, body: &str) -> anyhow::Result<WireMetrics> {

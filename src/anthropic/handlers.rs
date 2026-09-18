@@ -472,6 +472,19 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // 本地按声明上限拒绝：与字节预算同为 413，但用独立的错误码，运维才能分清
+    // 拒绝来自运维自配的字节预算还是来自「估算 vs 上游声明上限」的比较。
+    if err
+        .downcast_ref::<crate::pipeline::LocalTokenAdmission>()
+        .is_some()
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse::new("local_token_admission", err_str)),
+        )
+            .into_response();
+    }
+
     // Upstream request-level rejections arrive typed. Classification already happened once,
     // against the raw upstream body, where the JSON field confirmation actually works.
     // Re-deriving it here from the formatted error string is what previously bypassed that
