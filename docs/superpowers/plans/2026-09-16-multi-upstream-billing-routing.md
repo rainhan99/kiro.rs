@@ -262,8 +262,35 @@ rendered page.
 
 **Files:** Extend `src/gateway/integration_tests.rs` and frontend behavior tests; create `docs/multi-upstream-routing.md`, `docs/multi-upstream-verification.md`; update README links. Do not alter live configuration or credentials.
 
-- [ ] RED/GREEN for any newly uncovered bug; offline scenarios include both routing modes, TTL/concurrency, Kiro-pool-to-direct failover, exhausted accounts, currency isolation, pending usage, price snapshot, config persistence failure, restart recovery, stream cancellation and migration repeated twice.
-- [ ] Run `cargo test`, `cargo test --no-default-features`, `bun test`, `bun run build`, `cargo build --release`, relevant existing offline CLI fixtures; capture exact counts, ignored tests and artifact SHA-256. No upstream test calls.
-- [ ] Review final changed scope independently for security, financial invariants, integration and spec coverage. Resolve material findings and rerun covering tests; list any requirements that cannot honestly be claimed implemented.
-- [ ] Write operator steps for `opus5`, main/backup groups, two weights, mode inheritance, account setup, zero vs unlimited, missing usage, price assumptions, known protocol limits and safe rollback. Cite current official usage/streaming docs used during adapter implementation.
-- [ ] Deliver actual Web location, verified behavior, artifact path/hash, test evidence and no-deployment/no-live-cache-evidence statement. Leave user changes and review records intact; do not claim native cache savings from mocks.
+- [x] RED/GREEN for any newly uncovered bug; offline scenarios include both routing modes, TTL/concurrency, Kiro-pool-to-direct failover, exhausted accounts, currency isolation, pending usage, price snapshot, config persistence failure, restart recovery, stream cancellation and migration repeated twice.
+- [x] Run `cargo test`, `cargo test --no-default-features`, `bun test`, `bun run build`, `cargo build --release`, relevant existing offline CLI fixtures; capture exact counts, ignored tests and artifact SHA-256. No upstream test calls.
+- [x] Review final changed scope independently for security, financial invariants, integration and spec coverage. Resolve material findings and rerun covering tests; list any requirements that cannot honestly be claimed implemented.
+- [x] Write operator steps for `opus5`, main/backup groups, two weights, mode inheritance, account setup, zero vs unlimited, missing usage, price assumptions, known protocol limits and safe rollback. Cite current official usage/streaming docs used during adapter implementation.
+- [x] Deliver actual Web location, verified behavior, artifact path/hash, test evidence and no-deployment/no-live-cache-evidence statement. Leave user changes and review records intact; do not claim native cache savings from mocks.
+
+### Task 7 delivery (takeover session)
+
+**Web location.** Admin → 设置 → 多上游网关 for configuration and route preview;
+Admin → 客户端 Key → wallet icon for a key's per-unit budgets, adjustments,
+cycle rollover and read-only ledger audit.
+
+**Artifact.** `target/release/kiro-rs`, 20150432 bytes,
+sha256 `a0631d3b153815d74759ab71d68cf447579f25826f04fa462770246e9263b76e`.
+
+**Evidence.** 1123 unit tests and 3 CLI integration tests pass in both feature
+modes, 1 ignored (`web_pipeline_browser_fixture`, pre-existing, needs a browser).
+219 of them are `src/gateway/`, 13 `admin::gateway`. bun: 42 tests, tsc and the
+production build clean. clippy matches the pre-existing 120-warning baseline
+exactly, with none from `src/gateway/`. The release binary's offline
+`--check-config` and `--inspect-request` report `networkRequests: 0`.
+
+**Seven defects found during review** are listed with their consequences in
+`docs/multi-upstream-verification.md`, together with the 7 surviving mutations
+that exposed gaps in the tests rather than redundancy in the code.
+
+**Not claimed.** No browser was opened, so no visual or interaction pass is
+asserted. Nothing was deployed and no upstream was contacted, so no native cache
+saving is claimed and the Kiro route's *success*-side settlement has not been
+exercised end to end — it needs real credentials. Its amount conversion is
+pinned by the `credits_to_amount` round-trip tests and its failure side by an
+end-to-end test.

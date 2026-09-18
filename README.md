@@ -336,6 +336,8 @@ Admin API 鉴权同样支持：
 
 长度治理、原文按需读取、图片保真、缓存构造与真实用量举证见 [请求管线说明](docs/request-pipeline.md)；可用 [配置示例](config.pipeline.example.json) 和 `--check-config` / `--inspect-request` 离线检查，不需要调用 Kiro。
 
+给一个对外别名配置多条上游路线并按路记账，见 [多上游网关](docs/multi-upstream-routing.md)（验证记录在 [这里](docs/multi-upstream-verification.md)）。**不创建 `gateway.json` 时这一切都不存在**，所有请求原样走既有 Kiro 路径。
+
 默认配置文件名是 `config.json`。首次启动如果文件不存在，会自动生成最小配置。
 
 ### 最小配置
