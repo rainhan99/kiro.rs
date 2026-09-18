@@ -230,12 +230,33 @@ contributes none. The release binary's offline `--check-config` and
 
 **Interfaces:** Authenticated `GET/PUT /api/admin/gateway/config`, `POST /gateway/preview`, `GET/PUT /client-keys/{id}/budgets`, `GET /gateway/requests`, and audited adjustment/new-cycle endpoints. Return structured `invalid_configuration`, `configuration_conflict`, `quota_exceeded`, `persistence_error`; redact secrets and raw sensitive payloads. Views match Shared JSON Contract and Task 2/3 produced types.
 
-- [ ] RED: Frontend tests submit sticky/random settings and model overrides, preserve decimal strings, reject wrong units/missing prices, and preserve edited drafts on refresh. Render real controls and separate currency labels. Backend handler tests prove unauthorized calls cannot read/modify config, update then GET reads the same effective revision and stale revision returns conflict.
-- [ ] Run `bun test` and focused Rust admin tests for expected failure.
-- [ ] GREEN: Real form inputs for upstream kind/URL/secret/weight, alias bindings/priority/weight/actual model/capabilities/cost and sell tariffs, global mode/model override/TTL, accounts/limits/allowlists. Support create/edit/remove with validation; deleting referenced upstreams fails clearly. No raw JSON editor as the only means to configure common fields.
-- [ ] Hot-save via backend; display saved/effective version and pending form state. Config mode changes demonstrably change mock route results. Budget UI separates credit/CNY/USD used/reserved/pending, soft-limit warnings and read-only audit evidence; legacy credit control cannot overwrite ledger usage or make money look like credits.
-- [ ] Route preview and request detail show actual route, evidence source, price/config versions, upstream cost vs downstream debit, typed units and failures. Masked secrets never resubmit as credentials. Update help: stickiness does not prove cache hits; unavailable native counts are unknown.
-- [ ] Verify backend handlers, Bun tests, `bun run build`; visual inspection if local browser access is permitted, otherwise report that limitation accurately. Do not bypass browser blocks.
+- [x] RED: Frontend tests submit sticky/random settings and model overrides, preserve decimal strings, reject wrong units/missing prices, and preserve edited drafts on refresh. Render real controls and separate currency labels. Backend handler tests prove unauthorized calls cannot read/modify config, update then GET reads the same effective revision and stale revision returns conflict.
+- [x] Run `bun test` and focused Rust admin tests for expected failure.
+- [x] GREEN: Real form inputs for upstream kind/URL/secret/weight, alias bindings/priority/weight/actual model/capabilities/cost and sell tariffs, global mode/model override/TTL, accounts/limits/allowlists. Support create/edit/remove with validation; deleting referenced upstreams fails clearly. No raw JSON editor as the only means to configure common fields.
+- [x] Hot-save via backend; display saved/effective version and pending form state. Config mode changes demonstrably change mock route results. Budget UI separates credit/CNY/USD used/reserved/pending, soft-limit warnings and read-only audit evidence; legacy credit control cannot overwrite ledger usage or make money look like credits.
+- [x] Route preview and request detail show actual route, evidence source, price/config versions, upstream cost vs downstream debit, typed units and failures. Masked secrets never resubmit as credentials. Update help: stickiness does not prove cache hits; unavailable native counts are unknown.
+- [x] Verify backend handlers, Bun tests, `bun run build`; visual inspection if local browser access is permitted, otherwise report that limitation accurately. Do not bypass browser blocks.
+
+### Task 6 verification (takeover session)
+
+**Backend.** `GET/PUT /gateway/config`, `POST /gateway/preview`,
+`GET /gateway/requests`, `GET/PUT /client-keys/{id}/budgets`,
+`POST /client-keys/{id}/{adjustments,cycles}` and
+`GET /client-keys/{id}/ledger-audit`, all behind the existing admin auth.
+Errors are typed as `gateway_not_configured`, `invalid_configuration`,
+`configuration_conflict`, `quota_exceeded` and `persistence_error`. 13 handler
+tests run over real loopback HTTP; four mutations (conflict reported as
+invalid, lazy gateway served as configured, endpoints moved outside auth,
+amounts routed through f64) each fail one.
+
+**Frontend.** Settings → 多上游网关 holds the structured editor; a key's ledger
+budgets open from a wallet action on the client-keys page. `bun test` passes 42
+tests across 5 files, `tsc -b` and `bun run build` are clean. Six mutations
+against the form logic each fail a test.
+
+**Not claimed.** No browser was opened, so no visual inspection or interaction
+pass is asserted. Route preview is verified through its API, not through the
+rendered page.
 
 ## Task 7: End-to-end regression, documentation and release artifact
 
