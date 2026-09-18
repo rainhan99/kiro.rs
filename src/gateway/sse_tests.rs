@@ -101,7 +101,11 @@ fn chat_usage_is_a_final_value_and_done_terminates() {
             data: r#"{"choices":[{"delta":{"content":"hi"}}]}"#.into(),
         })
         .unwrap();
-    assert_eq!(translator.usage(), StreamUsage::default(), "上游未给则保持缺失");
+    assert_eq!(
+        translator.usage(),
+        StreamUsage::default(),
+        "上游未给则保持缺失"
+    );
 
     translator
         .consume(&SseEvent {
@@ -160,7 +164,11 @@ fn anthropic_cumulative_output_is_not_added_twice() {
 /// Responses 的终结事件带完整用量。
 #[test]
 fn responses_terminal_event_carries_usage() {
-    for terminal in ["response.completed", "response.incomplete", "response.failed"] {
+    for terminal in [
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ] {
         let mut translator = StreamTranslator::new(WireProtocol::Responses);
         let frame = translator
             .consume(&SseEvent {
@@ -213,4 +221,76 @@ fn a_malformed_frame_is_an_error() {
         })
         .unwrap_err();
     assert!(format!("{error:#}").contains("not valid JSON"));
+}
+
+/// 缓存计数必须原样留下：流式与非流式走同一套定价，只留 token 数会让每个流式
+/// 请求都因证据不全而永远算不出钱。
+#[test]
+fn the_raw_usage_object_survives_the_stream_for_pricing() {
+    let mut translator = StreamTranslator::new(WireProtocol::Anthropic);
+    assert_eq!(translator.usage_payload(), None, "什么都没见过就是 None");
+
+    translator
+        .consume(&SseEvent {
+            event: "message_start".into(),
+            data: serde_json::json!({
+                "message": {"usage": {
+                    "input_tokens": 1_000,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 12
+                }}
+            })
+            .to_string(),
+        })
+        .unwrap();
+    translator
+        .consume(&SseEvent {
+            event: "message_delta".into(),
+            data: serde_json::json!({"usage": {"output_tokens": 500}}).to_string(),
+        })
+        .unwrap();
+
+    let payload = translator.usage_payload().expect("应有用量");
+    // 输入侧与缓存计数来自 message_start，输出侧被 message_delta 覆盖。
+    assert_eq!(payload["input_tokens"], 1_000);
+    assert_eq!(payload["output_tokens"], 500, "累计值取最后一次，不是相加");
+    assert_eq!(payload["cache_read_input_tokens"], 40);
+    assert_eq!(payload["cache_creation_input_tokens"], 12);
+}
+
+/// 上游一个用量字段都没发时保持 `None`——不构造一个空对象冒充"报了但都是 0"。
+#[test]
+fn a_stream_without_usage_reports_none_rather_than_an_empty_object() {
+    let mut translator = StreamTranslator::new(WireProtocol::Anthropic);
+    translator
+        .consume(&SseEvent {
+            event: "content_block_delta".into(),
+            data: serde_json::json!({"delta": {"text": "hi"}}).to_string(),
+        })
+        .unwrap();
+    assert_eq!(translator.usage_payload(), None);
+}
+
+/// Chat 的最终用量对象整体留下，包括缓存明细。
+#[test]
+fn a_chat_stream_retains_its_final_usage_object_whole() {
+    let mut translator = StreamTranslator::new(WireProtocol::ChatCompletions);
+    translator
+        .consume(&SseEvent {
+            event: String::new(),
+            data: serde_json::json!({
+                "usage": {
+                    "prompt_tokens": 800,
+                    "completion_tokens": 200,
+                    "prompt_tokens_details": {"cached_tokens": 64, "cache_write_tokens": 0}
+                }
+            })
+            .to_string(),
+        })
+        .unwrap();
+
+    let payload = translator.usage_payload().unwrap();
+    assert_eq!(payload["prompt_tokens"], 800);
+    assert_eq!(payload["prompt_tokens_details"]["cached_tokens"], 64);
 }

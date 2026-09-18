@@ -94,8 +94,8 @@ fn take_frame(buffer: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 fn parse_frame(raw: &[u8]) -> Result<Option<SseEvent>> {
     // 半个 UTF-8 字符不可能出现在完整帧里；真出现说明上游发了非法字节。
-    let text = std::str::from_utf8(raw)
-        .map_err(|_| anyhow::anyhow!("SSE frame is not valid UTF-8"))?;
+    let text =
+        std::str::from_utf8(raw).map_err(|_| anyhow::anyhow!("SSE frame is not valid UTF-8"))?;
     let mut event = String::new();
     let mut data: Vec<&str> = Vec::new();
     for line in text.split('\n') {
@@ -144,6 +144,13 @@ pub struct TranslatedFrames {
 pub struct StreamTranslator {
     from: WireProtocol,
     usage: StreamUsage,
+    /// 流里见过的**原始** usage 字段，按出现顺序合并。
+    ///
+    /// 只留 token 计数是不够的：缓存读写同样按 token 计费，而严格口径下
+    /// "字段没出现"不等于 0。把原始对象原样攒下来，就能让流式请求走**和非流式
+    /// 完全相同**的证据与定价逻辑，而不是另起一套只认两个字段的简化版——
+    /// 那会让每一个流式请求都因证据不全而永远算不出钱。
+    usage_payload: serde_json::Map<String, Value>,
     completed: bool,
 }
 
@@ -152,7 +159,28 @@ impl StreamTranslator {
         Self {
             from,
             usage: StreamUsage::default(),
+            usage_payload: serde_json::Map::new(),
             completed: false,
+        }
+    }
+
+    /// 流里见过的原始用量对象，可直接交给 `normalize_usage`。一个字段都没见过时为 `None`
+    /// ——没见过就是没见过，不构造一个空对象冒充"上游报了但都是 0"。
+    pub fn usage_payload(&self) -> Option<Value> {
+        (!self.usage_payload.is_empty()).then(|| Value::Object(self.usage_payload.clone()))
+    }
+
+    /// 合并一个 usage 对象。后出现的字段覆盖先出现的——Anthropic 的输入侧在
+    /// `message_start`、输出侧在 `message_delta`，两者都是快照。
+    fn merge_usage(&mut self, usage: &Value) {
+        let Some(object) = usage.as_object() else {
+            return;
+        };
+        for (key, value) in object {
+            if value.is_null() {
+                continue;
+            }
+            self.usage_payload.insert(key.clone(), value.clone());
         }
     }
 
@@ -189,6 +217,7 @@ impl StreamTranslator {
         if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
             self.usage.input_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
             self.usage.output_tokens = usage.get("completion_tokens").and_then(Value::as_u64);
+            self.merge_usage(usage);
         }
         Ok(TranslatedFrames {
             events: vec![event.clone()],
@@ -205,17 +234,24 @@ impl StreamTranslator {
                     self.usage.input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
                     // message_start 里的 output_tokens 是起始快照，同样是快照不是增量。
                     self.usage.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+                    // 缓存读写计数就在这里，非流式路径按它们定价，流式也必须拿到。
+                    self.merge_usage(usage);
                 }
             }
             "message_delta" => {
                 // 这里的 output_tokens 是**累计值**。逐条相加会把总量翻好几倍，
                 // 所以取最后一次覆盖，而不是累加。
-                if let Some(output) = value.pointer("/usage/output_tokens").and_then(Value::as_u64)
+                if let Some(output) = value
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64)
                 {
                     self.usage.output_tokens = Some(output);
                 }
                 if let Some(input) = value.pointer("/usage/input_tokens").and_then(Value::as_u64) {
                     self.usage.input_tokens = Some(input);
+                }
+                if let Some(usage) = value.pointer("/usage") {
+                    self.merge_usage(usage);
                 }
             }
             "message_stop" => self.completed = true,
@@ -234,6 +270,7 @@ impl StreamTranslator {
         if let Some(usage) = value.pointer("/response/usage").filter(|u| !u.is_null()) {
             self.usage.input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
             self.usage.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+            self.merge_usage(usage);
         }
         if matches!(
             event.event.as_str(),

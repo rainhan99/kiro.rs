@@ -126,7 +126,7 @@ pub async fn dispatch(
     }
 }
 
-enum RouteError {
+pub(super) enum RouteError {
     /// 请求没发出去（转换不了、端点不合法、目标被拒）。
     Unsendable(String),
     Upstream(SendError),
@@ -143,15 +143,25 @@ async fn attempt_once(
         .upstream(&attempt.upstream_id)
         .ok_or_else(|| RouteError::Unsendable("plan lost its upstream".into()))?;
     let wire = wire_for(upstream.kind);
-    let converted = convert_request(protocol, wire, body, &attempt.upstream_model)
-        .map_err(|e| RouteError::Unsendable(format!("{e:#}")))?;
-    let bytes = serde_json::to_vec(&converted)
-        .map_err(|e| RouteError::Unsendable(format!("request could not be serialized: {e}")))?;
+    let bytes = attempt_body(protocol, wire, body, &attempt.upstream_model)?;
 
     executor
         .execute(upstream, wire, bytes, plan.deadline)
         .await
         .map_err(RouteError::Upstream)
+}
+
+/// 把请求转成这条路的协议并序列化。转换失败即这条路接不住这个请求。
+pub(super) fn attempt_body(
+    protocol: WireProtocol,
+    wire: WireProtocol,
+    body: &Value,
+    upstream_model: &str,
+) -> std::result::Result<Vec<u8>, RouteError> {
+    let converted = convert_request(protocol, wire, body, upstream_model)
+        .map_err(|e| RouteError::Unsendable(format!("{e:#}")))?;
+    serde_json::to_vec(&converted)
+        .map_err(|e| RouteError::Unsendable(format!("request could not be serialized: {e}")))
 }
 
 fn settle_success(
@@ -242,7 +252,7 @@ fn finish(
 /// 原生积分以上游自己报的 `credits` 为准——那是供应商的真相，不是本地估算。
 /// 按钱计费的路用配置里的售价乘用量。两者都拿不到时返回 `None`，由账本记为
 /// 待结算，**绝不用 0 顶替**。
-fn customer_cost(binding: &ModelBinding, usage: &NativeUsage) -> Result<Option<Amount>> {
+pub(super) fn customer_cost(binding: &ModelBinding, usage: &NativeUsage) -> Result<Option<Amount>> {
     match binding.billing_unit {
         BillingUnit::KiroCredit => Ok(usage.credits),
         _ => binding
@@ -257,7 +267,7 @@ fn customer_cost(binding: &ModelBinding, usage: &NativeUsage) -> Result<Option<A
 ///
 /// Kiro 归到 Anthropic：它的线上格式是 Amazon Q 的事件流，但既有 provider 接受的
 /// 请求形状就是 Anthropic 的，而 Kiro 路的"发送"正是交给那个 provider。
-fn wire_for(kind: UpstreamKind) -> WireProtocol {
+pub(super) fn wire_for(kind: UpstreamKind) -> WireProtocol {
     match kind {
         UpstreamKind::Kiro | UpstreamKind::Anthropic => WireProtocol::Anthropic,
         UpstreamKind::OpenaiChat => WireProtocol::ChatCompletions,
@@ -266,7 +276,7 @@ fn wire_for(kind: UpstreamKind) -> WireProtocol {
 }
 
 /// 没有可用路线时，把**真实原因**告诉客户端，而不是一句笼统的不可用。
-fn no_route(
+pub(super) fn no_route(
     ledger: &super::ledger::Ledger,
     plan: &RequestPlan,
     ctx: &RouteContext,
@@ -335,7 +345,7 @@ fn render(refusal: &Refusal) -> (u16, String) {
     }
 }
 
-fn stopped(stop: StopReason, reason: &str) -> Dispatched {
+pub(super) fn stopped(stop: StopReason, reason: &str) -> Dispatched {
     let status = match stop {
         StopReason::NotRetryable => 400,
         StopReason::DeadlineReached => 504,

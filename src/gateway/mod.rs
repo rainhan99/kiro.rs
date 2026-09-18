@@ -14,6 +14,7 @@ pub mod sse;
 pub mod transport;
 pub mod routing;
 pub mod service;
+pub mod streaming;
 mod ledger_types;
 pub mod usage;
 
