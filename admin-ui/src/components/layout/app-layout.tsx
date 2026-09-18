@@ -444,7 +444,7 @@ export function AppLayout({
               className="h-8 w-8 text-muted-foreground hover:text-foreground hidden sm:inline-flex"
             >
               <a
-                href="https://github.com/ZyphrZero/kiro.rs"
+                href="https://github.com/rainhan99/kiro.rs"
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label="GitHub 仓库"

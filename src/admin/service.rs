@@ -625,7 +625,12 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
+///
+/// 本仓库自 2026-09-18 起独立开发，不再跟随上游 ZyphrZero/kiro.rs。指向别人的仓库
+/// 会让运行中的实例把自己更新成别人的版本，因此这里必须与实际发布 Release 的仓库一致。
+/// 与 `binary_update.rs::GITHUB_REPO` 必须同步修改——两者指向不同仓库会出现
+/// 「检查到有新版本，下载却取自另一个仓库」的错配。
+const GITHUB_RELEASES_REPO: &str = "rainhan99/kiro.rs";
 
 impl AdminService {
     pub fn new(

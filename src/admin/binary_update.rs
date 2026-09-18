@@ -23,7 +23,10 @@ use crate::admin::error::AdminServiceError;
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 /// GitHub Releases 仓库 owner/repo。
-const GITHUB_REPO: &str = "ZyphrZero/kiro.rs";
+///
+/// 必须与 `service.rs::GITHUB_RELEASES_REPO` 保持一致：前者查版本与 changelog，
+/// 后者下载资产，指向不同仓库会导致版本检查与实际下载来源错配。
+const GITHUB_REPO: &str = "rainhan99/kiro.rs";
 
 /// release 包内（解压后）二进制文件名。Linux/macOS 是 `kiro-rs`，
 /// Windows 是 `kiro-rs.exe`。
