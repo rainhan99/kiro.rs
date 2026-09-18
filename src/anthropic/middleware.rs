@@ -193,8 +193,11 @@ pub async fn gateway_middleware(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
+    // 备路要用的那份请求体：克隆 `Bytes` 是 O(1) 的引用计数，克隆解析后的 `Value`
+    // 则要把整棵树复制一遍——解析后的结构比原始字节还大，而回退是少数情况。
+    let retained = bytes.clone();
     match entry
-        .handle(protocol, value.clone(), key_id, request_id, &[])
+        .handle(protocol, value, key_id, request_id, &[])
         .await
     {
         crate::gateway::entry::Handled::Response(response) => response,
@@ -215,10 +218,13 @@ pub async fn gateway_middleware(
                 status = response.status().as_u16(),
                 "Kiro 路未成功且尚未向客户端发出内容，改走备路"
             );
+            let Ok(body) = serde_json::from_slice::<serde_json::Value>(&retained) else {
+                return response;
+            };
             match entry
                 .handle(
                     protocol,
-                    value,
+                    body,
                     key_id,
                     uuid::Uuid::new_v4().to_string(),
                     std::slice::from_ref(&binding_id),
