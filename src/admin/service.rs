@@ -1971,12 +1971,12 @@ impl AdminService {
             c.update_last_applied_at = Some(applied_at_to_persist);
         });
 
-        super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
+        super::binary_update::schedule_self_restart(std::time::Duration::from_secs(2));
 
         Ok(ImageUpdateResponse {
             success: true,
             message: format!(
-                "已替换为 v{}，进程将在 2 秒后退出，由容器重启策略接管",
+                "已替换为 v{}，进程将在 2 秒后用新二进制重启自己",
                 version
             ),
             output: Some(format!(
@@ -2022,12 +2022,12 @@ impl AdminService {
             c.update_last_applied_at = None;
         });
 
-        super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
+        super::binary_update::schedule_self_restart(std::time::Duration::from_secs(2));
 
         Ok(ImageUpdateResponse {
             success: true,
             message: format!(
-                "已回退到 {}，进程将在 2 秒后退出，由容器重启策略接管",
+                "已回退到 {}，进程将在 2 秒后用旧二进制重启自己",
                 previous_label
             ),
             output: Some(format!("rolled back to: {}", previous_label)),

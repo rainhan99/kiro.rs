@@ -181,12 +181,52 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
     onError: (err) => toast.error(`拉取失败: ${extractErrorMessage(err)}`),
   })
 
+  /** 等到服务真的换成目标版本为止。
+   *
+   * 完成信号不是那个 HTTP 响应：替换完二进制后进程会用新版本重启自己，
+   * 响应很可能永远到不了。真正说明更新成功的，是重新连上之后版本号变了。
+   * 重启期间请求必然失败若干次，这是预期，不是错误。
+   */
+  const waitForVersion = async (target: string) => {
+    const deadline = Date.now() + 3 * 60 * 1000
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      try {
+        const info = await checkSystemUpdate(false)
+        if (info.currentVersion && info.currentVersion.replace(/^v/, '') === target.replace(/^v/, '')) {
+          queryClient.setQueryData(['system-update-check'], info)
+          return true
+        }
+      } catch {
+        // 重启中连不上，继续等。
+      }
+    }
+    return false
+  }
+
   const applyMutation = useMutation({
-    mutationFn: applyImageUpdate,
-    onSuccess: (res) => {
-      setLastOutput(res.output || res.message)
-      toast.success(res.message)
+    mutationFn: async () => {
+      const target = updateCheck?.latestVersion ?? ''
+      // 响应可能到不了（进程已被新二进制替换），所以两边都要接住。
+      const started = applyImageUpdate().catch(() => null)
+      const [res, switched] = await Promise.all([
+        started,
+        target ? waitForVersion(target) : Promise.resolve(false),
+      ])
+      return { res, switched, target }
+    },
+    onSuccess: ({ res, switched, target }) => {
+      if (res) setLastOutput(res.output || res.message)
+      if (switched) {
+        toast.success(`已更新并重启到 v${target.replace(/^v/, '')}`)
+      } else if (res?.success) {
+        // 二进制换好了但版本没跟上：多半是重启没成功，说清而不是报"成功"。
+        toast.error('二进制已替换，但服务没有在预期时间内以新版本回来；请检查进程是否已重启')
+      } else {
+        toast.error('更新未完成；请查看服务端日志确认失败原因')
+      }
       queryClient.invalidateQueries({ queryKey: ['update-config'] })
+      queryClient.invalidateQueries({ queryKey: ['system-update-check'] })
     },
     onError: (err) => toast.error(`更新失败: ${extractErrorMessage(err)}`),
   })

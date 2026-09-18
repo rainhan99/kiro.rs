@@ -641,15 +641,27 @@ export async function pullUpdateImage(): Promise<ImageUpdateResponse> {
   return data
 }
 
-// 拉取镜像并通过 Docker Compose 应用更新
+/** 更新类操作要下载约 20MB 再替换二进制，远超共用的 15 秒超时。
+ *
+ * 更要紧的是：替换完成后进程会用新二进制重启自己，这个响应**可能永远到不了**。
+ * 所以调用方不能把响应当成完成信号——真正的信号是版本号变了（见
+ * `image-update-dialog.tsx` 里的轮询）。这里的超时只是别让它 15 秒就先喊失败。
+ */
+const UPDATE_TIMEOUT_MS = 10 * 60 * 1000
+
+// 下载并替换二进制，随后进程用新二进制重启自己
 export async function applyImageUpdate(): Promise<ImageUpdateResponse> {
-  const { data } = await api.post<ImageUpdateResponse>('/system/update/apply')
+  const { data } = await api.post<ImageUpdateResponse>('/system/update/apply', undefined, {
+    timeout: UPDATE_TIMEOUT_MS,
+  })
   return data
 }
 
 // 通过本地备份 tag 回退到上一次更新前的镜像版本
 export async function rollbackImageUpdate(): Promise<ImageUpdateResponse> {
-  const { data } = await api.post<ImageUpdateResponse>('/system/update/rollback')
+  const { data } = await api.post<ImageUpdateResponse>('/system/update/rollback', undefined, {
+    timeout: UPDATE_TIMEOUT_MS,
+  })
   return data
 }
 

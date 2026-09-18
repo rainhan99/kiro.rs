@@ -164,9 +164,13 @@ pub async fn download_release_binary(
 pub(super) fn build_http_client(
     proxy: Option<&str>,
 ) -> Result<reqwest::Client, AdminServiceError> {
+    // `timeout` 是**整体**超时：20MB 的产物在慢链路上会被它硬砍，哪怕一直在传。
+    // 换成空闲超时——只要还有数据到达就继续，真正卡住才放弃。连接阶段另设一个
+    // 短上限，避免在一个连不上的地址上干等。
     let mut builder = reqwest::Client::builder()
         .user_agent("kiro-rs-updater")
-        .timeout(std::time::Duration::from_secs(180));
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(60));
     if let Some(url) = proxy.and_then(|u| {
         let s = u.trim();
         if s.is_empty() { None } else { Some(s) }
@@ -464,13 +468,85 @@ pub fn restore_backup(exe: &Path) -> Result<(), AdminServiceError> {
     Ok(())
 }
 
-/// 启动一个异步任务，在 `delay` 之后让进程退出（exit code 0）。
-/// docker 的 `restart: unless-stopped` 会接管重启，新二进制随之生效。
-pub fn schedule_self_exit(delay: std::time::Duration) {
+/// 重启自己要执行的命令：当前可执行文件 + 本次启动的原始参数。
+///
+/// 参数必须原样带上——配置路径、凭据路径都在里面，丢掉它们等于用另一套配置
+/// 重启，而且往往"看起来正常"，因为默认值也能跑起来。
+pub fn restart_command() -> Result<(PathBuf, Vec<std::ffi::OsString>), AdminServiceError> {
+    let exe = current_executable()?;
+    // 跳过 argv[0]：那是旧的调用名，要执行的路径由 exe 给出。
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    Ok((exe, args))
+}
+
+/// 在 `delay` 之后用新二进制**替换掉自己**。
+///
+/// # 为什么不再是「退出，等监管进程拉起来」
+///
+/// 那要求部署里有 docker 的 `restart: unless-stopped` 或 systemd。前台直接跑
+/// `./kiro-rs` 的人没有这些东西，于是「更新并重启」只做了前半句，服务就停在
+/// 那里——而界面从不提这件事。
+///
+/// Unix 上 `exec` 用新二进制替换当前进程映像，PID 不变：前台、systemd、docker
+/// 全都成立。对 docker 反而更好——容器不必重启，没有停机窗口。监听套接字由
+/// Rust 默认带的 `CLOEXEC` 在 exec 时关闭，新进程照常绑定。
+///
+/// exec 失败时退回旧行为（退出进程）：此时二进制已经换好，留在原地跑旧代码
+/// 同样不对。日志会写明走的是哪一种。
+pub fn schedule_self_restart(delay: std::time::Duration) {
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        // 给 stdout 一个 flush 机会，避免最后一行日志丢失
+        let _ = std::io::stdout().flush();
+        match restart_command() {
+            Ok((exe, args)) => {
+                tracing::info!(exe = %exe.display(), "以新二进制替换当前进程");
+                let _ = std::io::stdout().flush();
+                exec_replacing_self(&exe, &args);
+                // 能走到这里就说明 exec 没成功——成功是不会返回的。
+                tracing::error!("exec 失败，改为退出进程；需要监管进程或手动重启");
+            }
+            Err(error) => tracing::error!("无法确定重启命令（{error}），改为退出进程"),
+        }
         let _ = std::io::stdout().flush();
         std::process::exit(0);
     });
+}
+
+/// Unix：`exec` 成功则永不返回。
+#[cfg(unix)]
+fn exec_replacing_self(exe: &Path, args: &[std::ffi::OsString]) {
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(exe).args(args).exec();
+    tracing::error!("exec {} 失败: {error}", exe.display());
+}
+
+/// Windows 没有 exec：拉起新进程，随后由调用方退出当前进程。
+#[cfg(not(unix))]
+fn exec_replacing_self(exe: &Path, args: &[std::ffi::OsString]) {
+    match std::process::Command::new(exe).args(args).spawn() {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), "已拉起新进程，当前进程随后退出");
+            // 让新进程先把端口占上，避免两边同时绑定的一瞬冲突。
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        Err(error) => tracing::error!("拉起新进程失败: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    /// 重启命令必须带上**本次启动的原始参数**。
+    ///
+    /// 配置路径、凭据路径都在参数里；丢掉它们等于用另一套配置重启，而且往往
+    /// 静悄悄地"看起来正常"，因为默认值也能跑起来。
+    #[test]
+    fn the_restart_command_keeps_the_arguments_this_process_was_started_with() {
+        let (exe, args) = restart_command().expect("应能确定重启命令");
+        assert!(exe.is_absolute(), "要用解析后的绝对路径：{}", exe.display());
+
+        let live: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        assert_eq!(args, live, "参数必须逐个原样保留");
+    }
 }
