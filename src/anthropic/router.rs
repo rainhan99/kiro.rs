@@ -68,6 +68,7 @@ pub fn create_router(
         usage_aggregator,
         cache_meter,
         trace_store,
+        None,
     )
 }
 
@@ -82,6 +83,7 @@ pub fn create_router_with_shared_provider(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    gateway: Option<Arc<crate::gateway::entry::GatewayEntry>>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     let max_body_size = kiro_provider
@@ -94,6 +96,7 @@ pub fn create_router_with_shared_provider(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_gateway(gateway);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
@@ -102,6 +105,12 @@ pub fn create_router_with_shared_provider(
         .route("/messages/count_tokens", post(count_tokens))
         .route("/chat/completions", post(post_chat_completions))
         .route("/responses", post(post_responses))
+        // 网关层在鉴权**之内**：axum 后挂的 layer 在外层，所以 auth 先跑，
+        // 网关拿得到 KeyContext。未接管的别名在这一层原样放行。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::anthropic::middleware::gateway_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -112,6 +121,12 @@ pub fn create_router_with_shared_provider(
     let cc_v1_routes = Router::new()
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
+        // cc 端点同样接管：它与 /v1 的差别（等 contextUsageEvent 再发
+        // message_start）是 Kiro 路的行为，直连上游根本没有这个事件。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::anthropic::middleware::gateway_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

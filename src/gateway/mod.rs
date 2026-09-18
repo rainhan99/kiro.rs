@@ -5,17 +5,19 @@ pub mod amount;
 pub mod config;
 pub mod config_store;
 pub mod coordinator;
+pub mod direct;
 pub mod dispatch;
+pub mod entry;
 pub mod execute;
 pub mod import;
 pub mod ledger;
+mod ledger_types;
 pub mod protocol;
-pub mod sse;
-pub mod transport;
 pub mod routing;
 pub mod service;
+pub mod sse;
 pub mod streaming;
-mod ledger_types;
+pub mod transport;
 pub mod usage;
 
 #[cfg(test)]

@@ -1101,7 +1101,7 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
 }
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
-fn extract_session_id(user_id: &str) -> Option<String> {
+pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
         && let Some(sid) = json
             .get("session_id")

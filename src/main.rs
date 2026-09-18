@@ -391,6 +391,26 @@ async fn main() {
         });
     }
 
+    // 网关入口。只有网关接管了模型时才建——没接管就不该有这个对象，
+    // 也不该为它建一条 HTTP 连接池。
+    let gateway_entry = if gateway.has_managed_models() {
+        let timeout =
+            std::time::Duration::from_secs(gateway.snapshot().config.request_timeout_secs);
+        match gateway::execute::build_client(timeout, config.tls_backend, None) {
+            Ok(client) => Some(std::sync::Arc::new(gateway::entry::GatewayEntry::new(
+                gateway.clone(),
+                client,
+            ))),
+            Err(error) => {
+                // 接管了模型却建不出 client，等于接管了却发不出去。
+                tracing::error!("网关 HTTP client 构建失败: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -400,6 +420,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        gateway_entry,
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

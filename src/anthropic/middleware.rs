@@ -52,6 +52,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 多上游网关入口（可选）。`None` 或未接管任何模型时，请求一个字节都不改。
+    pub gateway: Option<Arc<crate::gateway::entry::GatewayEntry>>,
 }
 
 impl AppState {
@@ -70,6 +72,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            gateway: None,
         }
     }
 
@@ -102,6 +105,73 @@ impl AppState {
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
         self
+    }
+
+    /// 注入多上游网关入口
+    pub fn with_gateway(
+        mut self,
+        gateway: Option<Arc<crate::gateway::entry::GatewayEntry>>,
+    ) -> Self {
+        self.gateway = gateway;
+        self
+    }
+}
+
+/// 网关入口中间件。
+///
+/// 只有被网关接管的别名会在这里被截走；其余请求**原样**继续走既有路径，
+/// 连请求体都不缓冲——未配置网关的部署不该为一个用不上的特性付代价。
+///
+/// 必须排在鉴权**之后**：路由与计费都按具体的 Key 判定，拿不到身份就无从判定。
+pub async fn gateway_middleware(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(entry) = state.gateway.clone() else {
+        return next.run(request).await;
+    };
+    if !entry.manages_anything() {
+        return next.run(request).await;
+    }
+    let Some(protocol) = crate::gateway::entry::protocol_for_path(request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let Some(key_id) = request.extensions().get::<KeyContext>().map(|c| c.key_id) else {
+        // 没有身份就不该走到这里；交回既有路径由它按自己的规则处理。
+        return next.run(request).await;
+    };
+
+    let (parts, body) = request.into_parts();
+    // 请求体上限已由路由层的 DefaultBodyLimit 管着，这里不再设第二道。
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!("网关入口读取请求体失败: {error}");
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": "request body could not be read"}
+                })),
+            )
+                .into_response();
+        }
+    };
+    // 解析不了就不是网关的事，交回既有路径去报它自己的错。
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return next
+            .run(axum::extract::Request::from_parts(parts, Body::from(bytes)))
+            .await;
+    };
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    match entry.handle(protocol, value, key_id, request_id).await {
+        Some(response) => response,
+        None => {
+            next.run(axum::extract::Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
     }
 }
 

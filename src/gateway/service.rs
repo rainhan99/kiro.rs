@@ -137,6 +137,22 @@ impl GatewayService {
         &self.config
     }
 
+    /// 网关有没有接管任何模型。入口据此决定要不要缓冲请求体——
+    /// 未配置网关的部署不该为一个用不上的特性付出缓冲代价。
+    pub fn has_managed_models(&self) -> bool {
+        let snapshot = self.config.snapshot();
+        snapshot.config.models.iter().any(|model| {
+            model.bindings.iter().any(|binding| {
+                binding.enabled
+                    && snapshot
+                        .config
+                        .upstreams
+                        .iter()
+                        .any(|u| u.id == binding.upstream_id && u.enabled)
+            })
+        })
+    }
+
     /// 网关是否接管了这个别名。
     ///
     /// 只有既定义了该公开模型、又至少有一个**启用的**绑定，才算接管。一个定义了却全部
