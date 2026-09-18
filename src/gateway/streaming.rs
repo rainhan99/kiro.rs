@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::coordinator::{AttemptResult, Coordinator, Next};
 use super::dispatch::{
-    Dispatched, RouteError, attempt_body, customer_cost, no_route, stopped, wire_for,
+    Dispatched, RouteError, attempt_body, classify_send, customer_cost, no_route, stopped, wire_for,
 };
 use super::execute::SendError;
 use super::protocol::WireProtocol;
@@ -160,7 +160,7 @@ async fn run(
                 .open_stream(upstream, wire, bytes, plan.deadline)
                 .await
                 .map(|stream| (stream, wire))
-                .map_err(RouteError::Upstream),
+                .map_err(classify_send),
             Err(error) => Err(error),
         };
 

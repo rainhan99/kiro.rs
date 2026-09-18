@@ -148,7 +148,19 @@ async fn attempt_once(
     executor
         .execute(upstream, wire, bytes, plan.deadline)
         .await
-        .map_err(RouteError::Upstream)
+        .map_err(classify_send)
+}
+
+/// 「没发出去」与「发出去了但失败」必须分开。
+///
+/// [`SendError::Refused`] 说明请求**根本没上线**：端点配置不合法、目标落在私网。
+/// 客户端的请求没有任何问题，所以既不该回 400 说它无效，也不该就此停手——
+/// 别的路可能好好的。它和转换失败是同一类：这条路承不住，换下一条。
+pub(super) fn classify_send(error: SendError) -> RouteError {
+    match error {
+        SendError::Refused(reason) => RouteError::Unsendable(format!("{reason:#}")),
+        SendError::Upstream(failure) => RouteError::Upstream(SendError::Upstream(failure)),
+    }
 }
 
 /// 把请求转成这条路的协议并序列化。转换失败即这条路接不住这个请求。

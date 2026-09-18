@@ -674,3 +674,43 @@ async fn every_route_failing_is_reported_as_such() {
     // 全部释放，不留在飞。
     assert_eq!(account(&f, 7, BillingUnit::Cny).in_flight, 0);
 }
+
+/// 现状记录（**不是期望行为**）：配置里一条 Kiro 绑定会被选中，然后必然失败。
+///
+/// 校验器要求 Kiro 上游不得设 baseUrl（凭据与地址都来自既有凭据池），而直连执行器
+/// 正是靠 baseUrl 构造端点的。所以 Kiro 这一路目前"选得中、发不出"。
+/// 适配器补上之后，这条测试应当被真正跑通 Kiro 路的测试取代。
+#[tokio::test]
+async fn a_kiro_binding_currently_has_no_executor_and_fails() {
+    let f = fixture(vec![credit_binding("k", "kiro", 0)], vec![kiro_upstream()]);
+    credit_account(&f, 7, 0.0, Some(100.0));
+
+    // 用生产里真正在跑的执行器，而不是测试替身——替身不查 baseUrl，测不出真相。
+    let direct = crate::gateway::direct::DirectExecutor::new(
+        crate::gateway::execute::build_client(
+            Duration::from_secs(5),
+            crate::model::config::TlsBackend::Rustls,
+            None,
+        )
+        .unwrap(),
+    );
+    let result = dispatch(
+        &f.service,
+        &direct,
+        WireProtocol::Anthropic,
+        &request(),
+        &ctx(),
+        "r1",
+    )
+    .await;
+
+    let Dispatched::Refused { status, reason } = result else {
+        panic!("Kiro 路目前没有执行器，不该成功：{result:?}");
+    };
+    // 502「这些路都试过了」，不是 400「你的请求有问题」——客户端的请求没毛病。
+    assert_eq!(status, 502, "配置坏了不该赖到客户端头上");
+    assert!(
+        reason.contains("every eligible route failed"),
+        "实得：{reason}"
+    );
+}
