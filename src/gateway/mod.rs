@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports)]
 
+pub mod admission;
 pub mod amount;
 pub mod config;
 pub mod config_store;
