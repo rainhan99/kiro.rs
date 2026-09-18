@@ -704,6 +704,111 @@ async fn a_kiro_route_reserves_then_releases_when_the_legacy_path_fails() {
     let _ = std::fs::remove_file(ledger_path);
 }
 
+/// 模拟缓存**永远**变不成钱。
+///
+/// 本地 `CacheMeter` 是模拟，由 `allowSimulatedCache` 控制，它只拆分 token 计数；
+/// 账本收的是原生 `meteringEvent` 报的 credit。这里喂进很大的缓存计数而原生
+/// credit 为 0，账本必须记 0——缓存计数一旦能影响金额，一个开了模拟缓存的部署
+/// 就会按自己编的数字收费。
+#[tokio::test]
+async fn simulated_cache_counts_never_become_money() {
+    use crate::gateway::ledger_types::{BoundKind, PriceSnapshot, ReservationInput};
+
+    let config_path = temp("config.json");
+    let ledger_path = temp("billing.db");
+    let mut credit = binding();
+    credit.billing_unit = BillingUnit::KiroCredit;
+    credit.cost_prices = None;
+    credit.sell_prices = None;
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&GatewayConfig {
+            models: vec![PublicModel {
+                id: "opus5".into(),
+                display_name: None,
+                routing_mode: None,
+                affinity_ttl_secs: None,
+                bindings: vec![credit],
+            }],
+            upstreams: vec![Upstream {
+                kind: UpstreamKind::Kiro,
+                base_url: None,
+                api_key: None,
+                has_api_key: false,
+                ..upstream("unused")
+            }],
+            ..GatewayConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let service = Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap());
+    let ledger = service.ledger().unwrap();
+    crate::gateway::import::import_opening_balances(
+        ledger,
+        &[crate::gateway::import::LegacyKeyBalance {
+            key_id: 7,
+            used: 0.0,
+            limit: Some(100.0),
+        }],
+    )
+    .unwrap();
+    ledger
+        .reserve(ReservationInput {
+            request_id: "r1".into(),
+            attempt_id: "r1:1".into(),
+            key_id: 7,
+            unit: BillingUnit::KiroCredit,
+            public_model: "opus5".into(),
+            upstream_id: "u1".into(),
+            upper_bound: None,
+            bound_kind: BoundKind::Unknown,
+            snapshot: PriceSnapshot {
+                config_revision: 1,
+                price_revision: 1,
+                binding_id: "b1".into(),
+                upstream_kind: UpstreamKind::Kiro,
+                upstream_model: "real-model".into(),
+                cost_prices: None,
+                sell_prices: None,
+            },
+        })
+        .unwrap();
+
+    let hook = crate::anthropic::handlers::UsageRecordHook {
+        recorder: None,
+        aggregator: None,
+        client_keys: None,
+        key_id: 7,
+        model: "opus5".into(),
+        started_at: std::time::Instant::now(),
+        settlement: Some(Arc::new(crate::gateway::settlement::Settlement::new(
+            service.clone(),
+            "r1:1".into(),
+            BillingUnit::KiroCredit,
+        ))),
+    };
+    // 巨大的缓存计数，但上游确认的 credit 是 0。
+    hook.record(1, 100, 50, 999_999, 888_888, 0.0, "success");
+
+    let account = ledger
+        .accounts(7)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .unwrap();
+    assert_eq!(
+        account.used,
+        crate::gateway::Amount::ZERO,
+        "缓存计数不得变成金额；账本只认原生 credit"
+    );
+    assert_eq!(account.customer_pending, 0, "上游确认为 0 是确定的事实，不是待结算");
+    assert_eq!(account.in_flight, 0);
+
+    let _ = std::fs::remove_file(config_path);
+    let _ = std::fs::remove_file(ledger_path);
+}
+
 /// 上游报回一个记不进账本的 credit 值（NaN / 负数 / 小到 18 位小数放不下）：
 /// 记为**待结算**，绝不按 0 确认——0 的意思是"确认没花钱"，与"不知道花了多少"
 /// 是两回事，后者按 0 入账就是白送一次调用。

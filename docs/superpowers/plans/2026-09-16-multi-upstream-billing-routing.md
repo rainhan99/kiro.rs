@@ -178,14 +178,51 @@ assert_eq!(converted["messages"][0]["content"], "hello");
 
 **Interfaces:** `GatewayService` holds configuration, routing, ledger, transport and existing Kiro provider. Public entry dispatch receives the original JSON, headers, protocol, KeyContext and existing AppState; returns `axum::response::Response`. If alias not managed, preserve legacy routing while applying the correct legacy credit ledger admission. Managed requests are coordinated before Kiro conversion. Add request-scoped Kiro overrides, never temporary global switches.
 
-- [ ] RED: Build local route fixtures: Key has exhausted credit account plus funded CNY account; Kiro quota fails, compatible Anthropic fallback succeeds, alias stays `opus5`, only CNY charged, Kiro failure cost separate. A credit-only Key cannot access money fallback. Missing credentials must not trigger any real HTTP in tests.
-- [ ] Run focused integration tests to observe failure.
-- [ ] GREEN: Identity verification no longer globally rejects a credit-exhausted Key. Keep account checks in the exact selected route. Per-request snapshots freeze model mapping, tariff, mode and retry deadline; fresh request sees saved config. `/v1/models` exposes configured public aliases with honest capabilities.
-- [ ] Reserve before sending; filter permissions/health/capabilities/known quotas. Monetary hard upper bounds must include configured input/output maxima and bounded internal rounds; unbounded requests reject unless account explicitly soft. Never use heuristic token count as a hard guarantee.
-- [ ] Kiro adapter preserves request pipeline and internal artifact loop. Propagate request-scoped actual model/group/affinity scope and disable Kiro sticky for random mode. Reuse eligible Kiro credentials within shared total retry budget. Native metering observer records raw usage independent of client estimates or `allowSimulatedCache`; aggregate internal rounds once. Credit balance/legacy JSON stats cannot be charged a second time by the new ledger.
-- [ ] Coordinate error retry before first effective downstream event only, with bounded total attempts/deadline across Kiro and direct requests. Exclude unsafe replay and incompatible state; after commitment report protocol-correct interruption, never concatenate another supplier. Drop/cancel leaves durable pending or confirmed settlement, not a lost charge. Success publishes affinity only if generation still valid.
-- [ ] Startup opens `gateway.json`/`billing.db` beside config/cache locations with fail-closed ledger errors; imports legacy Key opening balances idempotently. Legacy stats remain analytics; reset stats no longer clears quota expenditure. Deletion/rotation of Key does not delete historical ledger. Old enabled/disabled affinity choices stay respected until explicit migration.
-- [ ] Verify all incoming endpoints, no simulated billing, existing Kiro tests and CLI offline checks. Report exact coverage and any explicit unsupported protocol capabilities.
+- [x] RED: Build local route fixtures: Key has exhausted credit account plus funded CNY account; Kiro quota fails, compatible Anthropic fallback succeeds, alias stays `opus5`, only CNY charged, Kiro failure cost separate. A credit-only Key cannot access money fallback. Missing credentials must not trigger any real HTTP in tests.
+- [x] Run focused integration tests to observe failure.
+- [x] GREEN: Identity verification no longer globally rejects a credit-exhausted Key. Keep account checks in the exact selected route. Per-request snapshots freeze model mapping, tariff, mode and retry deadline; fresh request sees saved config. `/v1/models` exposes configured public aliases with honest capabilities.
+- [x] Reserve before sending; filter permissions/health/capabilities/known quotas. Monetary hard upper bounds must include configured input/output maxima and bounded internal rounds; unbounded requests reject unless account explicitly soft. Never use heuristic token count as a hard guarantee.
+- [x] Kiro adapter preserves request pipeline and internal artifact loop. Propagate request-scoped actual model/group/affinity scope and disable Kiro sticky for random mode. Reuse eligible Kiro credentials within shared total retry budget. Native metering observer records raw usage independent of client estimates or `allowSimulatedCache`; aggregate internal rounds once. Credit balance/legacy JSON stats cannot be charged a second time by the new ledger.
+- [x] Coordinate error retry before first effective downstream event only, with bounded total attempts/deadline across Kiro and direct requests. Exclude unsafe replay and incompatible state; after commitment report protocol-correct interruption, never concatenate another supplier. Drop/cancel leaves durable pending or confirmed settlement, not a lost charge. Success publishes affinity only if generation still valid.
+- [x] Startup opens `gateway.json`/`billing.db` beside config/cache locations with fail-closed ledger errors; imports legacy Key opening balances idempotently. Legacy stats remain analytics; reset stats no longer clears quota expenditure. Deletion/rotation of Key does not delete historical ledger. Old enabled/disabled affinity choices stay respected until explicit migration.
+- [x] Verify all incoming endpoints, no simulated billing, existing Kiro tests and CLI offline checks. Report exact coverage and any explicit unsupported protocol capabilities.
+
+### Task 5 verification (takeover session)
+
+**Endpoints.** The gateway layer sits inside auth and outside the handlers on
+`/v1/messages`, `/v1/chat/completions`, `/v1/responses` and `/cc/v1/messages`.
+`/v1/models` lists managed aliases and survives Kiro being unavailable.
+`/v1/messages/count_tokens` is deliberately not intercepted — it bills nothing.
+An unmanaged alias is rebuilt byte for byte and handed to the existing handler;
+a mutation dropping the body on that path fails the pass-through test.
+
+**No simulated billing.** `credits` is only ever accumulated from the native
+`meteringEvent.usage`. The local `CacheMeter`, which `allowSimulatedCache`
+controls, only splits token counts and never touches it. A test feeds enormous
+cache counts with a native credit of zero and asserts the ledger charges zero.
+For direct upstreams, a cost that cannot be computed settles as pending and
+never as zero.
+
+**Suites.** 1103 unit tests and 3 CLI integration tests pass in both feature
+modes. Binary clippy stands at the pre-existing 120 warnings; `src/gateway/`
+contributes none. The release binary's offline `--check-config` and
+`--inspect-request` return `networkRequests: 0`, `localBudgetAccepted: true`,
+`nativeCacheEvidence: null`.
+
+**Unsupported protocol capabilities, stated rather than approximated.**
+
+- Streaming across protocols is not implemented: the stream translator extracts
+  usage and completion but does not convert frames, so a route whose wire
+  protocol differs from the client's is skipped in favour of a matching route
+  rather than forwarding frames the client cannot read.
+- Request conversion exists only from Anthropic to Chat Completions and to
+  Responses. The other directions are refused, not approximated.
+- Provider-signed state — thinking signatures, `previous_response_id` — cannot
+  be re-signed by a different upstream, so a conversion carrying it is refused
+  rather than silently dropped.
+- Kiro routes are executed by the existing channel, not by the gateway's own
+  transport, so gateway-level cross-route retry does not apply to them; Kiro's
+  own credential failover is the equivalent and already bounded.
 
 ## Task 6: Admin endpoints and working Web controls
 
