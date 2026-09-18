@@ -729,7 +729,22 @@ pub async fn get_models(
 ) -> Response {
     tracing::info!("Received GET /v1/models request");
 
+    // 网关接管的别名先取出来：它们与 Kiro 凭据无关，Kiro 那边失败也不该让它们消失。
+    let managed: Vec<Model> = state
+        .gateway
+        .as_ref()
+        .map(|entry| entry.public_models().into_iter().map(gateway_model).collect())
+        .unwrap_or_default();
+
     let Some(provider) = &state.kiro_provider else {
+        if !managed.is_empty() {
+            // 没有 Kiro 也照样有东西可用——只列网关接管的。
+            return Json(ModelsResponse {
+                object: "list".to_string(),
+                data: managed,
+            })
+            .into_response();
+        }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
@@ -747,6 +762,13 @@ pub async fn get_models(
     {
         Ok(models) => models,
         Err(ModelDiscoveryError::NoAvailableCredentials) => {
+            if !managed.is_empty() {
+                return Json(ModelsResponse {
+                    object: "list".to_string(),
+                    data: managed,
+                })
+                .into_response();
+            }
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -758,6 +780,13 @@ pub async fn get_models(
         }
         Err(error @ ModelDiscoveryError::ColdStartFailed { .. }) => {
             tracing::warn!("动态模型列表加载失败: {}", error);
+            if !managed.is_empty() {
+                return Json(ModelsResponse {
+                    object: "list".to_string(),
+                    data: managed,
+                })
+                .into_response();
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -769,13 +798,37 @@ pub async fn get_models(
         }
     };
 
-    let models = aggregate_available_models(upstream);
+    // 网关接管的别名排在前面并**覆盖**同名的 Kiro 条目：同一个名字，
+    // 实际服务它的是网关，列表就该按网关声明的能力来说。
+    let mut models = managed;
+    for model in aggregate_available_models(upstream) {
+        if !models.iter().any(|m| m.id == model.id) {
+            models.push(model);
+        }
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
     .into_response()
+}
+
+/// 把网关声明的能力如实翻成对外的模型条目。
+///
+/// `created` 用 0 而不是编一个时间戳：网关不知道这个别名"何时创建"，
+/// 那个字段在这里没有真实来源。
+fn gateway_model(model: crate::gateway::service::PublicModelCapabilities) -> Model {
+    Model {
+        display_name: model.display_name.unwrap_or_else(|| model.id.clone()),
+        id: model.id,
+        object: "model".to_string(),
+        created: 0,
+        owned_by: "gateway".to_string(),
+        model_type: "model".to_string(),
+        context_window: i32::try_from(model.context_window).unwrap_or(i32::MAX),
+        max_tokens: i32::try_from(model.max_output_tokens).unwrap_or(i32::MAX),
+    }
 }
 
 /// POST /v1/messages

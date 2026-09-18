@@ -404,3 +404,53 @@ async fn the_layer_is_wired_after_auth_and_leaves_other_models_alone() {
         .unwrap();
     assert_eq!(response.status(), 401, "鉴权必须排在网关之外");
 }
+
+/// `/v1/models` 必须如实列出网关接管的别名，且**没有 Kiro 也列得出来**——
+/// 这些别名与 Kiro 凭据无关，Kiro 那边不可用不该让它们从列表里消失。
+#[tokio::test]
+async fn managed_aliases_are_listed_even_without_a_kiro_provider() {
+    let f = fixture("http://127.0.0.1:1", true);
+    let client = crate::gateway::execute::build_client(
+        std::time::Duration::from_secs(5),
+        crate::model::config::TlsBackend::Rustls,
+        None,
+    )
+    .unwrap();
+    let entry = Arc::new(GatewayEntry::new(f.service.clone(), client));
+
+    let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    keys.create_with_key("t".into(), None, None, "sk-test-key".into());
+
+    let app = crate::anthropic::create_router_with_shared_provider(
+        None, // 没有 KiroProvider
+        false,
+        crate::model::config::ToolCompatibilityMode::default(),
+        Some(keys),
+        None,
+        None,
+        None,
+        None,
+        Some(entry),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/models"))
+        .header("x-api-key", "sk-test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "有网关模型时不该回 503");
+
+    let listed: Value = response.json().await.unwrap();
+    assert_eq!(listed["object"], "list");
+    let models = listed["data"].as_array().unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["id"], "opus5");
+    assert_eq!(models[0]["owned_by"], "gateway");
+    // 能力如实来自绑定声明，不是编的。
+    assert_eq!(models[0]["context_window"], 200_000);
+    assert_eq!(models[0]["max_tokens"], 8_000);
+}

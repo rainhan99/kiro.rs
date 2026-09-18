@@ -48,6 +48,11 @@ impl GatewayEntry {
         self.service.is_managed(alias)
     }
 
+    /// 对外可见的模型及其能力，供 `/v1/models` 如实列出。
+    pub fn public_models(&self) -> Vec<super::service::PublicModelCapabilities> {
+        self.service.public_models()
+    }
+
     /// 处理一次请求。返回 `None` 表示网关不接管，调用方继续走既有路径。
     pub async fn handle(
         &self,
