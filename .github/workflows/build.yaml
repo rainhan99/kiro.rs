@@ -33,6 +33,14 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
           fetch-depth: 0
+      # 版本自增的进位规则有边界（999 进 minor、99 进 major），出错会打出错误的
+      # tag。自测很便宜，每次 push 都跑，避免它在无人注意时失效。
+      # 上面的 checkout 带条件（仅 push 时执行），workflow_dispatch 下工作目录是空的，
+      # 所以这里必须用同一个条件，否则会因为文件不存在而失败。
+      - name: Version odometer self-test
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        run: bash scripts/next-version.sh --self-test
+
       - name: Check if commit has release tag
         id: check
         run: |

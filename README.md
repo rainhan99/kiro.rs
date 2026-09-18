@@ -796,6 +796,22 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 发布 tag `vX.Y.Z` 会触发 Release workflow：
 
+### 版本号与自动递增
+
+版本格式 `x.xx.xxx`，其中 **`xx` / `xxx` 是位数预算而不是补零显示**：minor 上限 99，patch 上限 999。补零写法（如 `0.09.001`）不可用——SemVer 禁止前导零，Cargo 会直接报 `invalid leading zero in minor version number` 拒绝构建。
+
+进位规则（实现与自测见 `scripts/next-version.sh`）：
+
+| 级别 | 行为 | 例 |
+| --- | --- | --- |
+| `patch` | +1；满 999 进位到 minor | `0.9.0` → `0.9.1`，`0.9.999` → `0.10.0` |
+| `minor` | +1、patch 归零；满 99 进位到 major | `0.9.7` → `0.10.0`，`0.99.0` → `1.0.0` |
+| `major` | +1、minor 与 patch 归零 | `0.9.7` → `1.0.0` |
+
+低位连锁进位也成立：`patch` 作用于 `0.99.999` 得到 `1.0.0`。
+
+发布方式：在 Actions 里手动运行 **Release**，`level` 选 `patch`（默认）/ `minor` / `major`，工作流会自己算出下一个版本、同步改写 `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json`、提交并据此打 tag 发布，无需手工改版本号。要发布一个已经写死在 `Cargo.toml` 里的版本，把 `level` 选成 `none` 并填 `version`。直接推 `v*` tag 的老方式继续可用。
+
 - 校验 `Cargo.toml` 版本和 tag 一致。
 - 构建 Admin UI。
 - 构建多平台二进制。

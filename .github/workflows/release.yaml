@@ -6,9 +6,15 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Release version, matching Cargo.toml (e.g. 0.1.0 or v0.1.0)'
+      level:
+        description: 'Auto-increment the version (x.xx.xxx odometer). Pick "none" to release the version already in Cargo.toml.'
         required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major, none]
+      version:
+        description: 'Explicit version, only used when level is "none" (e.g. 0.1.0 or v0.1.0)'
+        required: false
         type: string
       prerelease:
         description: 'Mark the GitHub Release as a prerelease'
@@ -20,7 +26,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -34,6 +40,7 @@ jobs:
       prerelease: ${{ steps.meta.outputs.prerelease }}
       target: ${{ steps.meta.outputs.target }}
       has_dockerhub: ${{ steps.dockerhub.outputs.has_dockerhub }}
+      bumped_sha: ${{ steps.bump.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,6 +64,52 @@ jobs:
             echo "has_dockerhub=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # 版本自增采用里程表式进位（详见 scripts/next-version.sh 与其自测）：
+      # patch 每次 +1，满 999 进位到 minor；minor 满 99 进位到 major。
+      # 注意 x.xx.xxx 是位数预算而非补零显示——补零的 0.09.001 不是合法 SemVer，
+      # Cargo 会直接报 invalid leading zero 拒绝构建。
+      - name: Bump version
+        id: bump
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.level != 'none' }}
+        shell: bash
+        env:
+          LEVEL: ${{ github.event.inputs.level }}
+        run: |
+          set -euo pipefail
+          bash scripts/next-version.sh --self-test
+          CURRENT="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          NEXT="$(bash scripts/next-version.sh "$LEVEL" "$CURRENT")"
+          echo "::notice::Version bump: ${CURRENT} -> ${NEXT} (${LEVEL})"
+
+          # 三处版本必须一起改：Cargo.toml 是发布校验的来源，Cargo.lock 里本包的
+          # 版本若不同步会让 --locked 构建失败，package.json 决定前端产物版本。
+          sed -i "0,/^version = \"${CURRENT}\"/s//version = \"${NEXT}\"/" Cargo.toml
+          sed -i "s/^  \"version\": \"${CURRENT}\",/  \"version\": \"${NEXT}\",/" admin-ui/package.json
+          python3 - "$CURRENT" "$NEXT" <<'PY'
+          import re, sys
+          current, nxt = sys.argv[1], sys.argv[2]
+          path = "Cargo.lock"
+          text = open(path, encoding="utf-8").read()
+          # 只改本包自己的条目，不碰任何依赖的版本。
+          updated = re.sub(
+              r'(\[\[package\]\]\nname = "kiro-rs"\nversion = ")%s(")' % re.escape(current),
+              r"\g<1>%s\g<2>" % nxt,
+              text,
+              count=1,
+          )
+          if updated == text:
+              raise SystemExit("Cargo.lock: kiro-rs %s entry not found; refusing to tag a mismatched lockfile" % current)
+          open(path, "w", encoding="utf-8").write(updated)
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock admin-ui/package.json
+          git commit -m "chore(release): ${NEXT}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Validate version
         id: meta
         shell: bash
@@ -65,11 +118,20 @@ jobs:
           # job outputs would be redacted to an empty string when passed across jobs.
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           REPO_OWNER: ${{ github.repository_owner }}
+          BUMPED_VERSION: ${{ steps.bump.outputs.version }}
+          BUMPED_SHA: ${{ steps.bump.outputs.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ -n "${BUMPED_VERSION:-}" ]; then
+            RAW_VERSION="$BUMPED_VERSION"
+            PRERELEASE="${{ github.event.inputs.prerelease }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             RAW_VERSION="${{ github.event.inputs.version }}"
             PRERELEASE="${{ github.event.inputs.prerelease }}"
+            if [ -z "$RAW_VERSION" ]; then
+              echo "::error::level is \"none\", so an explicit version input is required"
+              exit 1
+            fi
           else
             RAW_VERSION="${GITHUB_REF_NAME}"
             PRERELEASE="false"
@@ -97,7 +159,8 @@ jobs:
             exit 1
           fi
 
-          TARGET="$(git rev-list -n 1 "${TAG}" 2>/dev/null || echo "${GITHUB_SHA}")"
+          # 自增后 tag 必须落在刚提交的那个 commit 上，而不是工作流启动时的 SHA。
+          TARGET="${BUMPED_SHA:-$(git rev-list -n 1 "${TAG}" 2>/dev/null || echo "${GITHUB_SHA}")}"
 
           NAMESPACE="${DOCKERHUB_NAMESPACE:-$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')}"
 
@@ -114,6 +177,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 钉到 prepare 实际发布的那个提交：自增会往分支推一个版本提交，
+          # 若这里仍取分支最新，期间任何一次 push 都会让产物与 tag 指向的代码不一致。
+          ref: ${{ needs.prepare.outputs.target }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -194,6 +261,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 钉到 prepare 实际发布的那个提交：自增会往分支推一个版本提交，
+          # 若这里仍取分支最新，期间任何一次 push 都会让产物与 tag 指向的代码不一致。
+          ref: ${{ needs.prepare.outputs.target }}
 
       - name: Download admin-ui dist
         uses: actions/download-artifact@v4
@@ -280,6 +351,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 钉到 prepare 实际发布的那个提交：自增会往分支推一个版本提交，
+          # 若这里仍取分支最新，期间任何一次 push 都会让产物与 tag 指向的代码不一致。
+          ref: ${{ needs.prepare.outputs.target }}
 
       - name: Download release asset
         uses: actions/download-artifact@v4
@@ -370,6 +445,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 钉到 prepare 实际发布的那个提交：自增会往分支推一个版本提交，
+          # 若这里仍取分支最新，期间任何一次 push 都会让产物与 tag 指向的代码不一致。
+          ref: ${{ needs.prepare.outputs.target }}
 
       - name: Download release assets
         uses: actions/download-artifact@v4
