@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Loader2,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Loader2, Wallet,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -25,6 +25,7 @@ import { useConfirm } from '@/components/ui/confirm-dialog'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
 import { PageHeader } from '@/components/console/page-header'
+import { ClientKeyBudgets } from '@/components/client-key-budgets'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -98,6 +99,8 @@ export function ClientKeysPage() {
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
+  /// 账本额度单独一个弹窗：它按币种分行，塞进窄窄的编辑框里会挤成一团。
+  const [budgetTarget, setBudgetTarget] = useState<ClientKeyItem | null>(null)
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
@@ -456,6 +459,17 @@ export function ClientKeysPage() {
         variant="ghost"
         onClick={(e) => {
           e.stopPropagation()
+          setBudgetTarget(k)
+        }}
+        title="账本额度"
+      >
+        <Wallet className="h-3.5 w-3.5" />
+      </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={(e) => {
+          e.stopPropagation()
           handleToggleDisabled(k)
         }}
         title={k.disabled ? '启用' : '禁用'}
@@ -711,6 +725,21 @@ export function ClientKeysPage() {
         </Dialog>
       )}
 
+      {/* 账本额度 */}
+      {budgetTarget && (
+        <Dialog open onOpenChange={(o) => { if (!o) setBudgetTarget(null) }}>
+          <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>账本额度 — {budgetTarget.name}</DialogTitle>
+              <DialogDescription>
+                多上游网关按币种分别记账。这里的数字来自账本，与上面的「积分上限」和统计视图是两套东西。
+              </DialogDescription>
+            </DialogHeader>
+            <ClientKeyBudgets keyId={budgetTarget.id} />
+          </DialogContent>
+        </Dialog>
+      )}
+
       {/* 编辑对话框 */}
       {editOpen && (
         <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && setEditOpen(o)}>
@@ -754,7 +783,12 @@ export function ClientKeysPage() {
                   disabled={updateKey.isPending || setMaxCredits.isPending}
                 />
                 <p className="mt-1 text-[11px] text-muted-foreground">
-                  累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
+                  这是<strong>既有 Kiro 路径</strong>的积分上限：累计 credit 达到上限后，走既有路径的请求会被拒绝（HTTP 429）。
+                  清空则取消限制；重置统计会清零这里的已用量。
+                </p>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  多上游网关接管的别名<strong>不受这一项管辖</strong>，它们按账本额度计费——见「账本额度」。
+                  重置统计动不了账本。
                 </p>
               </div>
               <DialogFooter>
