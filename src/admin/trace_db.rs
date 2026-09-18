@@ -227,6 +227,10 @@ pub trait TraceSink: Send + Sync {
     fn on_wire_audit(&self, _audit: Value) {}
     /// The final complete native snapshot for one actual provider round, never each metadata event.
     fn on_native_usage(&self, _usage: TokenUsage) {}
+    /// One passive observation of what the upstream reported about context usage, recorded so the
+    /// event's real shape and the disagreement between declared, guessed and native figures become
+    /// knowable from ordinary traffic. Callers must pass redacted structure, never prompt text.
+    fn on_context_observation(&self, _observation: Value) {}
 }
 
 /// Summarize retained native snapshots without inferring coverage or cache-hit acceptance.

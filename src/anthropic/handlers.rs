@@ -320,6 +320,12 @@ impl TraceSink for RequestTracer {
             evidence.push(("native_usage", serde_json::to_value(usage).unwrap()));
         }
     }
+    fn on_context_observation(&self, observation: serde_json::Value) {
+        let mut evidence = self.pipeline_evidence.lock();
+        if evidence.len() < 255 {
+            evidence.push(("context_observation", observation));
+        }
+    }
     fn on_attempt(&self, mut attempt: TraceAttempt) {
         let mut attempts = self.attempts.lock();
         // Each provider call numbers retries from zero. A web-search request can make
@@ -1237,6 +1243,8 @@ struct StreamSettlement {
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     usage: TraceUsage,
+    /// 最近一次从 StreamContext 取得的上下文观测；流结束时落一次，不逐事件重复落。
+    observation: Option<serde_json::Value>,
     sent_bytes: u64,
     settled: bool,
 }
@@ -1253,6 +1261,7 @@ impl StreamSettlement {
             credential_id,
             tracer,
             usage: stream_trace_usage(ctx),
+            observation: context_observation(ctx),
             sent_bytes: 0,
             settled: false,
         }
@@ -1260,6 +1269,7 @@ impl StreamSettlement {
 
     fn update(&mut self, ctx: &StreamContext, sent_bytes: u64) {
         self.usage = stream_trace_usage(ctx);
+        self.observation = context_observation(ctx);
         self.sent_bytes = sent_bytes;
     }
 
@@ -1275,6 +1285,9 @@ impl StreamSettlement {
             return;
         }
         self.record_usage(usage_status);
+        if let Some(observation) = self.observation.take() {
+            self.tracer.on_context_observation(observation);
+        }
         self.tracer.finalize(
             trace_status,
             error_type,
@@ -1313,6 +1326,31 @@ impl Drop for StreamSettlement {
         );
         self.settled = true;
     }
+}
+
+/// 构造一次被动的上下文观测记录。
+///
+/// 只有上游真的发来 contextUsageEvent 才产生记录——没有观测就是没有观测，不补零。
+/// 记录里刻意**并列**三样互不替代的东西，而不是把它们合成一个结论：
+/// - `percentage`：上游原样下发的使用率
+/// - `guessedWindowTokens`：当前换算用的写死窗口表取值（`get_context_window_size`）
+/// - `derivedInputTokens`：二者相乘的结果，也就是当前上报给客户端的数字
+///
+/// 声明上限 `maxInputTokens` 与原生 `tokenUsage` 已由同一条 trace 的 `wire_audit`
+/// 与 `native_usage` 证据行承载，这里不重复存；聚合时在 trace 内 join 即可。
+///
+/// `shape` 是脱敏后的事件结构（字符串只留长度），用于让 breakdown 的真实形状能从
+/// 正常业务流量中被观察到——本项目不允许为此发探测流量。
+fn context_observation(ctx: &StreamContext) -> Option<serde_json::Value> {
+    let percentage = ctx.context_usage_percentage?;
+    Some(json!({
+        "model": ctx.model,
+        "percentage": percentage,
+        "guessedWindowTokens": get_context_window_size(&ctx.model),
+        "derivedInputTokens": ctx.context_input_tokens,
+        "shape": ctx.context_usage_shape,
+        "note": "passive observation of one ordinary request; no probe traffic",
+    }))
 }
 
 /// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
@@ -2499,6 +2537,54 @@ mod tests {
             canonical_attempt_outcome(outcome::ACCOUNT_SUSPENDED),
             outcome::ACCOUNT_SUSPENDED
         );
+    }
+
+    fn stream_ctx(model: &str) -> StreamContext {
+        StreamContext::new_with_thinking(
+            model,
+            0,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    /// 上游没发 contextUsageEvent 就是没有观测：不补零、不造样本。
+    #[test]
+    fn no_context_event_yields_no_observation() {
+        assert!(context_observation(&stream_ctx("claude-sonnet-4")).is_none());
+    }
+
+    /// 观测必须把上游原值、猜测窗口和换算结果**并列**保留，
+    /// 否则事后分不清误差来自上游还是来自那张写死的窗口表。
+    #[test]
+    fn observation_keeps_upstream_value_and_guess_side_by_side() {
+        let mut ctx = stream_ctx("claude-sonnet-4");
+        ctx.context_usage_percentage = Some(12.5);
+        ctx.context_input_tokens = Some(25_000);
+        let observation = context_observation(&ctx).expect("有百分比就应有观测");
+        assert_eq!(observation["percentage"], 12.5);
+        assert_eq!(observation["derivedInputTokens"], 25_000);
+        assert_eq!(
+            observation["guessedWindowTokens"],
+            get_context_window_size("claude-sonnet-4")
+        );
+        assert_eq!(observation["model"], "claude-sonnet-4");
+    }
+
+    /// 脱敏结构原样带过来，且不得携带任何文本内容。
+    #[test]
+    fn observation_carries_redacted_shape_without_text() {
+        let event = crate::kiro::model::events::ContextUsageEvent::from_payload(
+            br#"{"contextUsagePercentage":5.0,"breakdown":{"historyTokens":900},"note":"PRIVATE"}"#,
+        )
+        .unwrap();
+        let mut ctx = stream_ctx("claude-sonnet-4");
+        ctx.context_usage_percentage = Some(event.context_usage_percentage);
+        ctx.context_usage_shape = event.shape.clone();
+        let observation = context_observation(&ctx).unwrap();
+        assert_eq!(observation["shape"]["breakdown"]["historyTokens"], 900);
+        assert!(!observation.to_string().contains("PRIVATE"));
     }
 
     fn upstream_rejection(status: u16, body: &str) -> anyhow::Error {

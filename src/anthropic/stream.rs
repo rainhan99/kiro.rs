@@ -1382,6 +1382,13 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 上游原样下发的上下文使用百分比。
+    ///
+    /// 单独保留而不是只留换算结果：换算用的窗口是一张写死的模型名猜测表，
+    /// 把百分比和换算结果混在一起就再也分不清误差来自上游还是来自那张表。
+    pub context_usage_percentage: Option<f64>,
+    /// contextUsageEvent 的脱敏结构（字段名与数值，字符串只留长度）。
+    pub context_usage_shape: Option<serde_json::Value>,
     /// 上游 metadataEvent.tokenUsage 的精确最终快照。
     pub provider_token_usage: Option<TokenUsage>,
     /// 输出 tokens 累计
@@ -1494,6 +1501,8 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            context_usage_percentage: None,
+            context_usage_shape: None,
             provider_token_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
@@ -1606,6 +1615,9 @@ impl StreamContext {
                 Vec::new()
             }
             Event::ContextUsage(context_usage) => {
+                // 原始百分比与事件结构单独留存，供被动校准使用；换算逻辑保持不变。
+                self.context_usage_percentage = Some(context_usage.context_usage_percentage);
+                self.context_usage_shape = context_usage.shape.clone();
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
                 let actual_input_tokens =
