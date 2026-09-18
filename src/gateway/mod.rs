@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod sse;
 pub mod transport;
 pub mod routing;
+pub mod service;
 mod ledger_types;
 pub mod usage;
 

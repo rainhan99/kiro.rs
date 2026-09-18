@@ -236,6 +236,41 @@ async fn main() {
         }
     }
 
+    // 多上游网关。`gateway.json` 与 `billing.db` 与既有缓存文件并列。
+    //
+    // 与 traces.db 不同，这里的失败**是致命的**：
+    // - 配置存在但不合法 → 拒绝启动，而不是当作"没有上游"静悄悄拒绝全部流量；
+    // - 配置声明了上游/模型但账本打不开 → 拒绝启动，记不了账就不能收费。
+    //
+    // 配置缺失时网关完全惰性，任何别名都不接管，请求原样走既有路径——
+    // 现有部署不会因为引入这个特性而改变行为。
+    let gateway = std::sync::Arc::new(
+        gateway::service::GatewayService::open(
+            &cache_dir.join("gateway.json"),
+            &cache_dir.join("billing.db"),
+        )
+        .unwrap_or_else(|e| {
+            tracing::error!("网关初始化失败: {:#}", e);
+            std::process::exit(1);
+        }),
+    );
+    {
+        let managed = gateway.public_models();
+        if managed.is_empty() {
+            tracing::info!("多上游网关未配置，全部请求走既有 Kiro 路径");
+        } else {
+            tracing::info!(
+                models = managed.len(),
+                "多上游网关已启用，接管模型: {}",
+                managed
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
         cache_dir.join("traces.db"),
