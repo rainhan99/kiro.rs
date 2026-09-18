@@ -18,15 +18,12 @@ import { cn } from '@/lib/utils'
 import { railClass, type RailTone } from './rail'
 
 /**
- * 运维密集表格 —— 凭据 / 日志共用。
+ * 控制台表格：客户端 Key、分组和请求日志共用。
  *
- * 与「卡片」形态的分工：卡片是看的，表格是做的。所以这里的每个取舍都偏向
- * 「一屏能扫多少行」和「操作是否紧凑」：
- *
- * - 行高 34px、字号 12.5px（`.console-table`，见 index.css）
+ * - 行高至少 48px、字号 12.5px（`.console-table`，见 index.css）
  * - sticky 表头，长列表滚动时列名不丢
  * - 左侧 3px 状态色轨代替整行染色：既标状态，又不牺牲文字对比度
- * - 行内操作 hover 才显形（`.console-row-actions`），静默时不干扰扫读
+ * - 行内操作常驻显示，鼠标、键盘和触屏均可直接操作
  * - 可选列进列控制菜单并记住选择，避免 12 列硬挤出横向滚动
  */
 export interface ConsoleColumn<T> {
@@ -61,7 +58,7 @@ export interface ConsoleTableProps<T> {
   onExpandedKeysChange?: (next: Set<number | string>) => void
   /** 点击整行是否切换展开，默认 true */
   expandOnRowClick?: boolean
-  /** 行右侧的处置动作，hover / focus 行才显形 */
+  /** 行右侧常驻显示的处置动作 */
   rowActions?: (row: T) => ReactNode
   /** 列可见性持久化 key；不给则不显示列控制菜单 */
   columnsStorageKey?: string
@@ -284,7 +281,7 @@ function ConsoleTableImpl<T>({
                       >
                         <button
                           type="button"
-                          className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                          className="inline-flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                           title={isExpanded ? '收起详情' : '展开详情'}
                           aria-label={isExpanded ? '收起详情' : '展开详情'}
                         >
@@ -329,7 +326,7 @@ function ConsoleTableImpl<T>({
                         className="pr-3 text-right"
                         onClick={(e) => e.stopPropagation()}
                       >
-                        <div className="console-row-actions flex items-center justify-end gap-1">
+                        <div className="flex items-center justify-end gap-1">
                           {rowActions(row)}
                         </div>
                       </td>

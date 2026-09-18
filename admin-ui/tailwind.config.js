@@ -73,9 +73,9 @@ export default {
         '3xl': '12px',
         '2xl': '8px',
         xl: '8px',
-        lg: '6px',
-        md: '4px',
-        sm: '2px',
+        lg: '8px',
+        md: '8px',
+        sm: '6px',
       },
       keyframes: {
         'fade-in': {

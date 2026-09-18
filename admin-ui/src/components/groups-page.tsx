@@ -265,7 +265,6 @@ export function GroupsPage() {
       <Button
         size="icon"
         variant="ghost"
-        className="h-7 w-7"
         onClick={(e) => {
           e.stopPropagation()
           openEdit(g)
@@ -277,7 +276,7 @@ export function GroupsPage() {
       <Button
         size="icon"
         variant="ghost"
-        className="h-7 w-7 text-destructive hover:text-destructive"
+        className="text-destructive hover:text-destructive"
         onClick={(e) => {
           e.stopPropagation()
           handleDelete(g)
@@ -296,11 +295,6 @@ export function GroupsPage() {
         icon={<FolderTree className="h-4 w-4" />}
         title="分组管理"
         description="分组是凭据 / 客户端 Key 共享的独立逻辑实体；改名与删除会自动级联同步。"
-        badge={
-          <Badge variant="secondary" className="font-mono text-xs">
-            {groups.length} 个分组
-          </Badge>
-        }
         actions={
           <>
             <Button

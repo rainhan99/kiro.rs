@@ -1120,11 +1120,6 @@ export function TraceLogPage() {
         icon={<ScrollText className="h-4 w-4" />}
         title="请求日志"
         description="端到端请求链路审计追踪、模型用量与重试故障转移明细分析。"
-        badge={
-          <Badge variant="secondary" className="font-mono text-xs">
-            {total} 条记录
-          </Badge>
-        }
         actions={
           <>
             {filterCount > 0 && (

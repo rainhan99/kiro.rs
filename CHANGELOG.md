@@ -4,6 +4,66 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-09-17
+
+主题：**控制台主题与表格体验、Prompt Cache 计量与会话粘性路由、Codex 远程上下文压缩，以及凭据区域兼容性修复**。本版汇总 `v0.8.0` 之后的变更；新增配置提供默认值，请求日志数据库在启动时自动补齐新增字段。
+
+### 🎨 Admin UI — 主题、布局与操作体验
+
+> 来源：[PR #86](https://github.com/ZyphrZero/kiro.rs/pull/86)、[PR #89](https://github.com/ZyphrZero/kiro.rs/pull/89) 与 [PR #90](https://github.com/ZyphrZero/kiro.rs/pull/90)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。后续主题、表格可用性与移动端调整由 [@ZyphrZero](https://github.com/ZyphrZero) 补充。
+
+- 控制台采用固定侧栏与独立内容滚动区域，统一六个业务页面的标题、面包屑和操作区；窄屏使用紧凑操作菜单，避免快捷按钮挤掉页面标题。
+- 提供清透青、石墨灰、海洋蓝、松林绿和琥珀金五套完整配色，主题同时作用于页面背景、侧栏、选中态、悬停色与焦点色；分别校准深浅模式，主题菜单加入配色预览，并保留偏好记忆与跟随系统。
+- 统一常用控件圆角，弱化卡片边框和分隔线，使用轻量阴影区分层次；图表坐标文字跟随主题，提高深色模式下的可读性。
+- 客户端 Key、分组等表格的操作按钮常驻显示，点击区域增大到 `32 × 32px`；共用表格数据行至少 `48px`，表头 `36px`，改善阅读与点击体验。
+- 移除凭据、分组、请求日志和客户端 Key 标题旁的数量徽标；统计卡片说明支持换行，修复手机端数值与说明重叠。
+- 客户端 Key、分组与日志统一表格、批量选择和操作布局；批量删除展示进度与结果，日志支持行内展开详情。
+- 优化弹窗按需挂载、表格与表单组件记忆化、框选和滚动处理；移除背景模糊滤镜及无效的主题切换强制布局读取。
+- 修复新增凭据后的优先级选择刷新，并减少添加凭据对话框受到浏览器自动填充的干扰。
+
+### 📊 Prompt Cache — 计量语义与来源区分
+
+> 来源：[PR #86](https://github.com/ZyphrZero/kiro.rs/pull/86)、[PR #88](https://github.com/ZyphrZero/kiro.rs/pull/88) 与 [PR #90](https://github.com/ZyphrZero/kiro.rs/pull/90)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。PR #88 中的计费折扣映射已由 PR #90 移除，下文描述本版最终行为。
+
+- 本地缓存计量支持顶层自动 `cache_control` 与显式块级断点，按已声明断点匹配前缀；未声明缓存控制时不模拟缓存命中。
+- 支持最多四个断点、20 个块位置的回溯匹配，以及 `5m` / `1h` 独立 TTL 与命中续期；校验混合 TTL 顺序、无效断点和缓存隔离，保持输入、缓存创建与读取 Token 总量一致。
+- 增加可选 Redis 共享计量元数据与并发协调，用于多实例部署；该机制只参与计量估算，不存储模型 KV Cache。
+- 新增 `cacheMeteringEnabled` 配置与管理端运行时开关。关闭后停止本地缓存计量模拟；上游提供的真实 Token 用量仍优先采用，不受此开关影响。
+- 缓存读取与未缓存输入按对应来源的用量上报，不再为适配下游计费折扣改写 Token 拆分；请求日志区分 `provider`、`simulated` 与 `none`。
+
+### ✨ 会话路由与请求追踪
+
+> 来源：[PR #90](https://github.com/ZyphrZero/kiro.rs/pull/90)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 新增会话粘性路由：同一 `conversationId` 优先沿用上一轮成功的凭据；凭据禁用、冷却、限流、模型或分组不匹配时，回到现有调度策略。
+- 提供 `sessionAffinityEnabled`、`sessionAffinityTtlSecs` 配置与管理端开关、有效期及命中统计；仅在上游成功后建立或续期绑定。
+- 请求日志新增会话 ID、粘性命中结果、上一凭据、计量来源和客户端 IP，支持按会话、换号与 IP 筛选；凭据页面补充 Profile 信息，便于排查缓存与路由行为。
+- 日志 Token 列展示未缓存输入、输出、缓存读取与写入明细；首 Token 延迟和总耗时合并展示，并按各自阈值着色。
+
+### 🔧 Responses / Codex — 远程压缩与工具兼容
+
+> 来源：[PR #81](https://github.com/ZyphrZero/kiro.rs/pull/81)、[PR #82](https://github.com/ZyphrZero/kiro.rs/pull/82)，提交人：[@lijmyeah](https://github.com/lijmyeah)；[PR #83](https://github.com/ZyphrZero/kiro.rs/pull/83)，提交人：[@stormrise](https://github.com/stormrise)。感谢贡献。远程压缩的合并适配与测试修复由 [@ZyphrZero](https://github.com/ZyphrZero) 补充。
+
+- 接入并加固 Codex 远程上下文压缩流程（PR #81）：识别末尾 `compaction_trigger`，将历史转换为摘要请求，返回可在后续请求中恢复的 `compaction` 项，支持 JSON 与 SSE 响应。
+- 压缩路径保留最新用户输入和历史工具调用结构，处理未完成的工具结果；遇到上下文溢出时，对过大的历史工具输出限量后重试一次。
+- 区分摘要完成、输出截断、空摘要、意外工具调用和上下文溢出，正确返回完成、不完整或失败状态，并累计尝试中的用量。
+- 修复上游返回裸工具名时的 namespace 还原：精确匹配优先，仅在声明唯一时恢复命名空间及 custom / function 工具类型，避免同名工具误路由。
+- `GET /v1/models` 新增 `context_window`，由上游 `maxInputTokens` 提供，与管理端模型元数据保持一致。
+
+### 🔧 Kiro 凭据与区域兼容
+
+> 来源：[PR #78](https://github.com/ZyphrZero/kiro.rs/pull/78)。提交人：[@gujunxiang](https://github.com/gujunxiang)，感谢贡献。[Issue #91](https://github.com/ZyphrZero/kiro.rs/issues/91) 的凭据区域修复由 [@ZyphrZero](https://github.com/ZyphrZero) 完成。
+
+- 修复仅配置凭据 `region` 时推理请求仍使用全局区域的问题（#91）；API 区域优先级调整为 `credential.apiRegion → credential.region → config.apiRegion → config.region`，同时覆盖 IDE / CLI 的推理、MCP URL 与 Host。
+- 用量和模型列表请求携带 `profileArn` 遇到特定租户兼容错误时，可重试不带 ARN 的请求，并保留已有区域回退逻辑；普通客户端错误不会无条件重复发送。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.0`。
+- 会话粘性路由默认开启，绑定有效期默认 `3600` 秒；有效绑定优先于优先级调度的立即回切，需要原有逐请求选号行为时可关闭该选项。
+- 本地缓存计量开关依次读取 `cacheMeteringEnabled`、`KIRO_RS_CACHE_METERING`，均未设置时默认开启。本地估算不代表上游实际缓存命中或计费折扣，应结合日志中的用量来源判断。
+- 请求日志 SQLite 新字段自动迁移；现有配置、凭据和客户端 Key 文件无需手动转换。
+
 ## [0.8.0] - 2026-08-26
 
 主题：**Responses / Codex 流式链路稳定性、客户端 Key 配额治理、运维控制台与凭据元数据管理，以及 Enterprise / IdC 兼容性修复**。本版合并 PR #66、#67、#70、#71、#74、#75，并补充后续的控制台主题、刷新和移动端布局改进。新增字段均提供默认值，升级无需迁移现有配置、凭据或客户端 Key 文件。

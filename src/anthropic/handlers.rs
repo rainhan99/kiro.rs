@@ -32,7 +32,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_pipeline};
+use super::converter::{ConversionError, convert_request_with_pipeline, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -629,6 +629,14 @@ fn infer_model_owner(model_id: &str) -> &'static str {
     }
 }
 
+fn context_window_from_upstream(model_id: &str, token_limits: Option<&TokenLimits>) -> i32 {
+    token_limits
+        .and_then(|limits| limits.max_input_tokens)
+        .and_then(|limit| i32::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(|| get_context_window_size(model_id))
+}
+
 fn model_from_upstream(upstream: UpstreamModel) -> Model {
     let max_tokens = upstream
         .token_limits
@@ -637,6 +645,8 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         .and_then(|limit| i32::try_from(limit).ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(64_000);
+    let context_window =
+        context_window_from_upstream(&upstream.model_id, upstream.token_limits.as_ref());
     Model {
         display_name: upstream
             .model_name
@@ -647,6 +657,7 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         object: "model".to_string(),
         created: 0,
         model_type: "chat".to_string(),
+        context_window,
         max_tokens,
     }
 }
@@ -694,6 +705,9 @@ fn aggregate_available_models_with_custom(
                 .clone()
                 .unwrap_or_else(|| custom.id.clone()),
             model_type: "chat".to_string(),
+            context_window: custom
+                .context_window
+                .unwrap_or_else(|| get_context_window_size(&custom.id)),
             max_tokens: custom.max_tokens.unwrap_or(64_000),
         };
         models.insert(model.id.clone(), model);
@@ -945,6 +959,10 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -1508,7 +1526,25 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     }
 }
 
-use super::converter::get_context_window_size;
+pub(crate) enum NonStreamExecutionError {
+    Provider(Error),
+    Response(Response),
+}
+
+pub(crate) fn new_non_stream_request_tracer(
+    state: &AppState,
+    key_ctx: KeyContext,
+    model: String,
+) -> std::sync::Arc<RequestTracer> {
+    std::sync::Arc::new(RequestTracer::new(
+        state,
+        RequestTraceOptions {
+            key_ctx,
+            model,
+            is_stream: false,
+        },
+    ))
+}
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -1527,6 +1563,42 @@ async fn handle_non_stream_request(
     group: Option<String>,
     recovery_body: Option<String>,
 ) -> Response {
+    match execute_non_stream_request(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        hook,
+        cache_usage,
+        tracer,
+        group,
+        recovery_body,
+    )
+    .await
+    {
+        Ok(response_body) => (StatusCode::OK, Json(response_body)).into_response(),
+        Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
+        Err(NonStreamExecutionError::Response(response)) => response,
+    }
+}
+
+pub(crate) async fn execute_non_stream_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+    // 一次修改后重试用的修正体。compaction 通道传 None：它有自己的溢出处理，
+    // 不应再叠加一次无损修正重试。
+    recovery_body: Option<String>,
+) -> Result<serde_json::Value, NonStreamExecutionError> {
     // 调用 Kiro API（支持多凭据故障转移）
     let first = provider
         .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -1557,7 +1629,7 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return map_provider_error(e);
+            return Err(NonStreamExecutionError::Provider(e));
         }
     };
     let response = call_result.response;
@@ -1576,14 +1648,16 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
+            return Err(NonStreamExecutionError::Response(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("读取响应失败: {}", e),
+                    )),
+                )
+                    .into_response(),
+            ));
         }
     };
 
@@ -1766,11 +1840,13 @@ async fn handle_non_stream_request(
                 TraceUsage::zero(),
             );
         }
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new("upstream_tool_json_error", message)),
-        )
-            .into_response();
+        return Err(NonStreamExecutionError::Response(
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("upstream_tool_json_error", message)),
+            )
+                .into_response(),
+        ));
     }
 
     // 确定 stop_reason
@@ -1854,7 +1930,7 @@ async fn handle_non_stream_request(
             source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
         },
     );
-    (StatusCode::OK, Json(response_body)).into_response()
+    Ok(response_body)
 }
 
 fn build_non_stream_content(
@@ -2153,6 +2229,10 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -3015,6 +3095,36 @@ mod tests {
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
     }
 
+    /// 长度拒绝稳定映射为 400，但**不得替上游断言是哪条限制**。
+    ///
+    /// 上游 0.9.0 的同名测试断言文案包含 "Context window is full"。本仓库不这么说：
+    /// `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 没有指明是总 body、单个字段、图片还是模型
+    /// 上下文窗口，把它渲染成"上下文窗口已满"是替上游做了它没做的判断，会把排查引向
+    /// 错误方向。合并 0.9.0 时改的是断言，不是实现。
+    #[tokio::test]
+    async fn typed_context_overflow_maps_to_stable_400() {
+        let resp = map_provider_error(upstream_rejection(
+            400,
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD"));
+        assert!(
+            message.contains("did not specify"),
+            "必须如实说明上游没有指明是哪条限制：{message}"
+        );
+        assert!(
+            !message.contains("Context window is full"),
+            "不得替上游断言是上下文窗口：{message}"
+        );
+    }
+
     #[tokio::test]
     async fn generic_upstream_error_does_not_expose_raw_body() {
         let secret = "aws-account=123456789012 request-id=private-request";
@@ -3181,6 +3291,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "GLM 5");
         assert_eq!(models[0].owned_by, "kiro");
+        assert_eq!(models[0].context_window, 1_000_000);
         assert_eq!(models[0].max_tokens, 32_000);
     }
 
@@ -3211,6 +3322,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "Configured GPT");
         assert_eq!(models[0].owned_by, "configured-owner");
+        assert_eq!(models[0].context_window, 500_000);
         assert_eq!(models[0].max_tokens, 12_345);
     }
 

@@ -68,11 +68,11 @@ export function StatusStrip({
               title={s.hint}
               aria-pressed={s.active}
               className={cn(
-                'inline-flex items-center gap-1.5 px-2.5 h-7 text-xs font-medium rounded border transition-colors select-none cursor-pointer active:scale-[0.96] transition-transform',
+                'inline-flex items-center gap-1.5 px-2.5 h-7 text-xs font-medium rounded-md border transition-colors select-none cursor-pointer',
                 'focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                 s.active
-                  ? 'bg-card border-border text-foreground shadow-xs font-semibold'
-                  : 'bg-transparent border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground',
+                  ? 'bg-accent border-primary/15 text-accent-foreground font-semibold'
+                  : 'bg-transparent border-transparent text-muted-foreground hover:bg-accent hover:text-foreground',
               )}
             >
               {inner}

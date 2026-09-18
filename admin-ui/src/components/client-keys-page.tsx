@@ -443,7 +443,6 @@ export function ClientKeysPage() {
       <Button
         size="icon"
         variant="ghost"
-        className="h-7 w-7"
         onClick={(e) => {
           e.stopPropagation()
           startEdit(k)
@@ -455,7 +454,6 @@ export function ClientKeysPage() {
       <Button
         size="icon"
         variant="ghost"
-        className="h-7 w-7"
         onClick={(e) => {
           e.stopPropagation()
           handleToggleDisabled(k)
@@ -467,7 +465,6 @@ export function ClientKeysPage() {
       <Button
         size="icon"
         variant="ghost"
-        className="h-7 w-7"
         onClick={(e) => {
           e.stopPropagation()
           handleReset(k)
@@ -480,7 +477,7 @@ export function ClientKeysPage() {
         <Button
           size="icon"
           variant="ghost"
-          className="h-7 w-7 text-destructive hover:text-destructive"
+          className="text-destructive hover:text-destructive"
           onClick={(e) => {
             e.stopPropagation()
             handleDelete(k)
@@ -500,11 +497,6 @@ export function ClientKeysPage() {
         icon={<KeyRound className="h-4 w-4" />}
         title="客户端 Key"
         description="分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。"
-        badge={
-          <Badge variant="secondary" className="font-mono text-xs">
-            {keys.length} 把已注册
-          </Badge>
-        }
         actions={
           <>
             <Button

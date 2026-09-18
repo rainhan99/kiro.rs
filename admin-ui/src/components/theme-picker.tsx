@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -58,52 +59,63 @@ export function ThemePicker({
                 variant="ghost"
                 size="icon"
                 aria-label={title}
-                className="theme-picker-trigger"
+                className="relative text-primary"
               >
                 <Palette className="h-4 w-4" />
+                <span className="absolute right-1 top-1 size-1.5 rounded-full bg-primary" aria-hidden="true" />
               </Button>
             </DropdownMenuTrigger>
           </TooltipTrigger>
           <TooltipContent>{title}</TooltipContent>
         </Tooltip>
-        <DropdownMenuContent align="end" className="w-64">
-          <DropdownMenuLabel>配色主题</DropdownMenuLabel>
-          {THEME_METADATA.map((item) => (
-            <DropdownMenuItem
-              key={item.id}
-              role="menuitemradio"
-              aria-checked={theme.palette === item.id}
-              onSelect={() => onSelectPalette(item.id)}
-              className="gap-2.5"
-            >
-              <span
-                aria-hidden="true"
-                className="size-3 shrink-0 rounded-full ring-1 ring-black/10 dark:ring-white/20"
-                style={{ backgroundColor: item.swatch }}
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block text-sm">{item.name}</span>
-                <span className="block truncate text-[11px] text-muted-foreground">
-                  {item.description}
+        <DropdownMenuContent align="end" className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1.5">
+          <DropdownMenuLabel id="palette-label">配色主题</DropdownMenuLabel>
+          <DropdownMenuGroup aria-labelledby="palette-label" className="grid gap-1">
+            {THEME_METADATA.map((item) => (
+              <DropdownMenuItem
+                key={item.id}
+                role="menuitemradio"
+                aria-checked={theme.palette === item.id}
+                onSelect={() => onSelectPalette(item.id)}
+                data-active={theme.palette === item.id}
+                className="gap-3 rounded-md px-2.5 py-2 data-[active=true]:bg-accent data-[active=true]:text-accent-foreground"
+              >
+                <span
+                  aria-hidden="true"
+                  data-theme={item.id}
+                  className="theme-preview flex h-8 w-12 shrink-0 overflow-hidden rounded-sm border border-border bg-background"
+                >
+                  <span className="flex w-3.5 shrink-0 flex-col gap-1 bg-sidebar p-1">
+                    <span className="h-1 w-full rounded-full bg-primary" />
+                    <span className="h-1 w-full rounded-full bg-primary/25" />
+                  </span>
+                  <span className="flex flex-1 flex-col gap-1 p-1">
+                    <span className="h-2 rounded-xs bg-card" />
+                    <span className="h-2 rounded-xs bg-primary" />
+                  </span>
                 </span>
-              </span>
-              {theme.palette === item.id && <Check className="size-4 text-primary" aria-hidden="true" />}
-            </DropdownMenuItem>
-          ))}
+                <span className="min-w-0 flex-1 text-sm">{item.name}</span>
+                {theme.palette === item.id && <Check className="size-4 text-primary" aria-hidden="true" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuGroup>
           <DropdownMenuSeparator />
-          <DropdownMenuLabel>明暗模式</DropdownMenuLabel>
-          {MODE_OPTIONS.map(({ id, label, icon: Icon }) => (
-            <DropdownMenuItem
-              key={id}
-              role="menuitemradio"
-              aria-checked={theme.mode === id}
-              onSelect={() => onSelectMode(id)}
-            >
-              <Icon aria-hidden="true" />
-              <span className="flex-1">{label}</span>
-              {theme.mode === id && <Check className="size-4 text-primary" aria-hidden="true" />}
-            </DropdownMenuItem>
-          ))}
+          <DropdownMenuLabel id="mode-label">明暗模式</DropdownMenuLabel>
+          <DropdownMenuGroup aria-labelledby="mode-label" className="grid grid-cols-3 gap-1 rounded-md bg-muted p-1">
+            {MODE_OPTIONS.map(({ id, label, icon: Icon }) => (
+              <DropdownMenuItem
+                key={id}
+                role="menuitemradio"
+                aria-checked={theme.mode === id}
+                onSelect={() => onSelectMode(id)}
+                data-active={theme.mode === id}
+                className="flex-col justify-center gap-1 rounded-sm px-1 py-2 data-[active=true]:bg-card data-[active=true]:text-primary data-[active=true]:shadow-xs"
+              >
+                <Icon aria-hidden="true" />
+                <span>{label}</span>
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
     </TooltipProvider>

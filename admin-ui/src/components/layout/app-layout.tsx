@@ -198,7 +198,7 @@ export function AppLayout({
   const activeTabMeta = TABS.find((t) => t.key === currentTab) ?? TABS[0];
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-background text-foreground flex">
+    <div className="h-dvh w-full overflow-hidden bg-background text-foreground flex">
       {/* 移动端遮罩层 */}
       {mobileOpen && (
         <div
@@ -209,14 +209,14 @@ export function AppLayout({
 
       {/* 左侧侧边栏 (Sidebar) - 固定视口高度，绝不跟随页面滚动 */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 flex h-screen flex-col shrink-0 border-r border-sidebar-border bg-sidebar transition-[width,transform] duration-200 ease-out lg:relative lg:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-50 flex h-dvh flex-col shrink-0 border-r border-sidebar-border/60 bg-sidebar transition-[width,transform] duration-200 ease-out motion-reduce:transition-none lg:relative lg:translate-x-0 ${
           collapsed ? "w-[68px]" : "w-60"
         } ${
           mobileOpen ? "translate-x-0 w-64 shadow-2xl" : "-translate-x-full"
         }`}
       >
         {/* 顶部 Logo 品牌区 */}
-        <div className="flex h-14 items-center justify-between border-b border-sidebar-border px-3.5">
+        <div className="flex h-16 shrink-0 items-center justify-between px-4">
           <div className="flex items-center gap-2.5 overflow-hidden">
             <img
               src="/admin/kirors.png"
@@ -225,7 +225,7 @@ export function AppLayout({
               draggable={false}
             />
             {(!collapsed || mobileOpen) && (
-              <span className="font-semibold tracking-tight text-sm truncate">
+              <span className="font-semibold text-sm truncate">
                 Kiro Gateway
               </span>
             )}
@@ -235,6 +235,7 @@ export function AppLayout({
               variant="ghost"
               size="icon"
               className="lg:hidden h-7 w-7"
+              aria-label="关闭菜单"
               onClick={() => setMobileOpen(false)}
             >
               <X className="size-4" />
@@ -243,7 +244,7 @@ export function AppLayout({
         </div>
 
         {/* 导航菜单列表 */}
-        <div className="flex-1 overflow-y-auto px-2.5 py-3 space-y-1">
+        <div className="flex-1 overflow-y-auto px-3 py-3 space-y-1.5">
           {TABS.map((item) => {
             const active = currentTab === item.key;
             const Icon = item.icon;
@@ -268,19 +269,17 @@ export function AppLayout({
                 key={item.key}
                 type="button"
                 onClick={handleItemClick}
-                className={`group relative flex w-full items-center gap-3 rounded-md px-2.5 py-2 text-xs font-medium transition-colors transition-transform duration-100 ease-out active:scale-[0.97] ${
+                aria-current={active ? "page" : undefined}
+                aria-label={item.label}
+                className={`group relative flex min-h-10 w-full items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors duration-100 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
                   active
-                    ? "bg-primary/10 text-primary font-semibold dark:bg-primary/15"
+                    ? "bg-primary text-primary-foreground shadow-xs"
                     : "text-muted-foreground hover:bg-accent hover:text-foreground"
                 } ${collapsed && !mobileOpen ? "justify-center px-0" : ""}`}
               >
-                {/* 激活指示线 */}
-                {active && !hasChildren && (
-                  <span className="absolute left-0 top-1.5 bottom-1.5 w-1 rounded-r bg-primary" />
-                )}
                 <Icon
                   className={`size-4 shrink-0 transition-colors ${
-                    active ? "text-primary" : "text-muted-foreground group-hover:text-foreground"
+                    active ? "text-primary-foreground" : "text-muted-foreground group-hover:text-foreground"
                   }`}
                 />
                 {(!collapsed || mobileOpen) && (
@@ -288,8 +287,8 @@ export function AppLayout({
                     <span className="truncate flex-1 text-left">{item.label}</span>
                     {hasChildren && (
                       <ChevronDown
-                        className={`size-3.5 shrink-0 text-muted-foreground transition-transform duration-200 ${
-                          settingsExpanded ? "rotate-180 text-foreground" : ""
+                        className={`size-3.5 shrink-0 opacity-70 transition-transform duration-200 ${
+                          settingsExpanded ? "rotate-180" : ""
                         }`}
                       />
                     )}
@@ -362,7 +361,7 @@ export function AppLayout({
                             setCurrentSection(child.key);
                             setMobileOpen(false);
                           }}
-                          className={`group flex w-full items-center gap-2 rounded px-2 py-1.5 text-[11.5px] font-medium transition-colors active:scale-[0.98] ${
+                          className={`group flex w-full items-center gap-2 rounded-sm px-2 py-2 text-xs font-medium transition-colors ${
                             isChildActive
                               ? "bg-primary/10 text-primary font-semibold dark:bg-primary/15"
                               : "text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -385,7 +384,7 @@ export function AppLayout({
         </div>
 
         {/* 侧边栏底部折叠开关 */}
-        <div className="border-t border-sidebar-border p-2">
+        <div className="border-t border-sidebar-border/60 p-3">
           <div className="flex items-center justify-between gap-1">
             <Button
               variant="ghost"
@@ -410,9 +409,9 @@ export function AppLayout({
       </aside>
 
       {/* 右侧主工作区容器 - 视口锁定，仅内容区域平滑滚动 */}
-      <div className="flex-1 flex flex-col h-screen min-w-0 overflow-hidden">
+      <div className="flex-1 flex flex-col h-dvh min-w-0 overflow-hidden">
         {/* 顶部 Header 控制栏 - 固定在顶部 */}
-        <header className="h-14 shrink-0 flex items-center justify-between border-b border-border bg-card px-4 sm:px-6 z-20">
+        <header className="h-16 shrink-0 flex items-center justify-between gap-2 border-b border-border/60 bg-card px-4 sm:px-6 z-20">
           {/* 左侧：移动端汉堡菜单与页面标题 */}
           <div className="flex items-center gap-3 min-w-0">
             <Button
@@ -425,7 +424,7 @@ export function AppLayout({
               <Menu className="size-4" />
             </Button>
             <div className="flex items-center gap-2 min-w-0">
-              <span className="font-semibold text-foreground text-sm tracking-tight truncate">
+              <span className="font-semibold text-foreground text-sm truncate">
                 {currentTab === "settings" && activeTabMeta.children
                   ? `${activeTabMeta.label} · ${activeTabMeta.children.find((c) => c.key === currentSection)?.label || "调度策略"}`
                   : activeTabMeta.label}
@@ -434,7 +433,7 @@ export function AppLayout({
           </div>
 
           {/* 右侧全局操作栏 */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             <TopbarTools />
             <span className="h-4 w-px bg-border mx-0.5 hidden sm:inline-block" />
             <Button
@@ -457,14 +456,14 @@ export function AppLayout({
               variant="ghost"
               size="icon"
               asChild
-              title="Telegram 讨论群组：kiro.rs dev"
+              title="Telegram 讨论群组：kiro.rs"
               className="h-8 w-8 text-[#229ED9] hover:text-[#1D8FC4] hidden sm:inline-flex"
             >
               <a
                 href="https://t.me/+SXAjVkZDWFUyMWVl"
                 target="_blank"
                 rel="noopener noreferrer"
-                aria-label="Telegram 讨论群组：kiro.rs dev"
+                aria-label="Telegram 讨论群组：kiro.rs"
               >
                 <TelegramIcon className="size-3.5" />
               </a>

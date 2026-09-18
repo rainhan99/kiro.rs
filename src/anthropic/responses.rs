@@ -57,6 +57,9 @@ use super::types::{
     Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
 };
 
+#[path = "responses_compaction.rs"]
+mod compaction;
+
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
 
@@ -110,9 +113,32 @@ fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
     }
 }
 
+/// 将上游返回的工具名映射回请求里的声明。
+///
+/// Kiro 偶尔会把 namespaced 工具的展平名（如 `functions__exec`）返回为原名
+/// `exec`。精确匹配始终优先；仅当原名在本次请求中唯一时才接受裸名，避免在
+/// 多个 namespace 声明同名工具时猜错目标。
+fn resolve_declared_tool<'a>(
+    kinds: &'a ToolKindMap,
+    upstream_name: &str,
+) -> Option<(&'a DeclaredTool, bool)> {
+    if let Some(declared) = kinds.get(upstream_name) {
+        return Some((declared, false));
+    }
+
+    let mut matches = kinds
+        .values()
+        .filter(|declared| declared.name == upstream_name);
+    let declared = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((declared, true))
+}
+
 // ============================ 请求类型 ============================
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
     #[serde(default)]
@@ -142,7 +168,7 @@ fn default_parallel_tool_calls() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ReasoningConfig {
     #[serde(default)]
     pub effort: Option<String>,
@@ -194,6 +220,16 @@ pub async fn post_responses(
     headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
+    let operation = match compaction::classify(&req.input) {
+        Ok(operation) => operation,
+        Err(message) => {
+            return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+        }
+    };
+    if operation == compaction::Operation::RemoteCompact {
+        return compaction::handle(state, key_ctx, headers, req).await;
+    }
+
     let want_stream = req.stream;
     let model = req.model.clone();
     let response_config = ResponsesResponseConfig::from_request(&req);
@@ -679,8 +715,21 @@ fn translate_input_item(
             });
             push_merged(merged, "user", vec![block]);
         }
-        // 推理项 / 已完成的搜索展示项 / 压缩项：对 Anthropic 请求无意义，忽略
-        "reasoning" | "web_search_call" | "compaction" => {}
+        // 本代理生成的 compaction 项可还原为上一窗口的摘要；其它服务生成的
+        // opaque payload 无法解释，保持忽略。compaction_trigger 已由 handler 消费。
+        "compaction" => {
+            if let Some(summary) = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .and_then(compaction::decode_payload)
+            {
+                system.push(SystemMessage {
+                    text: compaction::restored_context(&summary),
+                    cache_control: None,
+                });
+            }
+        }
+        "reasoning" | "web_search_call" | "compaction_trigger" => {}
         // "message" 或未标注 type 但带 role 的项
         _ => {
             let role = item.get("role").and_then(|v| v.as_str());
@@ -824,7 +873,6 @@ fn new_ctc_id() -> String {
 fn new_rs_id() -> String {
     format!("rs_{}", Uuid::new_v4().to_string().replace('-', ""))
 }
-
 /// 从自由文本工具的 arguments JSON 里解出原始 input 字符串。
 ///
 /// 回退链：`{"input": <string>}` → 单字段字符串对象 → 原样返回 arguments。
@@ -917,7 +965,14 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
             .and_then(|v| v.as_str())
             .unwrap_or("{}")
             .to_string();
-        let decl = kinds.get(flat_name.as_str());
+        let resolution = resolve_declared_tool(kinds, flat_name.as_str());
+        if matches!(resolution, Some((_, true))) {
+            tracing::debug!(
+                upstream_tool_name = %flat_name,
+                "responses: resolved bare upstream tool name to a unique declaration"
+            );
+        }
+        let decl = resolution.map(|(declared, _)| declared);
         // 展平名还原：namespace 工具应答时用原名 + namespace 字段
         let (name, namespace) = match decl {
             Some(d) => (d.name.clone(), d.namespace.clone()),
@@ -1524,7 +1579,27 @@ impl ResponsesStreamContext {
             arguments = "{}".to_string();
         }
         let output_index = self.allocate_output_index();
-        let decl = self.tool_kinds.get(&flat_name);
+        let resolution = resolve_declared_tool(&self.tool_kinds, &flat_name);
+        let decl = resolution.map(|(declared, _)| declared);
+        match decl {
+            Some(declared) if matches!(resolution, Some((_, true))) => tracing::debug!(
+                upstream_tool_name = %flat_name,
+                declared_tool_name = %declared.name,
+                namespace = ?declared.namespace,
+                kind = ?declared.kind,
+                "responses: resolved bare upstream tool name to a unique declaration"
+            ),
+            Some(_) => {}
+            None => {
+                let mut known_tools = self.tool_kinds.keys().cloned().collect::<Vec<_>>();
+                known_tools.sort();
+                tracing::warn!(
+                    upstream_tool_name = %flat_name,
+                    known_tools = ?known_tools,
+                    "responses: upstream tool call was not present in the request registry"
+                );
+            }
+        }
         let (name, namespace, kind) = match decl {
             Some(d) => (d.name.clone(), d.namespace.clone(), d.kind),
             None => (flat_name, None, DeclaredToolKind::Function),
@@ -2124,6 +2199,26 @@ mod tests {
     }
 
     #[test]
+    fn compaction_payload_round_trips_into_system_context() {
+        let summary = "implemented parser; next run integration tests";
+        let payload = compaction::encode_payload(summary);
+        let req = req_with(
+            json!([]),
+            json!([
+                {
+                    "id": "cmp_1",
+                    "type": "compaction",
+                    "encrypted_content": payload
+                },
+                { "type": "message", "role": "user", "content": "continue" }
+            ]),
+        );
+        let (anthropic, _) = responses_to_anthropic(req, None).unwrap();
+        let system = anthropic.system.unwrap();
+        assert!(system.iter().any(|part| part.text.contains(summary)));
+    }
+
+    #[test]
     fn responses_body_session_metadata_is_forwarded() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
@@ -2176,6 +2271,7 @@ mod tests {
             model: "gpt-5.6-sol".to_string(),
             text: String::new(),
             tool_calls,
+            upstream_stop_reason: "tool_use".to_string(),
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
             cached_tokens: 0,
@@ -2202,6 +2298,22 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn namespaced_kind(
+        flat_name: &str,
+        name: &str,
+        namespace: &str,
+        kind: DeclaredToolKind,
+    ) -> ToolKindMap {
+        HashMap::from([(
+            flat_name.to_string(),
+            DeclaredTool {
+                kind,
+                name: name.to_string(),
+                namespace: Some(namespace.to_string()),
+            },
+        )])
     }
 
     fn system_texts(req: &MessagesRequest) -> Vec<String> {
@@ -2701,6 +2813,61 @@ mod tests {
     }
 
     #[test]
+    fn build_view_resolves_unique_bare_name_to_namespaced_custom_tool() {
+        let kinds = namespaced_kind(
+            "functions__exec",
+            "exec",
+            "functions",
+            DeclaredToolKind::Custom,
+        );
+        let p = parsed_with_tool_calls(vec![json!({
+            "id": "toolu_1",
+            "type": "function",
+            "function": { "name": "exec", "arguments": "{\"input\":\"pwd\"}" },
+        })]);
+
+        let view = build_view(&p, &kinds);
+        let item = view
+            .output
+            .iter()
+            .find(|item| item["type"] == "custom_tool_call")
+            .expect("the unique declared custom tool must be restored");
+        assert_eq!(item["name"], "exec");
+        assert_eq!(item["namespace"], "functions");
+        assert_eq!(item["input"], "pwd");
+    }
+
+    #[test]
+    fn declared_tool_resolution_prefers_exact_and_rejects_ambiguous_bare_names() {
+        let mut kinds = namespaced_kind(
+            "functions__exec",
+            "exec",
+            "functions",
+            DeclaredToolKind::Custom,
+        );
+        kinds.insert(
+            "exec".into(),
+            DeclaredTool {
+                kind: DeclaredToolKind::Function,
+                name: "exec".into(),
+                namespace: None,
+            },
+        );
+        let (exact, used_bare_fallback) = resolve_declared_tool(&kinds, "exec").unwrap();
+        assert_eq!(exact.kind, DeclaredToolKind::Function);
+        assert!(!used_bare_fallback);
+
+        kinds.remove("exec");
+        kinds.extend(namespaced_kind(
+            "other__exec",
+            "exec",
+            "other",
+            DeclaredToolKind::Custom,
+        ));
+        assert!(resolve_declared_tool(&kinds, "exec").is_none());
+    }
+
+    #[test]
     fn build_view_emits_function_call_for_function_and_unknown_kinds() {
         let kinds = kinds_of(&[("shell", DeclaredToolKind::Function)]);
         let p = parsed_with_tool_calls(vec![
@@ -2907,6 +3074,51 @@ mod tests {
         assert!(completed.contains("\"namespace\":\"collaboration\""));
         assert!(completed.contains("\"call_id\":\"toolu_1\""));
         assert!(!completed.contains("\"done_key\""));
+    }
+
+    #[test]
+    fn streaming_tool_resolves_unique_bare_name_to_namespaced_custom_tool() {
+        let kinds = namespaced_kind(
+            "functions__exec",
+            "exec",
+            "functions",
+            DeclaredToolKind::Custom,
+        );
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            kinds,
+            ResponsesResponseConfig::default(),
+        );
+        context.initial_events();
+        feed_event(
+            &mut context,
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {
+                    "type": "tool_use", "id": "toolu_1", "name": "exec", "input": {}
+                },
+            }),
+        );
+        feed_event(
+            &mut context,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 1,
+                "delta": { "type": "input_json_delta", "partial_json": "{\"input\":\"pwd\"}" },
+            }),
+        );
+
+        let completed = feed_event(
+            &mut context,
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 1 }),
+        );
+        assert!(completed.contains("response.custom_tool_call_input.done"));
+        assert!(completed.contains("\"name\":\"exec\""));
+        assert!(completed.contains("\"namespace\":\"functions\""));
+        assert!(completed.contains("\"input\":\"pwd\""));
+        assert!(!completed.contains("response.function_call_arguments.done"));
     }
 
     #[test]

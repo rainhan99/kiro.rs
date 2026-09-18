@@ -1501,32 +1501,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           title="凭据管理"
           description="上游提供商凭据集群、配额健康度与多通道负载均衡管理。"
           badge={
-            <span className="inline-flex items-center gap-1.5">
-              <Badge variant="secondary" className="font-mono text-xs">
-                {allCredentials.length} 个凭据
+            profileSummary.length > 0 && (
+              <Badge
+                variant="outline"
+                className={`font-mono text-xs ${
+                  profileSummary.length === 1
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                    : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                }`}
+                title={
+                  profileSummary.length === 1
+                    ? `全部账号同属 profile ${profileShortId(profileSummary[0][0])}\n上游 prompt cache 按 profile 隔离：这些账号互相共享缓存，会话在它们之间换号不会丢缓存`
+                    : `账号分布在 ${profileSummary.length} 个 profile：\n${profileSummary
+                        .map(([arn, n]) => `  ${profileShortId(arn)} × ${n}`)
+                        .join("\n")}\n跨 profile 换号会丢上游 prompt cache，此时会话粘性路由才真正起作用`
+                }
+              >
+                {profileSummary.length === 1
+                  ? `同一 profile · 缓存共享`
+                  : `${profileSummary.length} 个 profile`}
               </Badge>
-              {profileSummary.length > 0 && (
-                <Badge
-                  variant="outline"
-                  className={`font-mono text-xs ${
-                    profileSummary.length === 1
-                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                      : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-                  }`}
-                  title={
-                    profileSummary.length === 1
-                      ? `全部账号同属 profile ${profileShortId(profileSummary[0][0])}\n上游 prompt cache 按 profile 隔离：这些账号互相共享缓存，会话在它们之间换号不会丢缓存`
-                      : `账号分布在 ${profileSummary.length} 个 profile：\n${profileSummary
-                          .map(([arn, n]) => `  ${profileShortId(arn)} × ${n}`)
-                          .join("\n")}\n跨 profile 换号会丢上游 prompt cache，此时会话粘性路由才真正起作用`
-                  }
-                >
-                  {profileSummary.length === 1
-                    ? `同一 profile · 缓存共享`
-                    : `${profileSummary.length} 个 profile`}
-                </Badge>
-              )}
-            </span>
+            )
           }
         />
 

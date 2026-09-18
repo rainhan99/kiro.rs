@@ -48,7 +48,7 @@ export function PageHeader({
   return (
     <div
       className={cn(
-        'flex flex-col gap-2 pb-3.5 mb-4 border-b border-border/50',
+        'flex flex-col gap-2 mb-5',
         className,
       )}
     >
@@ -57,7 +57,7 @@ export function PageHeader({
         <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
           {icon && (
             <span
-              className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary border border-primary/20 shadow-2xs [&>svg]:size-3.5"
+              className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent text-primary [&>svg]:size-4"
               aria-hidden="true"
             >
               {icon}
@@ -67,7 +67,7 @@ export function PageHeader({
           {/* 面包屑导航与主标题一体化结构 */}
           <nav
             aria-label="Breadcrumb"
-            className="flex items-center gap-1.5 text-sm font-semibold tracking-tight text-foreground min-w-0"
+            className="flex items-center gap-1.5 text-sm text-foreground min-w-0"
           >
             {effectiveCrumbs.map((crumb, idx) => {
               const isLast = idx === effectiveCrumbs.length - 1
@@ -88,7 +88,7 @@ export function PageHeader({
                     <span
                       className={cn(
                         'truncate text-balance',
-                        isLast ? 'text-foreground font-semibold' : 'text-muted-foreground font-normal',
+                        isLast ? 'text-foreground text-base sm:text-lg font-semibold' : 'text-muted-foreground font-normal',
                       )}
                     >
                       {crumb.label}

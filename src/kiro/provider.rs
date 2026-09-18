@@ -1028,6 +1028,9 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
+                // 统一到带字段确认的分类错误：它已涵盖 CONTENT_LENGTH_EXCEEDS_THRESHOLD，
+                // 且携带状态码与原始报文。上游 0.9.0 在此处用的是裸子串匹配，报文里任何
+                // 位置出现该关键词都会被误判，故不采用。
                 return Err(UpstreamRequestError::api(api_type, status, &body).into());
             }
 
