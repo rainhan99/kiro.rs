@@ -67,7 +67,9 @@ fn an_invalid_file_fails_startup_instead_of_falling_back() {
 fn a_stale_revision_is_rejected_without_touching_runtime() {
     let path = temp_path("conflict");
     let store = ConfigStore::open(&path).unwrap();
-    store.update(1, config_with(vec![upstream("a", None)])).unwrap();
+    store
+        .update(1, config_with(vec![upstream("a", None)]))
+        .unwrap();
     assert_eq!(store.snapshot().revision, 2);
 
     let error = store
@@ -76,7 +78,10 @@ fn a_stale_revision_is_rejected_without_touching_runtime() {
     assert!(format!("{error:#}").contains("configuration_conflict"));
     let snapshot = store.snapshot();
     assert_eq!(snapshot.revision, 2, "冲突不得推进版本");
-    assert_eq!(snapshot.config.upstreams[0].id, "a", "冲突不得改动运行期配置");
+    assert_eq!(
+        snapshot.config.upstreams[0].id, "a",
+        "冲突不得改动运行期配置"
+    );
     let _ = fs::remove_file(&path);
 }
 
@@ -123,7 +128,10 @@ fn the_redacted_view_never_carries_a_secret() {
 
     let view = store.redacted().unwrap();
     let dumped = view.to_string();
-    assert!(!dumped.contains("secret-key"), "脱敏视图泄露了密钥：{dumped}");
+    assert!(
+        !dumped.contains("secret-key"),
+        "脱敏视图泄露了密钥：{dumped}"
+    );
     assert_eq!(view["config"]["upstreams"][0]["hasApiKey"], true);
     assert_eq!(view["config"]["upstreams"][1]["hasApiKey"], false);
     assert!(view["config"]["upstreams"][0].get("apiKey").is_none());
@@ -137,7 +145,9 @@ fn the_redacted_view_never_carries_a_secret() {
 fn a_weight_change_does_not_invalidate_routes() {
     let path = temp_path("weights");
     let store = ConfigStore::open(&path).unwrap();
-    store.update(1, config_with(vec![upstream("a", None)])).unwrap();
+    store
+        .update(1, config_with(vec![upstream("a", None)]))
+        .unwrap();
 
     let mut heavier = config_with(vec![upstream("a", None)]);
     heavier.upstreams[0].weight = 9999;
@@ -176,7 +186,9 @@ fn mode_and_upstream_identity_changes_invalidate_routes() {
     for (name, mutate) in cases {
         let path = temp_path("identity");
         let store = ConfigStore::open(&path).unwrap();
-        store.update(1, config_with(vec![upstream("a", None)])).unwrap();
+        store
+            .update(1, config_with(vec![upstream("a", None)]))
+            .unwrap();
         let mut changed = config_with(vec![upstream("a", None)]);
         mutate(&mut changed);
         let outcome = store.update(2, changed).unwrap();
@@ -217,7 +229,9 @@ fn a_saved_config_survives_reopen_with_owner_only_permissions() {
 fn an_invalid_update_changes_nothing() {
     let path = temp_path("reject");
     let store = ConfigStore::open(&path).unwrap();
-    store.update(1, config_with(vec![upstream("a", None)])).unwrap();
+    store
+        .update(1, config_with(vec![upstream("a", None)]))
+        .unwrap();
 
     let mut invalid = config_with(vec![upstream("a", None)]);
     invalid.affinity_ttl_secs = 1; // 超出允许区间
@@ -236,12 +250,82 @@ fn an_invalid_update_changes_nothing() {
 fn a_snapshot_is_immutable_once_taken() {
     let path = temp_path("snapshot");
     let store = ConfigStore::open(&path).unwrap();
-    store.update(1, config_with(vec![upstream("a", None)])).unwrap();
+    store
+        .update(1, config_with(vec![upstream("a", None)]))
+        .unwrap();
     let held = store.snapshot();
 
-    store.update(2, config_with(vec![upstream("b", None)])).unwrap();
+    store
+        .update(2, config_with(vec![upstream("b", None)]))
+        .unwrap();
     assert_eq!(held.config.upstreams[0].id, "a", "旧快照不应被后续更新改写");
     assert_eq!(held.revision, 2);
     assert_eq!(store.snapshot().config.upstreams[0].id, "b");
+    let _ = fs::remove_file(&path);
+}
+
+/// 落盘失败时**运行期必须保持原样**。
+///
+/// 顺序是校验 → 写盘 → 换快照，不可颠倒：先换快照再写盘的话，磁盘上是旧配置、
+/// 内存里是新配置，重启就悄悄回退，而没有人会察觉这中间按新配置收过的钱。
+#[test]
+fn a_failed_write_leaves_the_running_configuration_untouched() {
+    let path = temp_path("write-failure");
+    let store = ConfigStore::open(&path).unwrap();
+    store
+        .update(1, config_with(vec![upstream("a", None)]))
+        .unwrap();
+    let before = store.snapshot();
+
+    // 把配置文件换成目录：原子替换的最后一步必然失败。
+    let _ = fs::remove_file(&path);
+    fs::create_dir_all(&path).unwrap();
+
+    let result = store.update(before.revision, config_with(vec![upstream("b", None)]));
+    assert!(result.is_err(), "写不进去就必须失败，不能报成功");
+
+    let after = store.snapshot();
+    assert_eq!(after.revision, before.revision, "失败的更新不得推进版本");
+    assert_eq!(after.config.upstreams[0].id, "a", "运行期仍是写盘前那一份");
+
+    // 修好之后还能正常保存，且版本从原处继续。
+    let _ = fs::remove_dir_all(&path);
+    let outcome = store
+        .update(before.revision, config_with(vec![upstream("b", None)]))
+        .unwrap();
+    assert_eq!(outcome.revision, before.revision + 1);
+    assert_eq!(store.snapshot().config.upstreams[0].id, "b");
+    let _ = fs::remove_file(&path);
+}
+
+/// 价格快照在预留时冻结：改了价目表也不影响已经在飞的那一笔。
+///
+/// 否则一次请求可能按下单时的价格预留、按结算时的价格扣款。
+#[test]
+fn a_price_change_does_not_reach_a_request_already_under_way() {
+    let path = temp_path("price-freeze");
+    let store = ConfigStore::open(&path).unwrap();
+    store
+        .update(1, config_with(vec![upstream("a", None)]))
+        .unwrap();
+    let in_flight = store.snapshot();
+
+    store
+        .update(
+            2,
+            config_with(vec![upstream("a", None), upstream("b", None)]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        in_flight.config.upstreams.len(),
+        1,
+        "已取到的快照不得被后续更新改到脚下"
+    );
+    assert_eq!(
+        store.snapshot().config.upstreams.len(),
+        2,
+        "新请求看到新配置"
+    );
     let _ = fs::remove_file(&path);
 }
