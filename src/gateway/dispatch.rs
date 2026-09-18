@@ -89,6 +89,8 @@ pub async fn dispatch(
     body: &Value,
     ctx: &RouteContext,
     request_id: &str,
+    // 本次请求中已经失败过、不得再选的绑定。
+    exclude: &[String],
 ) -> Dispatched {
     let Some(plan) = gateway.plan_for(&ctx.public_model) else {
         return Dispatched::NotManaged;
@@ -103,7 +105,8 @@ pub async fn dispatch(
     };
 
     let mut coordinator =
-        Coordinator::new(ledger, gateway.routing(), &plan, ctx.key_id, request_id);
+        Coordinator::new(ledger, gateway.routing(), &plan, ctx.key_id, request_id)
+            .excluding(exclude);
     loop {
         let attempt = match coordinator.begin_attempt(ctx) {
             Ok(Some(attempt)) => attempt,
@@ -125,6 +128,7 @@ pub async fn dispatch(
                 .upstream(&attempt.upstream_id)
                 .and_then(|u| u.kiro_group.clone());
             return Dispatched::UseKiro(Box::new(KiroRoute {
+                binding_id: attempt.binding_id.clone(),
                 upstream_model: attempt.upstream_model.clone(),
                 group,
                 // 随机分发要一路随机到底，否则第一次选中的凭据会接管整个会话。

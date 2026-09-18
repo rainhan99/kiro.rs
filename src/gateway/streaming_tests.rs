@@ -233,6 +233,7 @@ async fn an_unmanaged_alias_is_left_to_the_legacy_path() {
         request(),
         other,
         "r1".into(),
+        Vec::new(),
     )
     .await;
 
@@ -258,6 +259,7 @@ async fn a_streamed_request_forwards_events_and_is_priced_from_its_usage() {
         request(),
         ctx(),
         "r1".into(),
+        Vec::new(),
     )
     .await;
 
@@ -316,6 +318,7 @@ async fn an_interruption_after_the_first_event_keeps_the_charge_and_never_switch
         request(),
         ctx(),
         "r1".into(),
+        Vec::new(),
     )
     .await
     else {
@@ -371,6 +374,7 @@ async fn an_interruption_without_any_usage_evidence_stays_pending() {
         request(),
         ctx(),
         "r1".into(),
+        Vec::new(),
     )
     .await
     else {
@@ -416,6 +420,7 @@ async fn a_failure_before_any_event_moves_to_another_route() {
         request(),
         ctx(),
         "r1".into(),
+        Vec::new(),
     )
     .await
     else {
@@ -448,6 +453,7 @@ async fn a_cross_protocol_route_cannot_serve_a_stream_and_is_skipped() {
         request(),
         ctx(),
         "r1".into(),
+        Vec::new(),
     )
     .await
     else {
@@ -475,6 +481,7 @@ async fn a_refusal_is_decided_before_the_response_begins() {
         request(),
         ctx(),
         "r1".into(),
+        Vec::new(),
     )
     .await;
 
@@ -525,6 +532,7 @@ async fn a_client_walking_away_still_leaves_the_obligation() {
         request(),
         ctx(),
         "r1".into(),
+        Vec::new(),
     )
     .await
     else {

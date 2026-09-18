@@ -286,6 +286,7 @@ async fn an_unmanaged_alias_is_left_to_the_legacy_path() {
         &request(),
         &other,
         "r1",
+        &[],
     )
     .await;
 
@@ -314,6 +315,7 @@ async fn an_exhausted_credit_account_does_not_block_a_funded_money_route() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -360,6 +362,7 @@ async fn a_credit_only_key_cannot_reach_a_money_route() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -391,6 +394,7 @@ async fn a_failure_before_commitment_moves_to_another_route() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -443,6 +447,7 @@ async fn a_response_that_cannot_be_converted_is_still_charged_and_never_retried(
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -489,6 +494,7 @@ async fn a_request_this_route_cannot_express_moves_to_another() {
         &body,
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -525,6 +531,7 @@ async fn a_missing_usage_settles_as_pending_not_as_zero() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -564,6 +571,7 @@ async fn an_incomplete_cache_report_is_not_priced_as_zero() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -631,6 +639,7 @@ async fn an_unpriced_cache_category_is_not_charged_as_zero() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -663,6 +672,7 @@ async fn every_route_failing_is_reported_as_such() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -694,6 +704,7 @@ async fn a_kiro_route_is_handed_back_with_request_scoped_overrides() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await;
 
@@ -736,6 +747,7 @@ async fn a_kiro_call_without_native_credits_settles_as_pending() {
         &request(),
         &ctx(),
         "r1",
+        &[],
     )
     .await
     else {
@@ -762,6 +774,7 @@ async fn a_kiro_failure_releases_only_when_nothing_reached_the_client() {
             &request(),
             &ctx(),
             "r1",
+            &[],
         )
         .await
         else {
@@ -817,6 +830,7 @@ async fn random_routing_turns_off_kiro_session_stickiness() {
             &request(),
             &ctx(),
             "r1",
+            &[],
         )
         .await
         else {

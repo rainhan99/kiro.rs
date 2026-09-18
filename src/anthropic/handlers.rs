@@ -928,7 +928,13 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    // 用量汇聚点必须在**任何**提前返回之前就绪：网关已经为这次请求预留了额度，
+    // 而释放它的正是这个 hook。校验失败就直接 return 的话，那笔预留会一直挂在
+    // 在飞状态，直到下次启动才被认领——期间白占着并发名额。
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone())
+        .with_settlement(gateway_route.as_ref().map(|r| r.settlement.clone()));
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
+        hook.record(0, 0, 0, 0, 0, 0.0, "error");
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
@@ -938,10 +944,9 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    // 统计记的是**客户端要的那个名字**，运维按它对账；账本另有价格快照记录
-    // 实际走的绑定与上游模型，两者各司其职。
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone())
-        .with_settlement(gateway_route.as_ref().map(|r| r.settlement.clone()));
+    // 统计记的是**客户端要的那个名字**（hook 在上面就用它建好了），运维按它对账；
+    // 账本另有价格快照记录实际走的绑定与上游模型，两者各司其职。
+    //
     // 网关选中了一条 Kiro 路：按**请求级**覆盖替换真实模型名与凭据分组。
     // 只改这两个局部值，不碰任何全局开关——并发的两个请求可以走不同的路。
     if let Some(route) = &gateway_route {

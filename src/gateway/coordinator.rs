@@ -112,6 +112,14 @@ impl<'a> Coordinator<'a> {
         }
     }
 
+    /// 预置一批"本次请求已经失败过"的绑定。
+    ///
+    /// 用于 Kiro 路失败后换直连备路：那一路已经试过了，不该再被选中。
+    pub fn excluding(mut self, bindings: &[String]) -> Self {
+        self.exhausted.extend(bindings.iter().cloned());
+        self
+    }
+
     pub fn attempts_used(&self) -> u32 {
         self.attempts_used
     }

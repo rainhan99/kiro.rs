@@ -51,6 +51,7 @@ fn ordinary_figures_pass_through_unchanged() {
 #[test]
 fn applying_a_route_replaces_both_the_model_and_the_group() {
     let route = KiroRoute {
+        binding_id: "b1".into(),
         upstream_model: "real-upstream-model".into(),
         group: Some("team-a".into()),
         sticky: true,

@@ -193,20 +193,60 @@ pub async fn gateway_middleware(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    match entry.handle(protocol, value, key_id, request_id).await {
+    match entry
+        .handle(protocol, value.clone(), key_id, request_id, &[])
+        .await
+    {
         crate::gateway::entry::Handled::Response(response) => response,
         // Kiro 路：预留已经记在账上，交既有通道执行。覆盖与结算句柄放进扩展，
         // 由 handler 取用——请求级传递，不碰任何全局开关。
         crate::gateway::entry::Handled::UseKiro(route) => {
+            let binding_id = route.binding_id.clone();
             let mut request = axum::extract::Request::from_parts(parts, Body::from(bytes));
             request.extensions_mut().insert(*route);
-            next.run(request).await
+            let response = next.run(request).await;
+            if !can_fall_back(&response) {
+                return response;
+            }
+            // Kiro 这一路没走通，而且**一个字节都还没发给客户端**（状态行还在我们手里）。
+            // 这正是配了直连备路要解决的情形：把这条路排除掉，让网关另选一条。
+            tracing::info!(
+                binding = %binding_id,
+                status = response.status().as_u16(),
+                "Kiro 路未成功且尚未向客户端发出内容，改走备路"
+            );
+            match entry
+                .handle(
+                    protocol,
+                    value,
+                    key_id,
+                    uuid::Uuid::new_v4().to_string(),
+                    std::slice::from_ref(&binding_id),
+                )
+                .await
+            {
+                crate::gateway::entry::Handled::Response(fallback) => fallback,
+                // 备路也是 Kiro，或者压根没有备路：如实回 Kiro 那次的结果，
+                // 不再套一层更笼统的错误。
+                _ => response,
+            }
         }
         crate::gateway::entry::Handled::NotManaged => {
             next.run(axum::extract::Request::from_parts(parts, Body::from(bytes)))
                 .await
         }
     }
+}
+
+/// Kiro 路的结果是否还留有换路的余地。
+///
+/// 只看状态行：它在响应体发出去之前就定下来了，所以此刻客户端还什么都没收到，
+/// 换供应商不会把两段输出拼在一起。
+///
+/// 4xx 里只认 429。其余 4xx 说明请求本身有问题，换一家照样会被拒，白花一次钱。
+fn can_fall_back(response: &Response) -> bool {
+    let status = response.status().as_u16();
+    status == 429 || (500..600).contains(&status)
 }
 
 /// API Key 认证中间件

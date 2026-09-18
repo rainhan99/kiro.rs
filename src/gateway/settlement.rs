@@ -132,6 +132,8 @@ impl Settlement {
 /// 模型与分组。
 #[derive(Clone)]
 pub struct KiroRoute {
+    /// 这一路对应的绑定 id。Kiro 失败后要换路时，得知道排除掉哪一条。
+    pub binding_id: String,
     /// 这一路的上游真实模型名，替换客户端说的公开别名。
     pub upstream_model: String,
     /// 这一路使用的凭据分组。`None` 表示不限，沿用 Key 自己的绑定。

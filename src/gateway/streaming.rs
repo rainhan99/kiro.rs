@@ -28,6 +28,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use super::RoutingMode;
 use super::coordinator::{AttemptResult, Coordinator, Next};
 use super::dispatch::{
     Dispatched, RouteError, attempt_body, classify_send, customer_cost, no_route, stopped, wire_for,
@@ -37,7 +38,6 @@ use super::protocol::WireProtocol;
 use super::routing::RouteContext;
 use super::service::GatewayService;
 use super::settlement::{KiroRoute, Settlement};
-use super::RoutingMode;
 use super::sse::{SseEvent, SseParser, StreamTranslator};
 use super::usage::normalize_usage;
 
@@ -93,6 +93,7 @@ pub async fn dispatch_stream(
     body: Value,
     ctx: RouteContext,
     request_id: String,
+    exclude: Vec<String>,
 ) -> StreamDispatched {
     if gateway.plan_for(&ctx.public_model).is_none() {
         return StreamDispatched::NotManaged;
@@ -109,7 +110,7 @@ pub async fn dispatch_stream(
 
     tokio::spawn(async move {
         run(
-            gateway, executor, protocol, body, ctx, request_id, decided, tx,
+            gateway, executor, protocol, body, ctx, request_id, exclude, decided, tx,
         )
         .await;
     });
@@ -134,6 +135,7 @@ async fn run(
     body: Value,
     ctx: RouteContext,
     request_id: String,
+    exclude: Vec<String>,
     decided: oneshot::Sender<Decision>,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
@@ -152,7 +154,8 @@ async fn run(
         return;
     };
     let mut coordinator =
-        Coordinator::new(ledger, gateway.routing(), &plan, ctx.key_id, &request_id);
+        Coordinator::new(ledger, gateway.routing(), &plan, ctx.key_id, &request_id)
+            .excluding(&exclude);
     let mut decided = Some(decided);
 
     loop {
@@ -180,6 +183,7 @@ async fn run(
                 .and_then(|u| u.kiro_group.clone());
             if let Some(decided) = decided.take() {
                 let _ = decided.send(Decision::UseKiro(Box::new(KiroRoute {
+                    binding_id: attempt.binding_id.clone(),
                     upstream_model: attempt.upstream_model.clone(),
                     group,
                     sticky: plan.mode != RoutingMode::WeightedRandom,

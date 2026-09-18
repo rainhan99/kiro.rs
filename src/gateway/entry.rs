@@ -71,6 +71,8 @@ impl GatewayEntry {
         body: Value,
         key_id: u64,
         request_id: String,
+        // 本次请求中已经试过并失败的绑定；首次调用传空。
+        exclude: &[String],
     ) -> Handled {
         let Some(alias) = body
             .get("model")
@@ -95,6 +97,7 @@ impl GatewayEntry {
                 body,
                 ctx,
                 request_id,
+                exclude.to_vec(),
             )
             .await
             {
@@ -124,6 +127,7 @@ impl GatewayEntry {
             &body,
             &ctx,
             &request_id,
+            exclude,
         )
         .await
         {

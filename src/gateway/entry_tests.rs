@@ -176,7 +176,7 @@ async fn an_unmanaged_alias_hands_the_request_back() {
     let body = serde_json::json!({"model": "some-other-model", "messages": []});
     assert!(
         f.entry
-            .handle(WireProtocol::Anthropic, body, 7, "r1".into())
+            .handle(WireProtocol::Anthropic, body, 7, "r1".into(), &[])
             .await
             .is_not_managed()
     );
@@ -187,7 +187,8 @@ async fn an_unmanaged_alias_hands_the_request_back() {
                 WireProtocol::Anthropic,
                 serde_json::json!({}),
                 7,
-                "r2".into()
+                "r1".into(),
+                &[],
             )
             .await
             .is_not_managed()
@@ -208,7 +209,7 @@ async fn a_managed_alias_is_served_and_charged() {
     });
     let response = f
         .entry
-        .handle(WireProtocol::Anthropic, body, 7, "r1".into())
+        .handle(WireProtocol::Anthropic, body, 7, "r1".into(), &[])
         .await
         .into_response_or_panic();
     assert_eq!(response.status(), StatusCode::OK);
@@ -241,7 +242,7 @@ async fn a_refusal_is_rendered_in_the_client_protocol() {
 
     let response = f
         .entry
-        .handle(WireProtocol::Anthropic, body.clone(), 7, "r1".into())
+        .handle(WireProtocol::Anthropic, body.clone(), 7, "r1".into(), &[])
         .await
         .into_response_or_panic();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -261,7 +262,7 @@ async fn a_refusal_is_rendered_in_the_client_protocol() {
     // 同一个拒绝，OpenAI 形状。
     let response = f
         .entry
-        .handle(WireProtocol::ChatCompletions, body, 7, "r2".into())
+        .handle(WireProtocol::ChatCompletions, body, 7, "r2".into(), &[])
         .await
         .into_response_or_panic();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -303,7 +304,7 @@ async fn a_streamed_request_gets_an_event_stream_response() {
     });
     let response = f
         .entry
-        .handle(WireProtocol::Anthropic, body, 7, "r1".into())
+        .handle(WireProtocol::Anthropic, body, 7, "r1".into(), &[])
         .await
         .into_response_or_panic();
     assert_eq!(
@@ -802,7 +803,10 @@ async fn simulated_cache_counts_never_become_money() {
         crate::gateway::Amount::ZERO,
         "缓存计数不得变成金额；账本只认原生 credit"
     );
-    assert_eq!(account.customer_pending, 0, "上游确认为 0 是确定的事实，不是待结算");
+    assert_eq!(
+        account.customer_pending, 0,
+        "上游确认为 0 是确定的事实，不是待结算"
+    );
     assert_eq!(account.in_flight, 0);
 
     let _ = std::fs::remove_file(config_path);
@@ -1045,4 +1049,307 @@ async fn resetting_stats_cannot_restore_ledger_balance() {
     let _ = std::fs::remove_file(keys_path);
     let _ = std::fs::remove_file(config_path);
     let _ = std::fs::remove_file(ledger_path);
+}
+
+/// 规格点名的那一条，端到端版本：**Kiro 这一路失败，兼容的直连备路接住**。
+///
+/// 与「Kiro 被准入拒绝」不是一回事——那种情况网关压根不会选中它。这里网关选中了
+/// Kiro、预留了、交出去执行，而执行失败了；此刻**一个字节都还没发给客户端**，
+/// 所以换供应商不会把两段输出拼在一起。别名对外不变，只有备路那一笔被计费。
+#[tokio::test]
+async fn a_failing_kiro_route_falls_back_to_a_direct_upstream() {
+    let base = upstream_server().await;
+    let config_path = temp("config.json");
+    let ledger_path = temp("billing.db");
+
+    let mut kiro_binding = binding();
+    kiro_binding.id = "kiro-b".into();
+    kiro_binding.upstream_id = "kiro".into();
+    kiro_binding.priority_tier = 0;
+    kiro_binding.billing_unit = BillingUnit::KiroCredit;
+    kiro_binding.cost_prices = None;
+    kiro_binding.sell_prices = None;
+
+    let mut direct_binding = binding();
+    direct_binding.id = "direct-b".into();
+    direct_binding.upstream_id = "u1".into();
+    direct_binding.priority_tier = 1;
+
+    let config = GatewayConfig {
+        models: vec![PublicModel {
+            id: "opus5".into(),
+            display_name: None,
+            routing_mode: Some(RoutingMode::Sticky),
+            affinity_ttl_secs: None,
+            bindings: vec![kiro_binding, direct_binding],
+        }],
+        upstreams: vec![
+            Upstream {
+                id: "kiro".into(),
+                name: "kiro".into(),
+                kind: UpstreamKind::Kiro,
+                enabled: true,
+                weight: 10,
+                base_url: None,
+                api_key: None,
+                has_api_key: false,
+                allow_private_network: false,
+                kiro_group: None,
+                cache_usage_policy: None,
+            },
+            upstream(&base),
+        ],
+        ..GatewayConfig::default()
+    };
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let service = Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap());
+
+    let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    let key = keys.create_with_key("t".into(), None, None, "sk-test-key".into());
+    // 两个币种都有余额：积分那条路要靠"执行失败"而不是"准入拒绝"来淘汰。
+    crate::gateway::import::import_opening_balances(
+        service.ledger().unwrap(),
+        &[crate::gateway::import::LegacyKeyBalance {
+            key_id: key.id,
+            used: 0.0,
+            limit: Some(100.0),
+        }],
+    )
+    .unwrap();
+    service
+        .ledger()
+        .unwrap()
+        .set_account(
+            key.id,
+            BudgetPolicy {
+                unit: BillingUnit::Cny,
+                limit: Some("100".parse().unwrap()),
+                enforcement: BudgetEnforcement::Soft,
+                max_in_flight: 8,
+                max_pending: 16,
+                allowed_models: vec![],
+                allowed_upstreams: vec![],
+            },
+        )
+        .unwrap();
+
+    let client = crate::gateway::execute::build_client(
+        std::time::Duration::from_secs(5),
+        crate::model::config::TlsBackend::Rustls,
+        None,
+    )
+    .unwrap();
+    // 没有 KiroProvider：Kiro 这一路必然以 503 失败，正是要演的那一幕。
+    let app = crate::anthropic::create_router_with_shared_provider(
+        None,
+        false,
+        crate::model::config::ToolCompatibilityMode::default(),
+        Some(keys),
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(GatewayEntry::new(service.clone(), client))),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "sk-test-key")
+        .json(&serde_json::json!({
+            "model": "opus5", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "备路应当接住这次请求");
+    let answer: Value = response.json().await.unwrap();
+    assert_eq!(answer["model"], "opus5", "对外别名不变");
+    assert_eq!(answer["content"][0]["text"], "hello");
+
+    let accounts = service.ledger().unwrap().accounts(key.id).unwrap();
+    let credit = accounts
+        .iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .unwrap();
+    let cny = accounts
+        .iter()
+        .find(|a| a.policy.unit == BillingUnit::Cny)
+        .unwrap();
+
+    // 失败的那一路释放干净：没产生任何下游承诺。
+    assert_eq!(
+        credit.used,
+        crate::gateway::Amount::ZERO,
+        "失败的 Kiro 路不计费"
+    );
+    assert_eq!(credit.in_flight, 0);
+    assert_eq!(credit.customer_pending, 0);
+    // 只有走通的那一路计费。
+    assert_eq!(cny.used, "0.003".parse().unwrap(), "1500 token × 2/百万");
+    assert_eq!(cny.in_flight, 0);
+}
+
+/// 客户端自己的请求有问题时**不换路**：换一家照样会被拒，白花一次钱。
+#[tokio::test]
+async fn a_client_side_rejection_is_not_retried_on_another_upstream() {
+    use axum::http::StatusCode;
+    let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter = hits.clone();
+    let router = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (StatusCode::BAD_REQUEST, "bad request shape")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let f = fixture(&format!("http://{addr}"), true);
+    let response = f
+        .entry
+        .handle(
+            WireProtocol::Anthropic,
+            serde_json::json!({
+                "model": "opus5", "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            7,
+            "r1".into(),
+            &[],
+        )
+        .await
+        .into_response_or_panic();
+
+    assert_eq!(response.status(), 400, "客户端请求有问题就如实回 400");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "不得为一个注定被拒的请求再花一次上游调用"
+    );
+}
+
+/// 客户端自己的请求有问题时**不换路**，而且那笔预留要当场释放。
+///
+/// 换一家照样会被拒，白花一次上游调用；而预留若挂着不放，一个反复发坏请求的
+/// 客户端就能把并发名额占满。
+#[tokio::test]
+async fn a_bad_request_neither_falls_back_nor_leaks_its_reservation() {
+    let base = upstream_server().await;
+    let config_path = temp("config.json");
+    let ledger_path = temp("billing.db");
+
+    let mut kiro_binding = binding();
+    kiro_binding.id = "kiro-b".into();
+    kiro_binding.upstream_id = "kiro".into();
+    kiro_binding.priority_tier = 0;
+    kiro_binding.billing_unit = BillingUnit::KiroCredit;
+    kiro_binding.cost_prices = None;
+    kiro_binding.sell_prices = None;
+    let mut direct_binding = binding();
+    direct_binding.id = "direct-b".into();
+    direct_binding.upstream_id = "u1".into();
+    direct_binding.priority_tier = 1;
+
+    let config = GatewayConfig {
+        models: vec![PublicModel {
+            id: "opus5".into(),
+            display_name: None,
+            routing_mode: Some(RoutingMode::Sticky),
+            affinity_ttl_secs: None,
+            bindings: vec![kiro_binding, direct_binding],
+        }],
+        upstreams: vec![
+            Upstream {
+                id: "kiro".into(),
+                name: "kiro".into(),
+                kind: UpstreamKind::Kiro,
+                enabled: true,
+                weight: 10,
+                base_url: None,
+                api_key: None,
+                has_api_key: false,
+                allow_private_network: false,
+                kiro_group: None,
+                cache_usage_policy: None,
+            },
+            upstream(&base),
+        ],
+        ..GatewayConfig::default()
+    };
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let service = Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap());
+
+    let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    let key = keys.create_with_key("t".into(), None, None, "sk-test-key".into());
+    crate::gateway::import::import_opening_balances(
+        service.ledger().unwrap(),
+        &[crate::gateway::import::LegacyKeyBalance {
+            key_id: key.id,
+            used: 0.0,
+            limit: Some(100.0),
+        }],
+    )
+    .unwrap();
+
+    let client = crate::gateway::execute::build_client(
+        std::time::Duration::from_secs(5),
+        crate::model::config::TlsBackend::Rustls,
+        None,
+    )
+    .unwrap();
+    let app = crate::anthropic::create_router_with_shared_provider(
+        None,
+        false,
+        crate::model::config::ToolCompatibilityMode::default(),
+        Some(keys),
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(GatewayEntry::new(service.clone(), client))),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // max_tokens 为 0：既有 handler 在碰 provider 之前就会以 400 拒绝。
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "sk-test-key")
+        .json(&serde_json::json!({
+            "model": "opus5", "max_tokens": 0,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        400,
+        "请求本身有问题就如实回 400，不该换路再花一次钱"
+    );
+
+    let credit = service
+        .ledger()
+        .unwrap()
+        .accounts(key.id)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .unwrap();
+    assert_eq!(
+        credit.in_flight, 0,
+        "提前返回也必须释放预留，不能挂到下次启动"
+    );
+    assert_eq!(credit.customer_pending, 0);
+    assert_eq!(credit.used, crate::gateway::Amount::ZERO);
 }
