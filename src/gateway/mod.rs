@@ -4,9 +4,16 @@ pub mod amount;
 pub mod config;
 pub mod config_store;
 pub mod ledger;
+pub mod protocol;
+pub mod sse;
+pub mod transport;
 pub mod routing;
 mod ledger_types;
 pub mod usage;
+
+#[cfg(test)]
+#[path = "adapter_tests.rs"]
+mod adapter_tests;
 
 pub use amount::Amount;
 pub use config::{
