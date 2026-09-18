@@ -216,6 +216,26 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/request-pipeline",
             get(get_request_pipeline).put(super::handlers::set_request_pipeline),
         )
+        // 多上游网关。未配置时这些端点一律 404，而不是回一个空壳让人以为配好了。
+        .route(
+            "/gateway/config",
+            get(super::gateway::get_config).put(super::gateway::put_config),
+        )
+        .route("/gateway/preview", post(super::gateway::preview))
+        .route("/gateway/requests", get(super::gateway::list_requests))
+        .route(
+            "/client-keys/{id}/budgets",
+            get(super::gateway::get_budgets).put(super::gateway::put_budget),
+        )
+        .route(
+            "/client-keys/{id}/adjustments",
+            post(super::gateway::post_adjustment),
+        )
+        .route("/client-keys/{id}/cycles", post(super::gateway::post_cycle))
+        .route(
+            "/client-keys/{id}/ledger-audit",
+            get(super::gateway::list_audit),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

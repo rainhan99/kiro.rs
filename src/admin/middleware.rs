@@ -35,9 +35,20 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 多上游网关（可选）。`None` 表示未配置，网关相关端点一律回 404。
+    pub gateway: Option<Arc<crate::gateway::service::GatewayService>>,
 }
 
 impl AdminState {
+    /// 注入多上游网关。
+    pub fn with_gateway(
+        mut self,
+        gateway: Option<Arc<crate::gateway::service::GatewayService>>,
+    ) -> Self {
+        self.gateway = gateway;
+        self
+    }
+
     pub fn new(
         admin_api_key: impl Into<String>,
         service: AdminService,
@@ -53,7 +64,8 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
-        }
+                    gateway: None,
+}
     }
 }
 

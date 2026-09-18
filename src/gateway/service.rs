@@ -148,6 +148,15 @@ impl GatewayService {
         &self.config
     }
 
+    /// 配置里是否真的声明了东西。
+    ///
+    /// 与 [`Self::has_managed_models`] 不同：一份声明了上游与模型、但全部停用的配置
+    /// **是**已配置的（运维正是要在管理面里把它们打开），只是暂时没接管任何别名。
+    pub fn is_configured(&self) -> bool {
+        let snapshot = self.config.snapshot();
+        !snapshot.config.upstreams.is_empty() || !snapshot.config.models.is_empty()
+    }
+
     /// 网关有没有接管任何模型。入口据此决定要不要缓冲请求体——
     /// 未配置网关的部署不该为一个用不上的特性付出缓冲代价。
     pub fn has_managed_models(&self) -> bool {

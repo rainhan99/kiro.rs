@@ -470,7 +470,8 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
-            );
+            )
+            .with_gateway(Some(gateway.clone()));
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

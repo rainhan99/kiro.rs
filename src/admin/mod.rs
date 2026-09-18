@@ -27,6 +27,7 @@ mod pipeline_config;
 mod pipeline_config_tests;
 pub mod types;
 mod binary_update;
+pub mod gateway;
 pub mod client_keys;
 pub mod groups;
 pub mod usage_stats;
