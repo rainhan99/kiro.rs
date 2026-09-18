@@ -105,7 +105,7 @@ pub fn token_cost(prices: &TokenPrices, usage: &NativeUsage)
     -> anyhow::Result<Amount>;
 ```
 
-- [ ] RED: Write tests for exact cost, no cache double counting, unknown usage, bad prices and invalid bindings. Example independent expected result:
+- [x] RED: Write tests for exact cost, no cache double counting, unknown usage, bad prices and invalid bindings. Example independent expected result:
 
 ```rust
 #[test]
@@ -117,10 +117,10 @@ fn cached_input_is_not_charged_as_ordinary_input() {
 }
 ```
 
-- [ ] Run focused `cargo test gateway::` before implementation and capture missing-behavior failure (minimal stubs may compile but must not implement behavior first).
-- [ ] GREEN: Implement Amount parsing/serialization with checked integer arithmetic; reject negative/nonfinite/exponent/overflow input and precision beyond eighteen decimals. Preserve the existing native credit fixture `0.0169543708291874` exactly. Price validation allows at most six fractional digits. Use checked sum, never `as` casts for externally sized arithmetic.
-- [ ] Implement full shared JSON structs, serde defaults, duplicate/reference/URL-shape/weights/TTL/context/price/unit validation. Empty default configuration is backward compatible. Native usage parsers distinguish missing required totals from confirmed zero and validate disjoint cache subsets. Anthropic TTL write breakdown must sum to total; OpenAI input includes read/write subsets when reported. Keep raw evidence, not fabricated zero cache evidence.
-- [ ] Run focused tests and full Rust suite. Report test commands, RED/GREEN and any fields refined from the contract. Do not commit earlier work.
+- [x] Run focused `cargo test gateway::` before implementation and capture missing-behavior failure (minimal stubs may compile but must not implement behavior first).
+- [x] GREEN: Implement Amount parsing/serialization with checked integer arithmetic; reject negative/nonfinite/exponent/overflow input and precision beyond eighteen decimals. Preserve the existing native credit fixture `0.0169543708291874` exactly. Price validation allows at most six fractional digits. Use checked sum, never `as` casts for externally sized arithmetic.
+- [x] Implement full shared JSON structs, serde defaults, duplicate/reference/URL-shape/weights/TTL/context/price/unit validation. Empty default configuration is backward compatible. Native usage parsers distinguish missing required totals from confirmed zero and validate disjoint cache subsets. Anthropic TTL write breakdown must sum to total; OpenAI input includes read/write subsets when reported. Keep raw evidence, not fabricated zero cache evidence.
+- [x] Run focused tests and full Rust suite. Report test commands, RED/GREEN and any fields refined from the contract. Do not commit earlier work.
 
 ## Task 2: Durable independent spending accounts
 
@@ -128,12 +128,12 @@ fn cached_input_is_not_charged_as_ordinary_input() {
 
 **Interfaces:** Consume Task 1 types. Produce `Ledger::open(path)`, `Ledger::open_in_memory()`, `set_account(key_id, policy)`, `accounts(key_id)`, `reserve(ReservationInput)`, `settle(SettlementInput)`, `record_attempt(AttemptInput)`, `release(attempt_id)`, `import_legacy(key_id, used, limit)`, `recover_inflight()`, `list_requests(key_id, limit)` and explicit input/view structs, all returning `anyhow::Result`. Reservation includes request/attempt IDs, unit, public model/upstream IDs, amount upper bound (optional for soft mode), config/price snapshot. Settlement includes evidence status, confirmed downstream amount (optional), attempt cost separately, committed flag and outcome. Publish exact definitions in report for later tasks.
 
-- [ ] RED: Tests create an in-memory real SQLite DB, configure CNY limit `1`, reserve `0.7`, then assert another `0.4` reservation fails while an independent USD account remains usable. Settle same attempt twice and assert used remains `0.5`; conflicting repeat must fail, not overwrite.
-- [ ] Run focused `cargo test gateway::ledger` and capture failure.
-- [ ] GREEN: Use transactions and unique request/attempt/settlement keys; canonical Amount decimal strings stored as TEXT, not REAL, and calculate under the transaction in Rust rather than SQLite floating-point SUM. Account update cannot relabel units or erase usage. Reject missing accounts, exhausted limits, unsupported hard bounds, over-concurrency/pending; quota zero denies even if a caller supplies zero reservation. Exact upper bound reservation decrements availability atomically. Price/config snapshots contain only typed nonsecret version, route and tariff fields, never a serialized secret-bearing GatewayConfig.
-- [ ] Persist pending evidence and in-flight attempts. Recovery changes unresolved reservations to pending; never silently zero-settle them. Release hidden failed-attempt customer reservations while still keeping upstream cost (possibly pending). Confirmed committed interruptions may settle; partial unknown usage stays pending. Support audited adjustment/new-cycle operations with reason, never a raw counter reset.
-- [ ] Add idempotent legacy opening-balance import and full file-reopen tests. No trace cleanup dependence or in-memory fallback on financial DB failure. Migration must not overwrite existing accounts on restart.
-- [ ] Run focused and full tests; report exact interfaces, RED/GREEN and durable behavior.
+- [x] RED: Tests create an in-memory real SQLite DB, configure CNY limit `1`, reserve `0.7`, then assert another `0.4` reservation fails while an independent USD account remains usable. Settle same attempt twice and assert used remains `0.5`; conflicting repeat must fail, not overwrite.
+- [x] Run focused `cargo test gateway::ledger` and capture failure.
+- [x] GREEN: Use transactions and unique request/attempt/settlement keys; canonical Amount decimal strings stored as TEXT, not REAL, and calculate under the transaction in Rust rather than SQLite floating-point SUM. Account update cannot relabel units or erase usage. Reject missing accounts, exhausted limits, unsupported hard bounds, over-concurrency/pending; quota zero denies even if a caller supplies zero reservation. Exact upper bound reservation decrements availability atomically. Price/config snapshots contain only typed nonsecret version, route and tariff fields, never a serialized secret-bearing GatewayConfig.
+- [x] Persist pending evidence and in-flight attempts. Recovery changes unresolved reservations to pending; never silently zero-settle them. Release hidden failed-attempt customer reservations while still keeping upstream cost (possibly pending). Confirmed committed interruptions may settle; partial unknown usage stays pending. Support audited adjustment/new-cycle operations with reason, never a raw counter reset.
+- [x] Add idempotent legacy opening-balance import and full file-reopen tests. No trace cleanup dependence or in-memory fallback on financial DB failure. Migration must not overwrite existing accounts on restart.
+- [x] Run focused and full tests; report exact interfaces, RED/GREEN and durable behavior.
 
 ## Task 3: Validated configuration, sticky routing and weighted random
 
@@ -141,12 +141,12 @@ fn cached_input_is_not_charged_as_ordinary_input() {
 
 **Interfaces:** Consume config/amount types. Produce `ConfigStore::open(path)`, `snapshot()`, `update(expected_revision, config)` with secret-safe views; `RoutingEngine` with `preview`, `select`, `bind_success`, `mark_unavailable`; public `RouteContext`, `Candidate`, `RouteSelection`, `RouteEvidence`. Engine takes already budget-eligible candidate IDs and request capabilities; production random tickets use `fastrand`, tests inject tickets/time. Configuration snapshots are owned/Arc immutable values.
 
-- [ ] RED: For a model with two same-tier candidates weighted `2` and `8`, supplied tickets `0,1` select the first, `2..9` the second. A valid sticky binding survives weight changes but not disabling/zero weight/budget exclusion/mode generation change. Higher-priority group always beats lower group when no valid sticky binding exists.
-- [ ] Run focused `cargo test gateway::routing` and `gateway::config_store` and capture failures.
-- [ ] GREEN: Exact weight multiplication and bounded summation, stable highest-score tie-breaks, scope Key+alias+session, TTL/capacity, same-session provisional lease and generation-checked success publication. Missing reliable session ID produces explicit evidence rather than Key-wide affinity. Persist no conversation body or auth key in route keys.
-- [ ] Config storage uses separate `gateway.json` alongside main config, defaults only if absent, validates before atomic replace, fsync/rename with 0600 secrets. Optimistic revision checked under a lock; failed persistence does not mutate runtime. GET redacts secrets; update preserves unchanged keys and increments routing generation only for mode/security changes that invalidate bindings. Unknown/invalid config fails startup rather than falling back to empty.
-- [ ] Preview is read-only: never reserves budget, renews affinity, samples production RNG or sends HTTP. Show candidates, filter reasons, weights, group and conditional probability. Selection rechecks runtime validity; don't trust preview as admission.
-- [ ] Run focused/full tests and report interfaces plus redacted sample JSON.
+- [x] RED: For a model with two same-tier candidates weighted `2` and `8`, supplied tickets `0,1` select the first, `2..9` the second. A valid sticky binding survives weight changes but not disabling/zero weight/budget exclusion/mode generation change. Higher-priority group always beats lower group when no valid sticky binding exists.
+- [x] Run focused `cargo test gateway::routing` and `gateway::config_store` and capture failures.
+- [x] GREEN: Exact weight multiplication and bounded summation, stable highest-score tie-breaks, scope Key+alias+session, TTL/capacity, same-session provisional lease and generation-checked success publication. Missing reliable session ID produces explicit evidence rather than Key-wide affinity. Persist no conversation body or auth key in route keys.
+- [x] Config storage uses separate `gateway.json` alongside main config, defaults only if absent, validates before atomic replace, fsync/rename with 0600 secrets. Optimistic revision checked under a lock; failed persistence does not mutate runtime. GET redacts secrets; update preserves unchanged keys and increments routing generation only for mode/security changes that invalidate bindings. Unknown/invalid config fails startup rather than falling back to empty.
+- [x] Preview is read-only: never reserves budget, renews affinity, samples production RNG or sends HTTP. Show candidates, filter reasons, weights, group and conditional probability. Selection rechecks runtime validity; don't trust preview as admission.
+- [x] Run focused/full tests and report interfaces plus redacted sample JSON.
 
 ## Task 4: Direct protocol adapters and real streaming transport
 
@@ -154,7 +154,7 @@ fn cached_input_is_not_charged_as_ordinary_input() {
 
 **Interfaces:** `WireProtocol` enum `Anthropic`, `ChatCompletions`, `Responses`; `convert_request(from, to, body, actual_model) -> Result<Value>`; `convert_response(from, to, body, public_model) -> Result<Value>`; incremental `StreamTranslator` consumes one complete SSE event and emits destination frames plus usage/completion evidence. `DirectTransport::send(upstream, protocol, body, deadline)` returns status/headers and an incremental byte stream, or a typed upstream error. Endpoint, auth and network decisions are owned here, never by callers.
 
-- [ ] RED: Local fixtures verify text, tool arguments split across chunks, tool result IDs and images across supported protocols; exact same-protocol unknown legitimate fields preserved; unsupported cross-protocol signed reasoning/provider state rejected, not dropped. Example:
+- [x] RED: Local fixtures verify text, tool arguments split across chunks, tool result IDs and images across supported protocols; exact same-protocol unknown legitimate fields preserved; unsupported cross-protocol signed reasoning/provider state rejected, not dropped. Example:
 
 ```rust
 let converted = convert_request(WireProtocol::Anthropic,
@@ -165,12 +165,33 @@ assert_eq!(converted["model"], "real-model");
 assert_eq!(converted["messages"][0]["content"], "hello");
 ```
 
-- [ ] Run focused tests to observe missing behavior.
-- [ ] GREEN: Implement same-protocol pass-through and validated cross-protocol text/tools/base64-or-URL images. Capability gating rejects unsupported fields, modalities, private response references and semantic transformations. Preserve max output and reasoning constraints; never reduce them silently. No fake streaming from a buffered nonstream response.
-- [ ] Stream parser handles UTF-8 boundaries, LF/CRLF, comments, multiple frames per chunk, bounded frame size, final usage and malformed/truncated streams. Chat requests ask for usage; parser does not manufacture it if missing. Responses terminal events and Anthropic start/delta cumulative usage must normalize correctly without adding cumulative counters twice.
-- [ ] Transport constructs paths once; validates HTTPS except explicitly permitted private/local destinations, prevents URL credentials/fragments/query abuse, resolves and checks actual target addresses and prevents redirect/proxy bypass. Auth header comes only from the configured upstream secret. Disable redirects. Pass only protocol-required allowed headers. Timeout and cancellation bound requests; redact all error snippets.
-- [ ] Typed errors distinguish invalid request, context limit, quota, throttle, authentication, transient and stream interruption. Use status plus structured body, not any occurrence of “quota” in arbitrary text. Respect Retry-After.
-- [ ] Verify local HTTP/SSE server cases without real provider traffic, run focused/full suite, document unsupported conversions explicitly.
+- [x] Run focused tests to observe missing behavior.
+- [x] GREEN: Implement same-protocol pass-through and validated cross-protocol text/tools/base64-or-URL images. Capability gating rejects unsupported fields, modalities, private response references and semantic transformations. Preserve max output and reasoning constraints; never reduce them silently. No fake streaming from a buffered nonstream response.
+- [x] Stream parser handles UTF-8 boundaries, LF/CRLF, comments, multiple frames per chunk, bounded frame size, final usage and malformed/truncated streams. Chat requests ask for usage; parser does not manufacture it if missing. Responses terminal events and Anthropic start/delta cumulative usage must normalize correctly without adding cumulative counters twice.
+- [x] Transport constructs paths once; validates HTTPS except explicitly permitted private/local destinations, prevents URL credentials/fragments/query abuse, resolves and checks actual target addresses and prevents redirect/proxy bypass. Auth header comes only from the configured upstream secret. Disable redirects. Pass only protocol-required allowed headers. Timeout and cancellation bound requests; redact all error snippets.
+- [x] Typed errors distinguish invalid request, context limit, quota, throttle, authentication, transient and stream interruption. Use status plus structured body, not any occurrence of “quota” in arbitrary text. Respect Retry-After.
+- [x] Verify local HTTP/SSE server cases without real provider traffic, run focused/full suite, document unsupported conversions explicitly.
+
+### Tasks 1–4 status (verified at takeover, not re-implemented)
+
+Tasks 1 and 2 were delivered by the prior Codex session; Tasks 3 and 4 by this
+one. None of their boxes had been ticked. Each item was checked against the code
+and its tests before ticking, rather than assumed:
+
+- **Task 1** — `gateway::amount` 4 tests (sign, exponent, overflow and precision
+  all rejected), `gateway::config` 16 (duplicates, references, URL shape,
+  weights, TTL, prices, units), `gateway::usage` 15 including
+  `cached_input_is_not_charged_as_ordinary_input`, which is the no-double-count
+  guarantee: OpenAI's `prompt_tokens` includes cached reads, so they are
+  subtracted out.
+- **Task 2** — `gateway::ledger` 14 tests, including
+  `independent_units_reserve_atomically_and_settle_once` with the spec's own
+  fixture (CNY limit 1, reserve 0.7, a further 0.4 refused, the credit account
+  untouched). Amounts are stored as `used TEXT NOT NULL CHECK(typeof(used)='text')`
+  — SQLite itself refuses a REAL there. `recover_inflight` turns unresolved
+  reservations into pending and never zero-settles them.
+- **Task 3** — `gateway::routing` 16 tests, `gateway::config_store` 12.
+- **Task 4** — `gateway::sse` 16, adapter 13, `gateway::transport` 15.
 
 ## Task 5: Runtime integration, Kiro adapter, admission and settlement
 
