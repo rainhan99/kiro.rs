@@ -980,6 +980,13 @@ pub async fn post_messages(
     let context = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
         Ok(context) => context,
         Err(error) => {
+            // 这类拒绝此前只写进 trace 库，控制台一行都不打：前台运行时只看得到
+            // "Received POST"，后面什么都没有，而客户端在那里一遍遍重试。
+            tracing::warn!(
+                model = %payload.model,
+                message_count = payload.messages.len(),
+                "请求在管线准备阶段被拒绝: {error:#}"
+            );
             let tracer = RequestTracer::new(
                 &state,
                 RequestTraceOptions {
@@ -2283,6 +2290,13 @@ pub async fn post_messages_cc(
     let context = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
         Ok(context) => context,
         Err(error) => {
+            // 这类拒绝此前只写进 trace 库，控制台一行都不打：前台运行时只看得到
+            // "Received POST"，后面什么都没有，而客户端在那里一遍遍重试。
+            tracing::warn!(
+                model = %payload.model,
+                message_count = payload.messages.len(),
+                "请求在管线准备阶段被拒绝: {error:#}"
+            );
             let tracer = RequestTracer::new(
                 &state,
                 RequestTraceOptions {

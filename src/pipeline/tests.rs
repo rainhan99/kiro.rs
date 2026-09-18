@@ -724,6 +724,13 @@ fn recovery_body_is_inert_while_disabled() {
 
 // ---------- 末尾 assistant（prefill）----------
 
+fn refusing_config() -> config::PipelineConfig {
+    config::PipelineConfig {
+        prefill: config::PrefillStrategy::Refuse,
+        ..config::PipelineConfig::default()
+    }
+}
+
 fn prefill_request() -> MessagesRequest {
     serde_json::from_value(json!({
         "model": "claude-sonnet-4",
@@ -736,15 +743,12 @@ fn prefill_request() -> MessagesRequest {
     .unwrap()
 }
 
-/// 默认拒绝，且**一个字都不丢**。
-///
-/// 0.9.0 及更早是静默截断到最后一条 user：请求看起来成功，客户端给的那段开头
-/// 却被扔掉了，模型表现异常而没人知道为什么。
+/// 显式选了 `refuse` 就必须拒绝，且请求原样不动。
 #[test]
-fn a_trailing_assistant_turn_is_refused_by_default() {
+fn choosing_refuse_rejects_without_touching_the_request() {
     let mut payload = prefill_request();
     let before = payload.messages.len();
-    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+    let pipeline = RequestPipeline::new(refusing_config());
 
     // `ContextSession` 刻意不实现 Debug——它持有转存的原文，实现 Debug 等于
     // 给内容开一条进日志的路。所以这里用 let-else 而不是 unwrap_err。
@@ -765,7 +769,7 @@ fn a_trailing_assistant_turn_is_refused_by_default() {
 #[test]
 fn the_refusal_names_the_role_sequence_without_any_content() {
     let mut payload = prefill_request();
-    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+    let pipeline = RequestPipeline::new(refusing_config());
     let Err(error) = pipeline.prepare(&mut payload, 1) else {
         panic!("末尾 assistant 必须被拒绝");
     };
@@ -795,7 +799,7 @@ fn a_long_conversation_folds_its_role_sequence() {
         "model": "claude-sonnet-4", "max_tokens": 100, "messages": messages
     }))
     .unwrap();
-    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+    let pipeline = RequestPipeline::new(refusing_config());
     let Err(error) = pipeline.prepare(&mut payload, 1) else {
         panic!("末尾 assistant 必须被拒绝");
     };
@@ -803,17 +807,15 @@ fn a_long_conversation_folds_its_role_sequence() {
     assert!(rendered.contains("…12 more…"), "中段应折叠：{rendered}");
 }
 
-/// 显式选择 `drop` 时恢复 0.9.0 的行为：截断到最后一条 user 继续。
+/// 默认（`drop`）保持 0.9.0 的行为：截断到最后一条 user 继续。
 #[test]
-fn choosing_drop_restores_the_pre_0_9_1_truncation() {
-    let mut cfg = config::PipelineConfig::default();
-    cfg.prefill = config::PrefillStrategy::Drop;
-    let pipeline = RequestPipeline::new(cfg);
+fn the_default_keeps_the_pre_0_9_1_truncation() {
+    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
     let mut payload = prefill_request();
 
     assert!(
         pipeline.prepare(&mut payload, 1).is_ok(),
-        "选了 drop 就不该报错"
+        "默认就是 drop，不该报错"
     );
     let converted = crate::anthropic::converter::convert_request_with_pipeline(
         &payload,
@@ -842,13 +844,13 @@ fn turning_off_enforcement_does_not_silently_re_enable_dropping() {
         config::PipelineMode::Audit,
         config::PipelineMode::Enforce,
     ] {
-        let mut cfg = config::PipelineConfig::default();
+        let mut cfg = refusing_config();
         cfg.mode = mode;
         let pipeline = RequestPipeline::new(cfg);
         let mut payload = prefill_request();
         assert!(
             pipeline.prepare(&mut payload, 1).is_err(),
-            "{mode:?}：prefill 默认拒绝，与 mode 无关"
+            "{mode:?}：选了 refuse 就该拒绝，与 mode 无关"
         );
     }
 }
@@ -857,7 +859,7 @@ fn turning_off_enforcement_does_not_silently_re_enable_dropping() {
 /// 由它兜住，免得同一份配置在两条路径上表现不同。
 #[test]
 fn the_converter_refuses_too_when_prepare_is_not_in_the_path() {
-    let cfg = config::PipelineConfig::default();
+    let cfg = refusing_config();
     let payload = prefill_request();
     let error = crate::anthropic::converter::convert_request_with_pipeline(
         &payload,
@@ -869,4 +871,17 @@ fn the_converter_refuses_too_when_prepare_is_not_in_the_path() {
         format!("{error}").contains("assistant prefill"),
         "实得：{error}"
     );
+}
+
+/// 默认必须是 `drop`。
+///
+/// 拒绝并**没有**把 prefill 保住——Kiro 两种情况下都用不上它。默认拒绝换不来
+/// "内容被保住"，只会让拿 prefill 约束小工具调用输出格式的客户端陷进重试循环。
+#[test]
+fn the_default_is_drop_because_refusing_saves_nothing() {
+    assert_eq!(
+        config::PipelineConfig::default().prefill,
+        config::PrefillStrategy::Drop
+    );
+    assert_eq!(config::PrefillStrategy::default(), config::PrefillStrategy::Drop);
 }

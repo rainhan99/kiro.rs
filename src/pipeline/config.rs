@@ -2,20 +2,31 @@ use serde::{Deserialize, Serialize};
 
 /// 末尾出现 assistant 消息（prefill）时怎么办。
 ///
-/// Kiro 不支持 assistant prefill。0.9.0 及更早的转换器**静默截断**到最后一条 user
-/// 就继续了——请求看起来成功，但客户端给出的那段开头被悄悄扔掉，模型表现异常而
-/// 没人知道为什么。请求管线随后改为拒绝，于是同一个请求在升级后从"能跑"变成"报错"。
+/// # 拒绝并不能把 prefill 保住
 ///
-/// 这两种处理各有道理，但**不该由 `mode` 顺带决定**。它是一个独立的选择，
-/// 所以单独成项：默认拒绝（不丢内容），需要旧行为的可以显式改回。
+/// Kiro 不支持 assistant prefill，**两种处理下它都用不上**。所以取舍不是
+/// "保住内容还是丢掉内容"，而是：
+///
+/// | | prefill | 请求 |
+/// |---|---|---|
+/// | `Refuse` | 用不上 | 失败 |
+/// | `Drop` | 用不上 | 成功，并在日志与 trace 里留痕 |
+///
+/// 主流客户端会拿 assistant prefill 约束小工具调用的输出格式（例如用两条消息、
+/// 64 个 token 生成一个标题）。默认拒绝会让这类客户端陷进固定间隔的重试循环，
+/// 而换来的并不是"内容被保住"。所以默认是 `Drop`。
+///
+/// 丢弃**不是静默的**：日志会记，trace 也会记。要严格拒绝的把它改成 `Refuse`。
+///
+/// 这个选择与 `mode` **正交**——关掉预算强制不等于同意改变 prefill 的处理。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrefillStrategy {
-    /// 报错，一个字都不丢。
+    /// 截断到最后一条 user 继续，并记录。这是 0.9.0 及更早的行为。
     #[default]
-    Refuse,
-    /// 截断到最后一条 user 继续。这是 0.9.0 及更早的行为。
     Drop,
+    /// 报错。请求失败，但 prefill 同样用不上。
+    Refuse,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,7 +263,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             mode: PipelineMode::Enforce,
-            prefill: PrefillStrategy::Refuse,
+            prefill: PrefillStrategy::Drop,
             strip_billing_header: true,
             cache_strategy: CacheStrategy::Off,
             agent_mode: "vibe".into(),

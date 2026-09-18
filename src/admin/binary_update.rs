@@ -103,6 +103,7 @@ pub async fn download_release_binary(
     github_token: Option<&str>,
     dest: &Path,
 ) -> Result<(), AdminServiceError> {
+    tracing::info!(version, "开始在线更新：下载 → 校验 → 替换 → 重启");
     let archive = archive_filename(version)?;
     let base = format!(
         "https://github.com/{}/releases/download/v{}",
@@ -195,10 +196,13 @@ async fn download_to_file(
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
     }
+    tracing::info!(url = %url, "开始下载更新产物");
     let resp = req.send().await.map_err(|e| {
+        tracing::error!(url = %url, "下载失败: {e}");
         AdminServiceError::InternalError(format!("下载 {} 失败: {}", url, e))
     })?;
     if !resp.status().is_success() {
+        tracing::error!(url = %url, status = resp.status().as_u16(), "下载被拒绝");
         return Err(AdminServiceError::InternalError(format!(
             "下载 {} 返回 {}",
             url,
@@ -420,6 +424,7 @@ fn set_executable(_path: &Path) -> Result<(), AdminServiceError> {
 /// "rename current → backup; rename staged → current" 的两步流程，
 /// 保证任何一步失败都能回滚。
 pub fn install_binary(exe: &Path, staged: &Path) -> Result<(), AdminServiceError> {
+    tracing::info!(exe = %exe.display(), staged = %staged.display(), "替换可执行文件");
     let backup = backup_path(exe);
     // 旧的 backup 留着没用，先清掉。
     let _ = fs::remove_file(&backup);

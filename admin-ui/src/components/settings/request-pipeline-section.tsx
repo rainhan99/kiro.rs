@@ -45,7 +45,7 @@ import type { PipelineEditor } from './request-pipeline-form'
 
 const choices: Record<string, { value: string; label: string }[]> = {
   mode: [{ value: 'off', label: '关闭' }, { value: 'audit', label: '审计' }, { value: 'enforce', label: '强制执行' }],
-  prefill: [{ value: 'refuse', label: '拒绝（默认，不丢内容）' }, { value: 'drop', label: '丢弃 prefill 继续（0.9.0 行为）' }],
+  prefill: [{ value: 'drop', label: '丢弃 prefill 继续（默认）' }, { value: 'refuse', label: '拒绝请求' }],
   cacheStrategy: [{ value: 'off', label: '关闭' }, { value: 'static-prefix', label: '静态前缀（实验性）' }],
   agentMode: [{ value: 'vibe', label: 'Vibe' }, { value: 'spec', label: 'Spec' }],
   'images.strategy': [{ value: 'preserve', label: '保留原图' }, { value: 'lossless-tiles', label: '无损切片' }],
@@ -202,7 +202,7 @@ export function RequestPipelineSection() {
           <legend className="mb-3 text-sm font-semibold">{editable ? '编辑下次启动配置' : '配置只读预览'}</legend>
           <SettingGroup title="执行与审计" description="各开关只修改草稿，统一通过下方保存按钮提交。">
             {select('mode', '强制执行会执行管线转换并拒绝超出已配置预算的请求。审计 / 关闭保留原有请求转换，不执行计费标记清理、原文转存、图片切片或 cachePoint 标记，也不强制拒绝这些预算违规。入口上限始终适用，审计记录由独立开关控制。')}
-            {select('prefill', 'Kiro 不支持 assistant prefill。「拒绝」会报错并在错误里给出消息的角色序列（只有角色、不含内容），一个字都不丢；「丢弃」恢复 0.9.0 及更早的行为——截断到最后一条 user 继续，你给的那段开头会被悄悄扔掉。这一项与执行模式无关：关掉强制执行不等于同意悄悄丢内容。')}
+            {select('prefill', 'Kiro 不支持 assistant prefill，两种处理下它都用不上——拒绝并不能把它保住，只是让请求失败。默认「丢弃」：截断到最后一条 user 继续，日志与 trace 都会留痕，不是静默的。主流客户端会拿 prefill 约束小工具调用的输出格式，选「拒绝」会让这类客户端陷进重试循环。这一项与执行模式无关。')}
             {select('agentMode', '上游请求使用的代理模式。')}
             {toggle('stripBillingHeader', '仅移除首个 system 文本块开头的 x-anthropic-billing-header: 行；不是任意 HTTP 请求头清理。')}
             {toggle('auditEnabled', '记录管线处理证据；原生缓存 usage 与本地估算分别展示。')}
