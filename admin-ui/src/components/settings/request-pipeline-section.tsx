@@ -6,10 +6,41 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { SettingGroup, SettingReadout, SettingRow, SettingSwitch } from '@/components/console/setting-row'
-import { useRequestPipeline, useSaveRequestPipeline } from '@/hooks/use-request-pipeline'
+import { useContextCalibration, useRequestPipeline, useSaveRequestPipeline } from '@/hooks/use-request-pipeline'
 import { extractErrorMessage } from '@/lib/utils'
 import type { PipelineConfig } from '@/types/request-pipeline'
 import { createEditor, flattenConfig, numericFields, receiveEditor, validateDraft } from './request-pipeline-form'
+import { calibrationRows } from './calibration-rows'
+
+/// 被动观测只读面板。
+function CalibrationObservations() {
+  const { data } = useContextCalibration()
+  const rows = calibrationRows(data?.observations)
+  return (
+    <SettingGroup
+      title="上下文分母被动观测"
+      description="仅由正常业务流量得出：原生 tokenUsage 与上下文百分比在同一次响应里同时到达时，两者反推出上游实际使用的分母。没有发送任何探测请求，也不做阈值二分。这是在已见样本上对上游算术的观察，不是实测或公布的上游上限，也不参与准入判定。"
+    >
+      {rows.length === 0
+        ? <p className="text-xs text-muted-foreground">暂无观测。样本只在响应同时给出完整原生用量和可用百分比时产生；100% 可能是钳位值，一律丢弃。</p>
+        : (
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+            {rows.map((row) => (
+              <div key={`${row.model}/${row.endpoint}`} className="contents">
+                <dt className="text-muted-foreground">{row.model} · {row.endpoint}</dt>
+                <dd className="font-mono">
+                  {row.window}
+                  <span className="ml-2 font-sans text-muted-foreground">{row.samples} 个样本</span>
+                  {row.unstable && <span className="ml-2 font-sans text-destructive">跨度大，均值不可当作窗口</span>}
+                  {row.thin && <span className="ml-2 font-sans text-muted-foreground">样本偏少，仅供参考</span>}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )}
+    </SettingGroup>
+  )
+}
 import type { PipelineEditor } from './request-pipeline-form'
 
 const choices: Record<string, { value: string; label: string }[]> = {
@@ -18,11 +49,14 @@ const choices: Record<string, { value: string; label: string }[]> = {
   agentMode: [{ value: 'vibe', label: 'Vibe' }, { value: 'spec', label: 'Spec' }],
   'images.strategy': [{ value: 'preserve', label: '保留原图' }, { value: 'lossless-tiles', label: '无损切片' }],
   'toolResults.strategy': [{ value: 'join', label: '合并为单条目（默认）' }, { value: 'lossless-chunks', label: '无损分片（接受性未验证）' }],
+  admission: [{ value: 'off', label: '不拦截（默认）' }, { value: 'declared-ceiling', label: '按上游声明上限拦截' }],
+  recovery: [{ value: 'off', label: '不重试（默认）' }, { value: 'lossless-retry', label: '无损修正后重发一次' }],
 }
 const labels: Record<string, string> = {
   mode: '执行模式', stripBillingHeader: '移除计费标记头', cacheStrategy: '缓存策略', agentMode: '代理模式',
   'artifacts.enabled': '启用原文分页读取', 'images.strategy': '图片策略',
-  'toolResults.strategy': '工具结果线上形状', auditEnabled: '记录管线审计',
+  'toolResults.strategy': '工具结果线上形状', admission: '发送前 token 准入',
+  recovery: '长度拒绝后的恢复', auditEnabled: '记录管线审计',
   kiroOnly: '仅使用 Kiro', allowSimulatedCache: '允许模拟缓存',
   ...Object.fromEntries(numericFields.map((field) => [field.key, field.label])),
 }
@@ -182,6 +216,13 @@ export function RequestPipelineSection() {
           <SettingGroup title="原文存储与分页读取" description="仅转存历史用户文本和工具结果文本，不转存当前指令、系统提示、工具 schema、推理或工具输入。原文保存在当前进程内存中，由内部工具分页读取；保留可检索性，不保证与一次性输入全文有相同推理效果。有效期结束、容量淘汰或进程重启后可能不可用，这不是持久化记忆。转存阈值 ≤ 单个内容上限 ≤ 内存存储总上限。">
             {toggle('artifacts.enabled', '启用后，达到阈值的历史用户文本和工具结果文本可转为引用，通过内部读取轮次获取原文。')}
             {numbers(numericFields.filter((field) => field.key.startsWith('artifacts.')).map((field) => field.key))}
+          </SettingGroup>
+
+          <CalibrationObservations />
+
+          <SettingGroup title="发送前准入与拒绝后恢复" description="两者都默认关闭，因为它们会改变请求的实际走向。准入按上游声明的 maxInputTokens 在发送前拒绝：判据是本地启发式估算而不是上游自己的计数，因此可能拒掉上游本来会接受的请求；上游没有声明上限时不拦截——未知不是无限也不是零。写死的模型名窗口表永远不会被当作上限。恢复只在拒绝分类明确指向长度预算时触发，对 payload 施加一次无损修正后同模型重发一次，没有第三次、不换补救手段、不换账号；它不改变正常请求的形状，修正只作用于这一次重试；修正后字节毫无变化时不重发。">
+            {select('admission', '按上游声明的 maxInputTokens 在发送前拒绝。判据是估算，可能误拦。')}
+            {select('recovery', '长度拒绝后施加一次无损修正并重发一次，同模型。接受性未验证的形状只在上游已拒绝常规形状之后发出。')}
           </SettingGroup>
 
           <SettingGroup title="工具结果线上形状" description="默认把工具结果的所有片段合并成单个 text 条目，与既有行为一致。无损分片把超过分片上限的正文切成多个 text 条目：逐字节可还原、切点落在 UTF-8 字符边界、与 tool_use_id 的配对不变，全文照发，既不是转存也不是摘要。上游 content 字段本就是数组，但本项目从未向上游发送过多于一个条目的载荷，也不允许为探测而发试探流量，因此上游是否接受未经验证；开启后若出现 400，请改回合并，不会自动改形或重试。可先用离线检查验收形状。">

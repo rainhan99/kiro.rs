@@ -26,46 +26,52 @@
 
 Files: `src/kiro/model/events/context_usage.rs`, `src/anthropic/stream.rs`, `src/anthropic/handlers.rs`.
 
-- [ ] RED: fixtures whose `contextUsageEvent` carries fields beyond the percentage assert those fields survive parsing today; assert a percentage-only payload still parses unchanged.
-- [ ] GREEN: retain the raw payload alongside the typed percentage, bounded in size, without changing how the percentage itself is consumed.
-- [ ] Record the declared `maxInputTokens`, the hardcoded window and the native usage from the same response beside the retained payload, so their disagreement is visible rather than resolved.
-- [ ] Confirm no prompt text, credential or header value can reach the retained evidence.
+- [x] RED: fixtures whose `contextUsageEvent` carries fields beyond the percentage assert those fields survive parsing today; assert a percentage-only payload still parses unchanged.
+- [x] GREEN: retain the raw payload alongside the typed percentage, bounded in size, without changing how the percentage itself is consumed.
+- [x] Record the declared `maxInputTokens`, the hardcoded window and the native usage from the same response beside the retained payload, so their disagreement is visible rather than resolved.
+- [x] Confirm no prompt text, credential or header value can reach the retained evidence.
 
 ### Task 2: Passive denominator calibration
 
 Files: `src/admin/trace_db.rs`, new calibration module, `src/anthropic/stream.rs` wiring.
 
-- [ ] RED: tests asserting a sample is produced only when a complete native usage snapshot and a nonzero percentage both arrived; asserting zero percentage, missing native fields, partial snapshots and interrupted streams each produce no sample.
-- [ ] GREEN: derive the implied denominator per response, aggregate per model and endpoint with sample counts, persist in the existing evidence store.
-- [ ] Expose the aggregate with its count through the admin API, labelled as an observation over N samples rather than a measured upstream limit.
-- [ ] Verify calibration mutates no configuration and feeds no value into admission on its own.
+- [x] RED: tests asserting a sample is produced only when a complete native usage snapshot and a nonzero percentage both arrived; asserting zero percentage, missing native fields, partial snapshots and interrupted streams each produce no sample.
+- [x] GREEN: derive the implied denominator per response, aggregate per model and endpoint with sample counts, persist in the existing evidence store.
+- [x] Expose the aggregate with its count through the admin API, labelled as an observation over N samples rather than a measured upstream limit.
+- [x] Verify calibration mutates no configuration and feeds no value into admission on its own.
 
 ### Task 3: Ceiling admission
 
 Files: `src/pipeline/config.rs`, `src/pipeline/mod.rs`, `src/kiro/provider.rs` or `src/anthropic/handlers.rs`.
 
-- [ ] RED: tests asserting a refusal above the declared ceiling when enabled, no refusal when the ceiling is unknown, no refusal when disabled, and that the hardcoded window never acts as a ceiling.
-- [ ] GREEN: refuse before transmission with a structured error carrying estimate, ceiling, ceiling source and the heuristic caveat.
-- [ ] Gate behind configuration, default off. Document that refusing on an estimate can refuse a request the upstream would have accepted.
-- [ ] Verify admission changes no model, rotates no credential and truncates nothing.
+- [x] RED: tests asserting a refusal above the declared ceiling when enabled, no refusal when the ceiling is unknown, no refusal when disabled, and that the hardcoded window never acts as a ceiling.
+- [x] GREEN: refuse before transmission with a structured error carrying estimate, ceiling, ceiling source and the heuristic caveat.
+- [x] Gate behind configuration, default off. Document that refusing on an estimate can refuse a request the upstream would have accepted.
+- [x] Verify admission changes no model, rotates no credential and truncates nothing.
 
 ### Task 4: Single modify-then-retry
 
 Files: `src/anthropic/handlers.rs`, `src/pipeline/config.rs`.
 
-- [ ] RED: tests asserting exactly one extra attempt; no retry when the rejection class names no budget line; no retry when the matching remedy is disabled; no third attempt when the second fails.
-- [ ] GREEN: on a classified rejection with an enabled lossless remedy, apply it to the payload, rebuild the request and send once more on the same model.
-- [ ] Gate behind configuration, default off. Enabling recovery must not change the steady-state shape of ordinary requests; the remedy applies to the retry alone.
-- [ ] No retry when applying the remedy leaves the payload byte-identical — that would be a blind resend.
-- [ ] Verify nothing is truncated, summarized, dropped or downgraded, and that an unverified remedy stays labelled unverified.
+- [x] RED: tests asserting exactly one extra attempt; no retry when the rejection class names no budget line; no retry when the matching remedy is disabled; no third attempt when the second fails.
+- [x] GREEN: on a classified rejection with an enabled lossless remedy, apply it to the payload, rebuild the request and send once more on the same model.
+- [x] Gate behind configuration, default off. Enabling recovery must not change the steady-state shape of ordinary requests; the remedy applies to the retry alone.
+- [x] No retry when applying the remedy leaves the payload byte-identical — that would be a blind resend.
+- [x] Verify nothing is truncated, summarized, dropped or downgraded, and that an unverified remedy stays labelled unverified.
 
 ### Task 5: Integrate, verify, document
 
-- [ ] Surface calibration samples and admission/recovery state in the console, with sample counts and the estimate caveat.
-- [ ] Update `docs/request-pipeline.md` and `docs/request-pipeline-coverage.md` to the post-phase-2 truth, including what remains unimplemented in phase 3.
-- [ ] Run focused regressions, both feature modes, clippy on touched files, the admin UI build and the offline `--check-config` / `--inspect-request` fixtures.
-- [ ] Review the complete diff for security, compatibility and information loss; fix important findings and rerun covering tests.
+- [x] Surface calibration samples and admission/recovery state in the console, with sample counts and the estimate caveat.
+- [x] Update `docs/request-pipeline.md` and `docs/request-pipeline-coverage.md` to the post-phase-2 truth, including what remains unimplemented in phase 3.
+- [x] Run focused regressions, both feature modes, clippy on touched files, the admin UI build and the offline `--check-config` / `--inspect-request` fixtures.
+- [x] Review the complete diff for security, compatibility and information loss; fix important findings and rerun covering tests.
 
 ## Execution record
 
-- No live Kiro requests or account experiments authorized or performed.
+- No live Kiro requests or account experiments authorized or performed. Branch stayed `codex/request-pipeline` throughout; every commit sits linearly on the prior session's `02f484a` with no rebase or history rewrite.
+- Task 1 found the retention problem is unsolvable by parsing alone: the event's shape is unknown and probing to learn it is forbidden, so the fix is to retain redacted *structure* — names, numbers, containers, string values reduced to their length. That keeps prompt text out by construction rather than by trusting a future field to be harmless.
+- Task 2's sample rejects a percentage at or above 100. The upstream is known to emit 100, and if that is a clamp the implied denominator equals the request's own input size, which would systematically understate the window and then record the understatement as an observation.
+- Task 4 amended the spec mid-task: its first form required the remedy to be already enabled, which made the feature either a blind resend (remedy on, retry identical) or dead (remedy off, never acts). Corrected to: steady-state shape unchanged, remedy applied to the retry alone.
+- Task 4's no-blind-resend guard was initially vacuous and a test caught it — `conversationId` and `agentContinuationId` are regenerated per conversion, so whole-body comparison always differed. The comparison now strips them, as the wire audit's semantic fingerprint does.
+- Task 5 review: the new admin route sits inside the authenticated router; the calibration table is created through the existing idempotent migration and a legacy-schema test proves an upgraded database gains it; the new evidence carries only redacted structure, counts and model/endpoint names. Known cost recorded in the docs: enabling recovery pays one extra conversion and serialization on every request, used or not.
+- Final: Rust 895 unit + 3 CLI passing in both feature modes, 1 ignored; clippy 116 binary warnings (118 at takeover); admin UI 25 tests and production build passing; release binary offline `--check-config` and `--inspect-request` return `networkRequests:0`, `construction-only` evidence, no prompt text, with `admission`, `recovery` and `toolResults` all defaulting to off.

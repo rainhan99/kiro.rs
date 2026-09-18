@@ -7,6 +7,7 @@ const config = () => ({
   limits: { bodyBytes: null, textFieldBytes: null, toolResultBytes: null, imageBase64Bytes: null },
   artifacts: { enabled: false, thresholdBytes: 131072, maxStoreBytes: 67108864, maxArtifactBytes: 16777216, ttlSecs: 3600, readBytes: 16384, maxRounds: 4 },
   toolResults: { strategy: 'join', chunkBytes: 400000 },
+  admission: 'off', recovery: 'off',
   images: { strategy: 'preserve', tileMaxBase64Bytes: 400000, maxTiles: 32, maxPixels: 40000000 },
   auditEnabled: true, allowSimulatedCache: false, kiroOnly: true,
 })
@@ -36,6 +37,14 @@ describe('pipeline configuration editor', () => {
     expect(result.errors['limits.bodyBytes']).toBeTruthy()
     expect(result.errors['artifacts.thresholdBytes']).toBeTruthy()
     expect(result.errors['artifacts.maxArtifactBytes']).toBeTruthy()
+  })
+  test('admission and recovery survive a save; a form that forgets them would silently reset them', () => {
+    const { draft } = createEditor(snapshot())
+    draft.admission = 'declared-ceiling'
+    draft.recovery = 'lossless-retry'
+    const config = validateDraft(draft).config
+    expect(config?.admission).toBe('declared-ceiling')
+    expect(config?.recovery).toBe('lossless-retry')
   })
   test('inactive chunk budget does not block a small ingress', () => {
     // 与后端 validate() 同一陷阱：关着的预算不得让配置无法保存。

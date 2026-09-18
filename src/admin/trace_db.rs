@@ -1798,6 +1798,19 @@ mod tests {
             store.pipeline_evidence("t1").unwrap(),
             vec![serde_json::json!({"kind": "wire_audit", "evidence": {"limits": null}})]
         );
+        // 老库（建库时还没有 context_calibration 表）必须在迁移后拿到该表并可用，
+        // 否则升级后的实例会在每次响应结束时静默丢失校准样本。
+        assert!(store.calibration_aggregates().unwrap().is_empty());
+        store
+            .record_calibration_sample(&crate::pipeline::calibration::CalibrationSample {
+                model: "m1".into(),
+                endpoint: "ide".into(),
+                percentage: 25.0,
+                native_input_tokens: 50_000,
+                implied_window_tokens: 200_000,
+            })
+            .unwrap();
+        assert_eq!(store.calibration_aggregates().unwrap()[0].samples, 1);
         TraceStore::migrate(&store.conn.lock()).unwrap();
         assert_eq!(store.pipeline_evidence("t1").unwrap().len(), 1);
     }

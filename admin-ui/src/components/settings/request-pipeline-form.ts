@@ -79,6 +79,8 @@ export function validateDraft(draft: PipelineDraft): { config?: PipelineConfig; 
     limits: { bodyBytes: numbers['limits.bodyBytes'], textFieldBytes: numbers['limits.textFieldBytes'], toolResultBytes: numbers['limits.toolResultBytes'], imageBase64Bytes: numbers['limits.imageBase64Bytes'] },
     artifacts: { enabled: draft['artifacts.enabled'] === true, thresholdBytes: n('artifacts.thresholdBytes'), maxArtifactBytes: n('artifacts.maxArtifactBytes'), maxStoreBytes: n('artifacts.maxStoreBytes'), ttlSecs: n('artifacts.ttlSecs'), readBytes: n('artifacts.readBytes'), maxRounds: n('artifacts.maxRounds') },
     toolResults: { strategy: draft['toolResults.strategy'] as PipelineConfig['toolResults']['strategy'], chunkBytes: n('toolResults.chunkBytes') },
+    admission: draft.admission as PipelineConfig['admission'],
+    recovery: draft.recovery as PipelineConfig['recovery'],
     images: { strategy: draft['images.strategy'] as PipelineConfig['images']['strategy'], tileMaxBase64Bytes: n('images.tileMaxBase64Bytes'), maxTiles: n('images.maxTiles'), maxPixels: n('images.maxPixels') },
     auditEnabled: draft.auditEnabled === true, kiroOnly: true, allowSimulatedCache: false,
   } }

@@ -7,6 +7,8 @@ export interface PipelineConfig {
   limits: { bodyBytes: number | null; textFieldBytes: number | null; toolResultBytes: number | null; imageBase64Bytes: number | null }
   artifacts: { enabled: boolean; thresholdBytes: number; maxStoreBytes: number; maxArtifactBytes: number; ttlSecs: number; readBytes: number; maxRounds: number }
   toolResults: { strategy: 'join' | 'lossless-chunks'; chunkBytes: number }
+  admission: 'off' | 'declared-ceiling'
+  recovery: 'off' | 'lossless-retry'
   images: { strategy: 'preserve' | 'lossless-tiles'; tileMaxBase64Bytes: number; maxTiles: number; maxPixels: number }
   auditEnabled: boolean
   allowSimulatedCache: boolean

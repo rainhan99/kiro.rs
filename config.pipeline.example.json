@@ -26,6 +26,8 @@
       "strategy": "join",
       "chunkBytes": 400000
     },
+    "admission": "off",
+    "recovery": "off",
     "images": {
       "strategy": "lossless-tiles",
       "tileMaxBase64Bytes": 400000,

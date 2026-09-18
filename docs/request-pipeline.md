@@ -33,8 +33,24 @@
 | `images.strategy: lossless-tiles` | 静态 PNG/JPEG/WebP 解码后按像素无损 PNG 切片；另附坐标；动画、容量不足明确报错 |
 | `artifacts.enabled` | 仅卸载超长历史用户文本和工具结果文本，保留原文，注入本地 read/search 工具 |
 | `toolResults.strategy: join/lossless-chunks` | `join` 为默认与既有行为（单个 text 条目）；`lossless-chunks` 把超过 `chunkBytes` 的工具结果切成多个 text 条目，逐字节可还原、切点落在 UTF-8 边界、与 `tool_use_id` 的配对不变。**不是卸载也不是摘要**：全文照发 |
+| `admission: off/declared-ceiling` | `off` 为默认。`declared-ceiling` 在发送前按**上游声明**的 `maxInputTokens` 拒绝，返回 **413 / local_token_admission** |
+| `recovery: off/lossless-retry` | `off` 为默认。`lossless-retry` 在分类明确的长度拒绝后，对 payload 施加一次无损修正并同模型重发一次 |
 | `allowSimulatedCache:false` | 无论旧计量开关如何，客户端路径不采用模拟缓存分摊；原生用量缺失不补出“命中” |
 | `kiroOnly:true` | 拒绝配置外部 countTokensApiUrl；推理/搜索仍走现有 Kiro 路径 |
+
+## 准入、恢复与被动校准（阶段 2）
+
+`admission` 与 `recovery` 都**默认关闭**，因为它们会改变请求的实际走向；观测与校准默认生效，因为它们只让既有数字更诚实。
+
+`admission: declared-ceiling` 在发送前比较**估算输入 token**与上游声明的 `maxInputTokens`，超出即返回 413 / `local_token_admission`（与字节预算的 `local_payload_limit` 用不同错误码，便于分清拒绝来自哪一侧）。三条边界必须清楚：判据是**本地启发式估算**而不是上游自己的计数，因此**可能拒掉上游本来会接受的请求**；上游没有声明上限时**不拦截**——未知不是无限也不是零；写死的模型名窗口表永远不会被当作上限，拿猜测做拦截等于把猜测升级成门禁。准入只读该凭据已缓存的模型列表，不触发刷新，不改模型、不换凭据、不截断。关闭审计不会连带关掉准入。
+
+`recovery: lossless-retry` 只在拒绝分类**明确指向长度预算**时触发（协议配对错误改尺寸不会通过，未分类的拒绝不得被当作长度问题）。它对 payload 施加一次无损修正——目前唯一可用的是工具结果分片——然后同模型重发**一次**：没有第三次、不换补救手段、不换账号碰运气。它**不改变正常请求的稳态形状**，修正只作用于这一次重试，因此接受性未验证的形状只会在上游**已经拒绝**常规形状之后发出。修正后若字节毫无变化则不重发（比较时会先剔除每次转换都重新生成的 `conversationId` / `agentContinuationId`，否则整串比较必然不同，这条约束会形同虚设）。恢复成功一次**不构成**该形状被普遍接受的证据。
+
+开启 `recovery` 的成本要知道：修正体在请求构造阶段就会预先生成，也就是**每个请求都多做一次转换与序列化**，即便它从未被拒绝、修正体从未被使用。大 payload 下这是实打实的 CPU 与内存开销。关闭时（默认）只有一次函数调用即返回，没有额外成本。
+
+被动分母校准不需要任何配置，也不需要探测流量。上游的 `contextUsageEvent` 只给百分比、不说分母，本项目此前用一张写死的模型名窗口表去乘它；但原生 `metadataEvent.tokenUsage` 与该百分比会在**同一次响应**里一起到达，两者一比即可反推上游实际使用的分母。样本只在两半都完整时产生：缺百分比、缺原生字段、用量是估算值、响应中断、输入为 0、百分比 ≤ 0 一律不取样；百分比 ≥ 100 也丢弃——上游确实会给出 100，若那是钳位值，反推出的分母会等于本次输入量本身，从而系统性低估窗口并把这个低估值记成观测。
+
+样本按模型与端点聚合，连同样本数、最小值、最大值与均值一起呈现，并独立于 trace 保留期存活（它描述的是上游算术而不是某一次请求）。`GET /api/admin/context-calibration` 与设置页的只读面板都会标明：这是**在 N 个样本上对上游算术的观察**，不是实测或公布的上游上限。min/max 跨度大时界面**不显示均值**，只显示区间——显示均值会让人误以为拿到了一个窗口值。校准只观察：聚合值只被那个只读接口读取，请求路径里没有任何消费者，它不修改配置，也不会自己流入准入。
 
 `toolResults.strategy: lossless-chunks` 是**接受性未验证**的实验特性，默认关闭。上游 `toolResults[].content` 在 schema 上本就是数组，此前恒为单条目是转换器的选择；但本仓库从未向 Kiro 发送过多于一个条目的载荷，本项目也不允许为探测而发试探流量，因此**无法离线证明上游接受它**。与 `static-prefix` 同为可撤销策略：开启后若出现 400，改回 `join`，不会自动改形或重试去绕过拒绝。开启前可用离线检查肉眼验收线上形状——`--inspect-request` 输出的 `metrics.toolResultEntryCount` 大于 `toolResultCount` 即表示分片已生效，同时 `largestTextBytes` 应降到 `chunkBytes` 以内。
 
