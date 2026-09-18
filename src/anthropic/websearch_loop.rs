@@ -3067,6 +3067,7 @@ mod tests {
             key_id: 0,
             model: "test-model".to_string(),
             started_at: std::time::Instant::now(),
+            settlement: None,
         };
         let (sender, receiver) = mpsc::channel::<Bytes>(1);
         let in_flight = async move {
@@ -4061,6 +4062,7 @@ mod tests {
             key_id: 0,
             model: "test-model".to_string(),
             started_at: std::time::Instant::now(),
+            settlement: None,
         })
     }
 

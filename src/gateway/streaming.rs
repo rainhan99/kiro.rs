@@ -36,6 +36,7 @@ use super::execute::SendError;
 use super::protocol::WireProtocol;
 use super::routing::RouteContext;
 use super::service::GatewayService;
+use super::settlement::{KiroRoute, Settlement};
 use super::sse::{SseEvent, SseParser, StreamTranslator};
 use super::usage::normalize_usage;
 
@@ -65,6 +66,16 @@ pub enum StreamDispatched {
     },
     /// 已开流。逐块取出发给客户端。
     Streaming(mpsc::Receiver<Result<Bytes, std::io::Error>>),
+    /// 选中了一条 Kiro 路：交既有 Kiro 通道执行（它自带 SSE 转换与原生用量提取）。
+    UseKiro(Box<KiroRoute>),
+}
+
+/// 任务回传给调用方的决策。必须在流开起来**之前**定下来——把错误塞进一段
+/// 已经开始的 SSE，客户端没有任何办法处理。
+enum Decision {
+    Opened,
+    Refused(u16, String),
+    UseKiro(Box<KiroRoute>),
 }
 
 /// 把接收端变成 axum 能用的流，不引入新依赖。
@@ -92,7 +103,7 @@ pub async fn dispatch_stream(
         };
     }
 
-    let (decided, decision) = oneshot::channel::<Result<(), (u16, String)>>();
+    let (decided, decision) = oneshot::channel::<Decision>();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
 
     tokio::spawn(async move {
@@ -103,8 +114,9 @@ pub async fn dispatch_stream(
     });
 
     match decision.await {
-        Ok(Ok(())) => StreamDispatched::Streaming(rx),
-        Ok(Err((status, reason))) => StreamDispatched::Refused { status, reason },
+        Ok(Decision::Opened) => StreamDispatched::Streaming(rx),
+        Ok(Decision::Refused(status, reason)) => StreamDispatched::Refused { status, reason },
+        Ok(Decision::UseKiro(route)) => StreamDispatched::UseKiro(route),
         // 任务在回话之前就没了。宁可报一个明确的 500，也不要交回一个永远不出数据的流。
         Err(_) => StreamDispatched::Refused {
             status: 500,
@@ -121,15 +133,21 @@ async fn run(
     body: Value,
     ctx: RouteContext,
     request_id: String,
-    decided: oneshot::Sender<Result<(), (u16, String)>>,
+    decided: oneshot::Sender<Decision>,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
     let Some(plan) = gateway.plan_for(&ctx.public_model) else {
-        let _ = decided.send(Err((500, "plan disappeared mid-dispatch".into())));
+        let _ = decided.send(Decision::Refused(
+            500,
+            "plan disappeared mid-dispatch".into(),
+        ));
         return;
     };
     let Some(ledger) = gateway.ledger() else {
-        let _ = decided.send(Err((500, "ledger disappeared mid-dispatch".into())));
+        let _ = decided.send(Decision::Refused(
+            500,
+            "ledger disappeared mid-dispatch".into(),
+        ));
         return;
     };
     let mut coordinator =
@@ -153,6 +171,25 @@ async fn run(
                 );
             }
         };
+
+        // Kiro 路交回既有通道：它自带 SSE 转换、凭据轮换与原生用量提取。
+        if plan.upstream(&attempt.upstream_id).map(|u| u.kind) == Some(super::UpstreamKind::Kiro) {
+            let group = plan
+                .upstream(&attempt.upstream_id)
+                .and_then(|u| u.kiro_group.clone());
+            if let Some(decided) = decided.take() {
+                let _ = decided.send(Decision::UseKiro(Box::new(KiroRoute {
+                    upstream_model: attempt.upstream_model.clone(),
+                    group,
+                    settlement: Arc::new(Settlement::new(
+                        gateway.clone(),
+                        attempt.attempt_id.clone(),
+                        attempt.unit,
+                    )),
+                })));
+            }
+            return;
+        }
 
         // 开流之前先确定这条路能不能表达这个请求。
         let opened = match prepare(&plan, protocol, &body, &attempt) {
@@ -193,7 +230,7 @@ async fn run(
 
         // 流已打开，此后不再换路。告诉调用方可以开始回应了。
         if let Some(decided) = decided.take() {
-            let _ = decided.send(Ok(()));
+            let _ = decided.send(Decision::Opened);
         }
         forward(&mut coordinator, &ctx, &plan, &attempt, wire, stream, &tx).await;
         return;
@@ -336,13 +373,13 @@ fn render(event: &SseEvent) -> Bytes {
     Bytes::from(out)
 }
 
-fn refuse(decided: &mut Option<oneshot::Sender<Result<(), (u16, String)>>>, refusal: Dispatched) {
+fn refuse(decided: &mut Option<oneshot::Sender<Decision>>, refusal: Dispatched) {
     let (status, reason) = match refusal {
         Dispatched::Refused { status, reason } => (status, reason),
         _ => (500, "unexpected dispatch outcome".to_string()),
     };
     if let Some(decided) = decided.take() {
-        let _ = decided.send(Err((status, reason)));
+        let _ = decided.send(Decision::Refused(status, reason));
     }
 }
 

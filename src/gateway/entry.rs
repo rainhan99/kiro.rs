@@ -24,7 +24,18 @@ use super::dispatch::{Dispatched, dispatch};
 use super::protocol::WireProtocol;
 use super::routing::RouteContext;
 use super::service::GatewayService;
+use super::settlement::KiroRoute;
 use super::streaming::{StreamDispatched, dispatch_stream, into_stream};
+
+/// 入口处理的结局。
+pub enum Handled {
+    /// 网关不接管，调用方原样继续走既有路径。
+    NotManaged,
+    /// 已完成，这是给客户端的应答。
+    Response(Response),
+    /// 走既有 Kiro 通道执行，带上这些请求级覆盖与结算句柄。
+    UseKiro(Box<KiroRoute>),
+}
 
 pub struct GatewayEntry {
     service: Arc<GatewayService>,
@@ -53,20 +64,26 @@ impl GatewayEntry {
         self.service.public_models()
     }
 
-    /// 处理一次请求。返回 `None` 表示网关不接管，调用方继续走既有路径。
+    /// 处理一次请求。
     pub async fn handle(
         &self,
         protocol: WireProtocol,
         body: Value,
         key_id: u64,
         request_id: String,
-    ) -> Option<Response> {
-        let alias = body.get("model")?.as_str()?.to_string();
+    ) -> Handled {
+        let Some(alias) = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Handled::NotManaged;
+        };
         // 快路径，不是守卫：真正兜底的是 `plan_for`，它对未接管的别名同样返回
         // `NotManaged`（变异测试确认过：去掉这一句行为不变）。留着它是为了在
         // 不接管时**不去扫描请求体**建路由上下文——那是每个请求都要付的钱。
         if !self.service.is_managed(&alias) {
-            return None;
+            return Handled::NotManaged;
         }
         let ctx = route_context(key_id, alias, &body);
 
@@ -81,9 +98,10 @@ impl GatewayEntry {
             )
             .await
             {
-                StreamDispatched::NotManaged => None,
+                StreamDispatched::NotManaged => Handled::NotManaged,
+                StreamDispatched::UseKiro(route) => Handled::UseKiro(route),
                 StreamDispatched::Refused { status, reason } => {
-                    Some(error_response(protocol, status, &reason))
+                    Handled::Response(error_response(protocol, status, &reason))
                 }
                 StreamDispatched::Streaming(rx) => {
                     let mut response = Body::from_stream(into_stream(rx)).into_response();
@@ -94,7 +112,7 @@ impl GatewayEntry {
                     response
                         .headers_mut()
                         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-                    Some(response)
+                    Handled::Response(response)
                 }
             };
         }
@@ -109,10 +127,13 @@ impl GatewayEntry {
         )
         .await
         {
-            Dispatched::NotManaged => None,
-            Dispatched::Answered(answer) => Some((StatusCode::OK, Json(answer)).into_response()),
+            Dispatched::NotManaged => Handled::NotManaged,
+            Dispatched::UseKiro(route) => Handled::UseKiro(route),
+            Dispatched::Answered(answer) => {
+                Handled::Response((StatusCode::OK, Json(answer)).into_response())
+            }
             Dispatched::Refused { status, reason } => {
-                Some(error_response(protocol, status, &reason))
+                Handled::Response(error_response(protocol, status, &reason))
             }
         }
     }

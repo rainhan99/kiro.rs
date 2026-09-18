@@ -23,6 +23,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -34,11 +35,11 @@ use super::execute::SendError;
 use super::protocol::{WireProtocol, convert_request, convert_response};
 use super::routing::RouteContext;
 use super::service::{GatewayService, RequestPlan};
+use super::settlement::{KiroRoute, Settlement};
 use super::usage::{NativeUsage, normalize_usage, token_cost};
 use super::{Amount, BillingUnit, ModelBinding, Upstream, UpstreamKind};
 
 /// 分发的结局。
-#[derive(Debug, PartialEq)]
 pub enum Dispatched {
     /// 网关不接管这个别名。调用方**原样**走既有路径——不接管就不该改变任何行为。
     NotManaged,
@@ -46,6 +47,22 @@ pub enum Dispatched {
     Answered(Value),
     /// 拒绝，附带可直接回给客户端的状态码与原因。
     Refused { status: u16, reason: String },
+    /// 选中了一条 Kiro 路。预留已经记在账上，由调用方走既有 Kiro 通道执行，
+    /// 并在用量汇聚点用 [`KiroRoute::settlement`] 结算（理由见 [`super::settlement`]）。
+    UseKiro(Box<KiroRoute>),
+}
+
+impl std::fmt::Debug for Dispatched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotManaged => write!(f, "NotManaged"),
+            Self::Answered(value) => write!(f, "Answered({value})"),
+            Self::Refused { status, reason } => {
+                write!(f, "Refused {{ status: {status}, reason: {reason:?} }}")
+            }
+            Self::UseKiro(route) => write!(f, "UseKiro({})", route.upstream_model),
+        }
+    }
 }
 
 /// 把一条路上的请求真正发出去。
@@ -66,7 +83,7 @@ pub trait RouteExecutor: Send + Sync {
 ///
 /// `request_id` 必须逐请求唯一——账本的幂等性建立在它上面。
 pub async fn dispatch(
-    gateway: &GatewayService,
+    gateway: &Arc<GatewayService>,
     executor: &dyn RouteExecutor,
     protocol: WireProtocol,
     body: &Value,
@@ -100,6 +117,23 @@ pub async fn dispatch(
                 };
             }
         };
+
+        // Kiro 路不由网关发请求：预留已经记上，执行交回既有通道。
+        // 它自带凭据轮换与重试，所以这里不再叠加一层换路重试。
+        if plan.upstream(&attempt.upstream_id).map(|u| u.kind) == Some(UpstreamKind::Kiro) {
+            let group = plan
+                .upstream(&attempt.upstream_id)
+                .and_then(|u| u.kiro_group.clone());
+            return Dispatched::UseKiro(Box::new(KiroRoute {
+                upstream_model: attempt.upstream_model.clone(),
+                group,
+                settlement: Arc::new(Settlement::new(
+                    gateway.clone(),
+                    attempt.attempt_id.clone(),
+                    attempt.unit,
+                )),
+            }));
+        }
 
         match attempt_once(executor, &plan, protocol, body, &attempt).await {
             Ok(raw) => {

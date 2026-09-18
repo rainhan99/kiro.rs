@@ -194,8 +194,15 @@ pub async fn gateway_middleware(
 
     let request_id = uuid::Uuid::new_v4().to_string();
     match entry.handle(protocol, value, key_id, request_id).await {
-        Some(response) => response,
-        None => {
+        crate::gateway::entry::Handled::Response(response) => response,
+        // Kiro 路：预留已经记在账上，交既有通道执行。覆盖与结算句柄放进扩展，
+        // 由 handler 取用——请求级传递，不碰任何全局开关。
+        crate::gateway::entry::Handled::UseKiro(route) => {
+            let mut request = axum::extract::Request::from_parts(parts, Body::from(bytes));
+            request.extensions_mut().insert(*route);
+            next.run(request).await
+        }
+        crate::gateway::entry::Handled::NotManaged => {
             next.run(axum::extract::Request::from_parts(parts, Body::from(bytes)))
                 .await
         }

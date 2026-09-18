@@ -56,6 +56,12 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    /// 网关接管这次请求时的账本结算句柄。`None` 表示这次不经账本。
+    ///
+    /// 结算挂在这里，是因为这里是 Kiro 路径上用量的**唯一汇聚点**：流式、非流式、
+    /// 成功、失败都经过它，而且它拿到的正是权威的原生 `meteringEvent` 计费量。
+    /// 让网关另起一套事件流解析去取同一个数字，等于给同一条不变量造两套实现。
+    pub settlement: Option<std::sync::Arc<crate::gateway::settlement::Settlement>>,
 }
 
 impl UsageRecordHook {
@@ -67,6 +73,50 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
+            settlement: None,
+        }
+    }
+
+    /// 挂上网关的结算句柄。
+    pub fn with_settlement(
+        mut self,
+        settlement: Option<std::sync::Arc<crate::gateway::settlement::Settlement>>,
+    ) -> Self {
+        self.settlement = settlement;
+        self
+    }
+
+    /// 把这次调用的结果落到账本上。
+    ///
+    /// 失败只记日志、不改变给客户端的应答：请求本身已经完成，此刻再报错于事无补，
+    /// 而且那条预留仍然留在账上，下次启动由 `recover_inflight` 认领，不会丢。
+    fn settle(&self, credits: f64, status: &str) {
+        let Some(settlement) = &self.settlement else {
+            return;
+        };
+        let outcome = if status == "success" {
+            // 上游报了多少就是多少；换算不了就记为待结算，绝不用 0 顶替。
+            let amount = match crate::gateway::settlement::credits_to_amount(credits) {
+                Ok(amount) => Some(amount),
+                Err(error) => {
+                    tracing::warn!(
+                        attempt = %settlement.attempt_id(),
+                        "原生 credit 无法记入账本，本次记为待结算: {error:#}"
+                    );
+                    None
+                }
+            };
+            settlement.succeeded(amount, None)
+        } else {
+            // 走到这里说明请求已经失败返回。没有向下游发出过内容的那部分由
+            // 网关侧的预留继续持有；这里如实记为失败并释放。
+            settlement.failed(false)
+        };
+        if let Err(error) = outcome {
+            tracing::error!(
+                attempt = %settlement.attempt_id(),
+                "账本结算失败，该预留留待启动时认领: {error:#}"
+            );
         }
     }
 
@@ -103,6 +153,7 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
+        self.settle(credits, status);
         if status == "success" && self.key_id != 0 {
             if let Some(m) = &self.client_keys {
                 m.record_usage(
@@ -836,9 +887,11 @@ fn gateway_model(model: crate::gateway::service::PublicModelCapabilities) -> Mod
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
+    Extension(mut key_ctx): Extension<KeyContext>,
+    gateway_route: Option<Extension<crate::gateway::settlement::KiroRoute>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let gateway_route = gateway_route.map(|Extension(route)| route);
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
     tracing::info!(
@@ -861,7 +914,15 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    // 统计记的是**客户端要的那个名字**，运维按它对账；账本另有价格快照记录
+    // 实际走的绑定与上游模型，两者各司其职。
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone())
+        .with_settlement(gateway_route.as_ref().map(|r| r.settlement.clone()));
+    // 网关选中了一条 Kiro 路：按**请求级**覆盖替换真实模型名与凭据分组。
+    // 只改这两个局部值，不碰任何全局开关——并发的两个请求可以走不同的路。
+    if let Some(route) = &gateway_route {
+        route.apply(&mut payload.model, &mut key_ctx.group);
+    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),

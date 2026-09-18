@@ -217,6 +217,9 @@ impl ResponsesResponseConfig {
 pub async fn post_responses(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    // 网关若选中了一条 Kiro 路，覆盖与结算句柄原样透传给内层——
+    // 这一层只做协议转换，不参与选路与记账。
+    gateway_route: Option<Extension<crate::gateway::settlement::KiroRoute>>,
     headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
@@ -250,7 +253,13 @@ pub async fn post_responses(
     };
 
     // 2. 复用 Anthropic 全链路。流式请求会得到标准 Anthropic SSE。
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(
+        State(state),
+        Extension(key_ctx),
+        gateway_route,
+        Json(anthropic_req),
+    )
+    .await;
 
     let status = inner.status();
     if !status.is_success() {

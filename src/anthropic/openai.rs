@@ -91,6 +91,9 @@ pub(super) fn resolve_session_metadata(
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    // 网关若选中了一条 Kiro 路，覆盖与结算句柄原样透传给内层——
+    // 这一层只做协议转换，不参与选路与记账。
+    gateway_route: Option<Extension<crate::gateway::settlement::KiroRoute>>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
@@ -114,7 +117,13 @@ pub async fn post_chat_completions(
     };
 
     // 2. 复用 Anthropic 全链路（内部强制非流式）
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(
+        State(state),
+        Extension(key_ctx),
+        gateway_route,
+        Json(anthropic_req),
+    )
+    .await;
 
     let status = inner.status();
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {

@@ -15,6 +15,7 @@ mod ledger_types;
 pub mod protocol;
 pub mod routing;
 pub mod service;
+pub mod settlement;
 pub mod sse;
 pub mod streaming;
 pub mod transport;

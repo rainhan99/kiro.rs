@@ -171,7 +171,7 @@ fn money_binding(id: &str, upstream: &str, tier: u32) -> ModelBinding {
 }
 
 struct Fixture {
-    service: GatewayService,
+    service: Arc<GatewayService>,
     config_path: PathBuf,
     ledger_path: PathBuf,
 }
@@ -198,7 +198,7 @@ fn fixture(bindings: Vec<ModelBinding>, upstreams: Vec<Upstream>) -> Fixture {
         ..GatewayConfig::default()
     };
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-    let service = GatewayService::open(&config_path, &ledger_path).unwrap();
+    let service = Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap());
     Fixture {
         service,
         config_path,
@@ -289,7 +289,7 @@ async fn an_unmanaged_alias_is_left_to_the_legacy_path() {
     )
     .await;
 
-    assert_eq!(result, Dispatched::NotManaged);
+    assert!(matches!(result, Dispatched::NotManaged));
     assert!(fake.calls().is_empty(), "不接管就不该发出任何请求");
 }
 
@@ -675,28 +675,21 @@ async fn every_route_failing_is_reported_as_such() {
     assert_eq!(account(&f, 7, BillingUnit::Cny).in_flight, 0);
 }
 
-/// 现状记录（**不是期望行为**）：配置里一条 Kiro 绑定会被选中，然后必然失败。
+/// Kiro 路由**交回**既有通道执行，并带上请求级覆盖。
 ///
-/// 校验器要求 Kiro 上游不得设 baseUrl（凭据与地址都来自既有凭据池），而直连执行器
-/// 正是靠 baseUrl 构造端点的。所以 Kiro 这一路目前"选得中、发不出"。
-/// 适配器补上之后，这条测试应当被真正跑通 Kiro 路的测试取代。
+/// 网关不替 Kiro 发请求：用量真相只有原生 `metadataEvent.tokenUsage` 一个来源，
+/// 既有通道已经在正确提取它，网关另起一套解析迟早与它对不上。
 #[tokio::test]
-async fn a_kiro_binding_currently_has_no_executor_and_fails() {
-    let f = fixture(vec![credit_binding("k", "kiro", 0)], vec![kiro_upstream()]);
+async fn a_kiro_route_is_handed_back_with_request_scoped_overrides() {
+    let mut kiro = kiro_upstream();
+    kiro.kiro_group = Some("team-a".into());
+    let f = fixture(vec![credit_binding("k", "kiro", 0)], vec![kiro]);
     credit_account(&f, 7, 0.0, Some(100.0));
 
-    // 用生产里真正在跑的执行器，而不是测试替身——替身不查 baseUrl，测不出真相。
-    let direct = crate::gateway::direct::DirectExecutor::new(
-        crate::gateway::execute::build_client(
-            Duration::from_secs(5),
-            crate::model::config::TlsBackend::Rustls,
-            None,
-        )
-        .unwrap(),
-    );
+    let fake = Fake::default();
     let result = dispatch(
         &f.service,
-        &direct,
+        &fake,
         WireProtocol::Anthropic,
         &request(),
         &ctx(),
@@ -704,13 +697,83 @@ async fn a_kiro_binding_currently_has_no_executor_and_fails() {
     )
     .await;
 
-    let Dispatched::Refused { status, reason } = result else {
-        panic!("Kiro 路目前没有执行器，不该成功：{result:?}");
+    let Dispatched::UseKiro(route) = result else {
+        panic!("Kiro 路该交回既有通道，实得 {result:?}");
     };
-    // 502「这些路都试过了」，不是 400「你的请求有问题」——客户端的请求没毛病。
-    assert_eq!(status, 502, "配置坏了不该赖到客户端头上");
-    assert!(
-        reason.contains("every eligible route failed"),
-        "实得：{reason}"
+    assert_eq!(route.upstream_model, "real-k", "覆盖成这一路的真实模型名");
+    assert_eq!(
+        route.group.as_deref(),
+        Some("team-a"),
+        "覆盖成这一路的凭据分组"
     );
+    assert!(fake.calls().is_empty(), "网关不该替 Kiro 发请求");
+
+    // 预留已经记在账上：先记账再执行，崩溃也不会丢掉这笔。
+    let reserved = account(&f, 7, BillingUnit::KiroCredit);
+    assert_eq!(reserved.in_flight, 1, "交回之前必须已经预留");
+
+    // 结算句柄指向的正是这条预留。
+    route
+        .settlement
+        .succeeded(Some("2.5".parse().unwrap()), None)
+        .unwrap();
+    let settled = account(&f, 7, BillingUnit::KiroCredit);
+    assert_eq!(settled.in_flight, 0);
+    assert_eq!(settled.used, "2.5".parse().unwrap(), "按原生积分结算");
+}
+
+/// 拿不到原生积分时记为待结算，**绝不用 0 顶替**——0 的意思是"确认没花钱"。
+#[tokio::test]
+async fn a_kiro_call_without_native_credits_settles_as_pending() {
+    let f = fixture(vec![credit_binding("k", "kiro", 0)], vec![kiro_upstream()]);
+    credit_account(&f, 7, 0.0, Some(100.0));
+
+    let fake = Fake::default();
+    let Dispatched::UseKiro(route) = dispatch(
+        &f.service,
+        &fake,
+        WireProtocol::Anthropic,
+        &request(),
+        &ctx(),
+        "r1",
+    )
+    .await
+    else {
+        panic!("应交回 Kiro 通道");
+    };
+
+    route.settlement.succeeded(None, None).unwrap();
+    let settled = account(&f, 7, BillingUnit::KiroCredit);
+    assert_eq!(settled.used, Amount::ZERO, "没有证据不得记为已用");
+    assert_eq!(settled.customer_pending, 1, "必须留下待结算义务");
+}
+
+/// 未提交的失败释放预留；已提交的失败保留义务。
+#[tokio::test]
+async fn a_kiro_failure_releases_only_when_nothing_reached_the_client() {
+    for (committed, expect_pending) in [(false, 0), (true, 1)] {
+        let f = fixture(vec![credit_binding("k", "kiro", 0)], vec![kiro_upstream()]);
+        credit_account(&f, 7, 0.0, Some(100.0));
+        let fake = Fake::default();
+        let Dispatched::UseKiro(route) = dispatch(
+            &f.service,
+            &fake,
+            WireProtocol::Anthropic,
+            &request(),
+            &ctx(),
+            "r1",
+        )
+        .await
+        else {
+            panic!("应交回 Kiro 通道");
+        };
+
+        route.settlement.failed(committed).unwrap();
+        let settled = account(&f, 7, BillingUnit::KiroCredit);
+        assert_eq!(settled.in_flight, 0, "committed={committed}");
+        assert_eq!(
+            settled.customer_pending, expect_pending,
+            "已向下游发过内容才保留义务；committed={committed}"
+        );
+    }
 }

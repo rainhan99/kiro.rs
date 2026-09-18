@@ -4,6 +4,19 @@ use crate::gateway::{
     RoutingMode, TokenPrices, Upstream, UpstreamKind,
 };
 use axum::http::StatusCode;
+
+impl Handled {
+    fn is_not_managed(&self) -> bool {
+        matches!(self, Self::NotManaged)
+    }
+    fn into_response_or_panic(self) -> Response {
+        match self {
+            Self::Response(response) => response,
+            Self::NotManaged => panic!("应被接管，实得 NotManaged"),
+            Self::UseKiro(_) => panic!("应由网关直接应答，实得 UseKiro"),
+        }
+    }
+}
 use std::path::PathBuf;
 
 fn temp(name: &str) -> PathBuf {
@@ -165,7 +178,7 @@ async fn an_unmanaged_alias_hands_the_request_back() {
         f.entry
             .handle(WireProtocol::Anthropic, body, 7, "r1".into())
             .await
-            .is_none()
+            .is_not_managed()
     );
     // 连 model 字段都没有时同样交回。
     assert!(
@@ -177,7 +190,7 @@ async fn an_unmanaged_alias_hands_the_request_back() {
                 "r2".into()
             )
             .await
-            .is_none()
+            .is_not_managed()
     );
 }
 
@@ -197,7 +210,7 @@ async fn a_managed_alias_is_served_and_charged() {
         .entry
         .handle(WireProtocol::Anthropic, body, 7, "r1".into())
         .await
-        .expect("应被接管");
+        .into_response_or_panic();
     assert_eq!(response.status(), StatusCode::OK);
 
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -230,7 +243,7 @@ async fn a_refusal_is_rendered_in_the_client_protocol() {
         .entry
         .handle(WireProtocol::Anthropic, body.clone(), 7, "r1".into())
         .await
-        .unwrap();
+        .into_response_or_panic();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -250,7 +263,7 @@ async fn a_refusal_is_rendered_in_the_client_protocol() {
         .entry
         .handle(WireProtocol::ChatCompletions, body, 7, "r2".into())
         .await
-        .unwrap();
+        .into_response_or_panic();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -292,7 +305,7 @@ async fn a_streamed_request_gets_an_event_stream_response() {
         .entry
         .handle(WireProtocol::Anthropic, body, 7, "r1".into())
         .await
-        .expect("应被接管");
+        .into_response_or_panic();
     assert_eq!(
         response
             .headers()
@@ -584,4 +597,210 @@ async fn without_a_gateway_the_legacy_limit_still_stops_at_auth() {
         .await
         .unwrap();
     assert_eq!(response.status(), 429);
+}
+
+/// Kiro 路的端到端：网关选路并预留 → 交回既有通道 → 既有通道执行失败 →
+/// 用量汇聚点把这笔**释放掉**，而不是留一条挂死的在飞记录。
+///
+/// 这里没有 KiroProvider，所以既有通道必然以 503 收场——正好用来验证失败侧的结算。
+/// 成功侧需要真实凭据与上游，不在离线测试范围内；那条路上的金额换算由
+/// `settlement` 的往返测试单独钉住。
+#[tokio::test]
+async fn a_kiro_route_reserves_then_releases_when_the_legacy_path_fails() {
+    let config_path = temp("config.json");
+    let ledger_path = temp("billing.db");
+    let kiro = Upstream {
+        id: "u1".into(),
+        name: "u1".into(),
+        kind: UpstreamKind::Kiro,
+        enabled: true,
+        weight: 10,
+        base_url: None,
+        api_key: None,
+        has_api_key: false,
+        allow_private_network: false,
+        kiro_group: Some("team-a".into()),
+        cache_usage_policy: None,
+    };
+    let mut credit = binding();
+    credit.billing_unit = BillingUnit::KiroCredit;
+    credit.cost_prices = None;
+    credit.sell_prices = None;
+    let config = GatewayConfig {
+        models: vec![PublicModel {
+            id: "opus5".into(),
+            display_name: None,
+            routing_mode: Some(RoutingMode::Sticky),
+            affinity_ttl_secs: None,
+            bindings: vec![credit],
+        }],
+        upstreams: vec![kiro],
+        ..GatewayConfig::default()
+    };
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let service = Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap());
+
+    let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    let key = keys.create_with_key("t".into(), None, None, "sk-test-key".into());
+    crate::gateway::import::import_opening_balances(
+        service.ledger().unwrap(),
+        &[crate::gateway::import::LegacyKeyBalance {
+            key_id: key.id,
+            used: 0.0,
+            limit: Some(100.0),
+        }],
+    )
+    .unwrap();
+
+    let client = crate::gateway::execute::build_client(
+        std::time::Duration::from_secs(5),
+        crate::model::config::TlsBackend::Rustls,
+        None,
+    )
+    .unwrap();
+    let app = crate::anthropic::create_router_with_shared_provider(
+        None, // 没有 KiroProvider：既有通道必然失败
+        false,
+        crate::model::config::ToolCompatibilityMode::default(),
+        Some(keys),
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(GatewayEntry::new(service.clone(), client))),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "sk-test-key")
+        .json(&serde_json::json!({
+            "model": "opus5", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503, "既有通道无可用 provider");
+
+    let account = service
+        .ledger()
+        .unwrap()
+        .accounts(key.id)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .expect("应有积分账户");
+    assert_eq!(account.in_flight, 0, "失败的预留必须被释放，不能挂死");
+    assert_eq!(
+        account.customer_pending, 0,
+        "没向下游发过内容就不该留下义务"
+    );
+    assert_eq!(account.used, crate::gateway::Amount::ZERO);
+
+    let _ = std::fs::remove_file(config_path);
+    let _ = std::fs::remove_file(ledger_path);
+}
+
+/// 上游报回一个记不进账本的 credit 值（NaN / 负数 / 小到 18 位小数放不下）：
+/// 记为**待结算**，绝不按 0 确认——0 的意思是"确认没花钱"，与"不知道花了多少"
+/// 是两回事，后者按 0 入账就是白送一次调用。
+///
+/// 这个分支在真实成功路径上才走得到，而那条路需要真实凭据，所以直接构造用量汇聚点
+/// 来打它。
+#[tokio::test]
+async fn an_unrepresentable_native_credit_settles_as_pending() {
+    use crate::gateway::ledger_types::{BoundKind, PriceSnapshot, ReservationInput};
+
+    let config_path = temp("config.json");
+    let ledger_path = temp("billing.db");
+    let mut credit = binding();
+    credit.billing_unit = BillingUnit::KiroCredit;
+    credit.cost_prices = None;
+    credit.sell_prices = None;
+    let config = GatewayConfig {
+        models: vec![PublicModel {
+            id: "opus5".into(),
+            display_name: None,
+            routing_mode: None,
+            affinity_ttl_secs: None,
+            bindings: vec![credit],
+        }],
+        upstreams: vec![Upstream {
+            kind: UpstreamKind::Kiro,
+            base_url: None,
+            api_key: None,
+            has_api_key: false,
+            ..upstream("unused")
+        }],
+        ..GatewayConfig::default()
+    };
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let service = Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap());
+    let ledger = service.ledger().unwrap();
+    crate::gateway::import::import_opening_balances(
+        ledger,
+        &[crate::gateway::import::LegacyKeyBalance {
+            key_id: 7,
+            used: 0.0,
+            limit: Some(100.0),
+        }],
+    )
+    .unwrap();
+    ledger
+        .reserve(ReservationInput {
+            request_id: "r1".into(),
+            attempt_id: "r1:1".into(),
+            key_id: 7,
+            unit: BillingUnit::KiroCredit,
+            public_model: "opus5".into(),
+            upstream_id: "u1".into(),
+            upper_bound: None,
+            bound_kind: BoundKind::Unknown,
+            snapshot: PriceSnapshot {
+                config_revision: 1,
+                price_revision: 1,
+                binding_id: "b1".into(),
+                upstream_kind: UpstreamKind::Kiro,
+                upstream_model: "real-model".into(),
+                cost_prices: None,
+                sell_prices: None,
+            },
+        })
+        .unwrap();
+
+    let hook = crate::anthropic::handlers::UsageRecordHook {
+        recorder: None,
+        aggregator: None,
+        client_keys: None,
+        key_id: 7,
+        model: "opus5".into(),
+        started_at: std::time::Instant::now(),
+        settlement: Some(Arc::new(crate::gateway::settlement::Settlement::new(
+            service.clone(),
+            "r1:1".into(),
+            BillingUnit::KiroCredit,
+        ))),
+    };
+    // 成功，但上游报回的 credit 记不进账本。
+    hook.record(1, 100, 50, 0, 0, f64::NAN, "success");
+
+    let account = ledger
+        .accounts(7)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .unwrap();
+    assert_eq!(account.in_flight, 0);
+    assert_eq!(
+        account.used,
+        crate::gateway::Amount::ZERO,
+        "换算不了就不该按 0 确认计费"
+    );
+    assert_eq!(account.customer_pending, 1, "必须留下待结算义务");
+
+    let _ = std::fs::remove_file(config_path);
+    let _ = std::fs::remove_file(ledger_path);
 }
