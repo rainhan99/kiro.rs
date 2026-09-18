@@ -796,6 +796,26 @@ credential.proxyUrl -> config.proxyUrl -> direct
 <a id="updates-release"></a>
 ## 在线更新和发布
 
+### 三个工作流分别产出什么
+
+| 工作流 | 何时跑 | 产出在哪 |
+| --- | --- | --- |
+| **Build Artifacts** | 推送 master 自动跑 | 该次 run 页面的 **Artifacts** 区，版本是 `beta-<短 sha>` |
+| **Build and Push Docker Hub Images** | 推送 master 自动跑 | Docker Hub（未配 secrets 时自动跳过） |
+| **Release** | **只有**手动触发或推 `v*` tag 才跑 | 仓库的 **Releases** 页面，附带各平台产物与 `SHA256SUMS.txt` |
+
+**推 master 不会产生 Release。** 那两个自动工作流出的是开发构建，产物挂在各自 run 页面的
+Artifacts 区，不会出现在 Releases 页面——Releases 是空的通常说明 Release 工作流还没跑过，
+而不是跑完没产物。
+
+要出正式版：**Actions → Release → Run workflow**，`level` 选 `patch` / `minor` / `major`
+（或 `none` + 填 `version` 发布 `Cargo.toml` 里的现值）。
+
+每个 run 的页面上都有一段摘要，写明这次是哪个版本、产物在哪；运行列表里的标题也显示
+版本而不是提交标题。
+
+### Release workflow 做的事
+
 发布 tag `vX.Y.Z` 会触发 Release workflow：
 
 ### 版本号与自动递增

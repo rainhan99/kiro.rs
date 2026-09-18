@@ -1,5 +1,9 @@
 name: Build and Push Docker Hub Images
 
+run-name: >-
+  ${{ inputs.version && format('镜像 v{0}（手动）', inputs.version)
+      || '开发镜像 beta（master 推送）' }}
+
 on:
   push:
     branches:

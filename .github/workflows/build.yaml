@@ -1,5 +1,11 @@
 name: Build Artifacts
 
+# 运行列表默认拿 commit 标题当名字，于是每一行都显示那条提交说了什么，
+# 而不是这次构建产出的是哪个版本。这里显式给出。
+run-name: >-
+  ${{ inputs.version && format('构建 v{0}（手动）', inputs.version)
+      || '开发构建 beta（master 推送）' }}
+
 on:
   push:
     branches:
@@ -168,6 +174,26 @@ jobs:
         env:
           RUSTFLAGS: ${{ contains(matrix.target, 'linux-gnu') && '-C link-arg=-fuse-ld=mold' || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+
+      # run 页面要能自己说清「这是什么、产物在哪、正式发版怎么做」，
+      # 否则只能从运行列表的提交标题去猜，而那句话说的是提交、不是构建。
+      - name: Summarise this build
+        shell: bash
+        run: |
+          {
+            echo "## ${{ matrix.name }} · \`${{ steps.version.outputs.version }}\`"
+            echo
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "手动构建，版本由触发时指定。"
+            else
+              echo "**这是 master 推送的开发构建**，版本号是 \`beta-<短 sha>\`，不是发布版本。"
+              echo
+              echo "产物在本页的 **Artifacts** 区（不是仓库的 Releases 页面）。"
+              echo "要出正式 Release：**Actions → Release → Run workflow**，选 \`level\`"
+              echo "（patch / minor / major，或 \`none\` 用 Cargo.toml 里的现值）。"
+              echo "只有那个工作流会打标签、建 Release 并挂上产物。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

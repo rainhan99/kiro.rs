@@ -1,5 +1,12 @@
 name: Release
 
+# 标签触发时名字就是标签；手动触发时显示要进哪一位——这两件事看一眼就该知道，
+# 不该去翻日志。
+run-name: >-
+  ${{ github.ref_type == 'tag' && format('发布 {0}', github.ref_name)
+      || (inputs.level == 'none' && format('发布 {0}（指定版本）', inputs.version)
+          || format('发布（{0} 进位）', inputs.level)) }}
+
 on:
   push:
     tags:
@@ -169,6 +176,19 @@ jobs:
           echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
           echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+
+          # 这次到底发的是哪个版本、打在哪个提交上，run 页面第一屏就该看得到。
+          {
+            echo "## 发布 ${TAG}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| 版本 | \`${VERSION}\` |"
+            echo "| 标签 | \`${TAG}\` |"
+            echo "| 打在提交 | \`${TARGET}\` |"
+            echo "| 预发布 | ${PRERELEASE} |"
+            echo "| 镜像 | \`${NAMESPACE}/kiro-rs:${VERSION}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build-frontend:
     name: Build admin-ui
@@ -529,3 +549,15 @@ jobs:
             --title "Kiro.rs ${{ needs.prepare.outputs.version }}" \
             --notes-file RELEASE_NOTES.md \
             "${PRERELEASE_ARGS[@]}"
+
+          # 挂上去的到底是哪几个文件，直接列出来——发布成功却没有产物是最难查的一种。
+          {
+            echo "## 已发布 ${{ needs.prepare.outputs.tag }}"
+            echo
+            echo "<${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.prepare.outputs.tag }}>"
+            echo
+            echo "### 随发布上传的文件"
+            echo '```'
+            (cd release-assets && ls -1)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
