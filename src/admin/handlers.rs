@@ -1624,6 +1624,33 @@ pub async fn list_traces(
 /// GET /api/admin/traces/failure-stats
 /// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
 /// 返回 { "<credentialId>": { auth, throttle, other }, ... }
+/// 被动分母校准的观测汇总。
+///
+/// 返回的是**在已见样本上对上游算术的观察**，不是实测或公布的上游上限：每条都带样本
+/// 数与 min/max 跨度，调用方必须连同样本数一起解读。跨度大说明百分比并非简单比例，
+/// 此时均值不可当作窗口使用。本接口只读，不改任何配置，也不参与准入判定。
+pub async fn context_calibration(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.trace_store.calibration_aggregates() {
+        Ok(aggregates) => axum::Json(serde_json::json!({
+            "observations": aggregates,
+            "source": "passive-observation",
+            "note": "derived from ordinary traffic only; no probe requests. An implied window is an observation over the listed sample count, not a measured or published upstream limit, and does not feed admission.",
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "could not read passive calibration observations");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(super::types::AdminErrorResponse::new(
+                    "internal_error",
+                    "could not read calibration observations",
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoResponse {
     let stats = state.trace_store.failure_stats();
     let map: std::collections::HashMap<String, serde_json::Value> = stats

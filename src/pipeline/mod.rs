@@ -1,5 +1,6 @@
 //! Configurable request preparation and final-wire inspection. No upstream probes.
 pub mod artifacts;
+pub mod calibration;
 pub mod config;
 pub mod images;
 pub mod inspect;

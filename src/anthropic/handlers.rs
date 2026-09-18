@@ -250,6 +250,10 @@ impl RequestTracer {
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
+        let final_endpoint = attempts
+            .last()
+            .map(|a| a.endpoint.clone())
+            .unwrap_or_else(|| "unknown".to_string());
         let first_token_ms = self
             .first_token_at
             .lock()
@@ -298,6 +302,26 @@ impl RequestTracer {
                     "cacheWriteInputTokens": usage.cache_creation_tokens
                 }),
             ));
+        }
+        // 被动分母校准：只有当本次响应同时给出了完整的原生用量与一个可用的上下文
+        // 百分比时才产出样本。样本来自本来就会发生的请求，没有任何探测流量。
+        // 校准只观察：它不改配置，也不会自己流入准入判定。
+        if let Some(sample) = crate::pipeline::calibration::derive_sample(
+            &self.model,
+            &final_endpoint,
+            evidence.iter().find_map(|(kind, value)| {
+                (*kind == "context_observation")
+                    .then(|| value.get("percentage").and_then(serde_json::Value::as_f64))
+                    .flatten()
+            }),
+            // 估算值不能用来反推上游算术；只认 metadataEvent 的真值。
+            (usage.source == UsageSource::Provider).then(|| {
+                usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens
+            }),
+            final_status == "success",
+        ) && let Err(error) = store.record_calibration_sample(&sample)
+        {
+            tracing::warn!(%error, "could not persist passive calibration sample");
         }
         for (kind, value) in evidence.drain(..) {
             if let Err(error) = store.record_pipeline_evidence(&self.trace_id, kind, &value) {

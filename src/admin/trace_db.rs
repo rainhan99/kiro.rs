@@ -462,6 +462,69 @@ impl TraceStore {
         Ok(())
     }
 
+    /// 记录一条被动校准样本。
+    ///
+    /// 与 trace 证据不同，聚合值**独立于 trace 保留期**：trace 清理掉之后观测仍然有效，
+    /// 因为它描述的是上游算术而不是某一次请求。这里不存单条样本，只累加聚合量。
+    pub fn record_calibration_sample(
+        &self,
+        sample: &crate::pipeline::calibration::CalibrationSample,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !sample.model.is_empty() && sample.model.len() <= 128,
+            "invalid calibration model"
+        );
+        anyhow::ensure!(
+            !sample.endpoint.is_empty() && sample.endpoint.len() <= 64,
+            "invalid calibration endpoint"
+        );
+        let window = i64::try_from(sample.implied_window_tokens)
+            .map_err(|_| anyhow::anyhow!("implied window out of range"))?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO context_calibration (model, endpoint, samples, min_window, max_window, sum_window, last_seen) \
+             VALUES (?1, ?2, 1, ?3, ?3, ?3, ?4) \
+             ON CONFLICT(model, endpoint) DO UPDATE SET \
+               samples    = samples + 1, \
+               min_window = MIN(min_window, excluded.min_window), \
+               max_window = MAX(max_window, excluded.max_window), \
+               sum_window = sum_window + excluded.sum_window, \
+               last_seen  = excluded.last_seen",
+            rusqlite::params![
+                sample.model,
+                sample.endpoint,
+                window,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 全部观测汇总，按样本数降序。样本数必须与数值一同呈现。
+    pub fn calibration_aggregates(
+        &self,
+    ) -> anyhow::Result<Vec<crate::pipeline::calibration::CalibrationAggregate>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model, endpoint, samples, min_window, max_window, sum_window, last_seen \
+             FROM context_calibration ORDER BY samples DESC, model ASC LIMIT 256",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let samples: i64 = row.get(2)?;
+            let sum: i64 = row.get(5)?;
+            Ok(crate::pipeline::calibration::CalibrationAggregate {
+                model: row.get(0)?,
+                endpoint: row.get(1)?,
+                samples: samples.max(0) as u64,
+                min_window_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                max_window_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                mean_window_tokens: if samples > 0 { (sum / samples).max(0) as u64 } else { 0 },
+                last_seen: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Chronological evidence for an existing trace; the query remains bounded even for old DBs.
     pub fn pipeline_evidence(&self, trace_id: &str) -> anyhow::Result<Vec<Value>> {
         let conn = self.conn.lock();
@@ -915,6 +978,16 @@ CREATE TABLE IF NOT EXISTS trace_pipeline_evidence (
     evidence TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_evidence_trace ON trace_pipeline_evidence(trace_id, id);
+CREATE TABLE IF NOT EXISTS context_calibration (
+    model      TEXT NOT NULL,
+    endpoint   TEXT NOT NULL,
+    samples    INTEGER NOT NULL,
+    min_window INTEGER NOT NULL,
+    max_window INTEGER NOT NULL,
+    sum_window INTEGER NOT NULL,
+    last_seen  TEXT NOT NULL,
+    PRIMARY KEY (model, endpoint)
+);
 ";
 
 const SCHEMA: &str = "
@@ -966,6 +1039,68 @@ CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::calibration::CalibrationSample;
+
+    fn calibration_sample(window: u64) -> CalibrationSample {
+        CalibrationSample {
+            model: "claude-sonnet-4".into(),
+            endpoint: "ide".into(),
+            percentage: 25.0,
+            native_input_tokens: window / 4,
+            implied_window_tokens: window,
+        }
+    }
+
+    /// 聚合必须与样本数一同呈现，且 min/max 跨度要保留——跨度本身是「百分比是否
+    /// 简单比例」的信号，被均值抹掉就没法判断该不该采信。
+    #[test]
+    fn calibration_aggregate_keeps_spread_and_sample_count() {
+        let store = TraceStore::open_in_memory().unwrap();
+        assert!(store.calibration_aggregates().unwrap().is_empty());
+
+        for window in [180_000_u64, 200_000, 220_000] {
+            store.record_calibration_sample(&calibration_sample(window)).unwrap();
+        }
+        let aggregates = store.calibration_aggregates().unwrap();
+        assert_eq!(aggregates.len(), 1);
+        let a = &aggregates[0];
+        assert_eq!(a.samples, 3);
+        assert_eq!(a.min_window_tokens, 180_000);
+        assert_eq!(a.max_window_tokens, 220_000);
+        assert_eq!(a.mean_window_tokens, 200_000);
+        assert_eq!(a.model, "claude-sonnet-4");
+        assert_eq!(a.endpoint, "ide");
+    }
+
+    /// 不同模型 / 端点各自独立聚合，不得混算。
+    #[test]
+    fn calibration_is_scoped_per_model_and_endpoint() {
+        let store = TraceStore::open_in_memory().unwrap();
+        store.record_calibration_sample(&calibration_sample(200_000)).unwrap();
+        let mut other = calibration_sample(1_000_000);
+        other.model = "claude-opus-4.8".into();
+        store.record_calibration_sample(&other).unwrap();
+        let mut other_endpoint = calibration_sample(200_000);
+        other_endpoint.endpoint = "cli".into();
+        store.record_calibration_sample(&other_endpoint).unwrap();
+
+        let aggregates = store.calibration_aggregates().unwrap();
+        assert_eq!(aggregates.len(), 3, "模型与端点各自成条目");
+        assert!(aggregates.iter().all(|a| a.samples == 1));
+    }
+
+    /// 空标识拒绝写入，避免聚合表被无主条目污染。
+    #[test]
+    fn calibration_rejects_blank_identifiers() {
+        let store = TraceStore::open_in_memory().unwrap();
+        let mut blank = calibration_sample(200_000);
+        blank.model = String::new();
+        assert!(store.record_calibration_sample(&blank).is_err());
+        let mut blank = calibration_sample(200_000);
+        blank.endpoint = String::new();
+        assert!(store.record_calibration_sample(&blank).is_err());
+        assert!(store.calibration_aggregates().unwrap().is_empty());
+    }
 
     struct TraceSample<'a> {
         trace_id: &'a str,
