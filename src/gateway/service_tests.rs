@@ -1,4 +1,6 @@
 use super::*;
+use crate::gateway::import::LegacyKeyBalance;
+use crate::gateway::ledger_types::{BoundKind, PriceSnapshot, ReservationInput};
 use crate::gateway::{BillingUnit, Upstream, UpstreamKind};
 use std::path::PathBuf;
 
@@ -174,9 +176,17 @@ fn a_managed_alias_produces_a_frozen_plan() {
     assert_eq!(plan.candidates.len(), 2);
 
     // 上游停用时，挂在它下面的绑定也不可用——否则会选中一个明确被关掉的去处。
-    let b2 = plan.candidates.iter().find(|c| c.binding_id == "b2").unwrap();
+    let b2 = plan
+        .candidates
+        .iter()
+        .find(|c| c.binding_id == "b2")
+        .unwrap();
     assert!(!b2.enabled, "上游停用应连带让绑定不可用");
-    let b1 = plan.candidates.iter().find(|c| c.binding_id == "b1").unwrap();
+    let b1 = plan
+        .candidates
+        .iter()
+        .find(|c| c.binding_id == "b1")
+        .unwrap();
     assert!(b1.enabled);
 
     assert_eq!(plan.binding("b1").unwrap().upstream_model, "real-model-b1");
@@ -249,7 +259,11 @@ fn only_meaning_changing_updates_bump_the_routing_generation() {
     heavier.upstreams[0].weight = 500;
     let revision = service.snapshot().revision;
     service.update_config(revision, heavier).unwrap();
-    assert_eq!(service.routing().generation(), before, "调权重不该踢掉在途会话");
+    assert_eq!(
+        service.routing().generation(),
+        before,
+        "调权重不该踢掉在途会话"
+    );
 
     // 改路由模式：作废。
     let mut switched = configured(
@@ -259,7 +273,10 @@ fn only_meaning_changing_updates_bump_the_routing_generation() {
     switched.default_routing_mode = RoutingMode::WeightedRandom;
     let revision = service.snapshot().revision;
     service.update_config(revision, switched).unwrap();
-    assert!(service.routing().generation() > before, "模式变化必须作废绑定");
+    assert!(
+        service.routing().generation() > before,
+        "模式变化必须作废绑定"
+    );
     let _ = std::fs::remove_file(config_path);
     let _ = std::fs::remove_file(ledger_path);
 }
@@ -299,6 +316,93 @@ fn public_models_report_capabilities_honestly() {
     assert!(!models[0].supports_reasoning);
     assert_eq!(models[0].context_window, 100_000, "窗口取最小者");
     assert_eq!(models[0].max_output_tokens, 4_000);
+    let _ = std::fs::remove_file(config_path);
+    let _ = std::fs::remove_file(ledger_path);
+}
+
+/// 惰性网关的启动收尾必须是**彻底的空操作**：不建账本文件、不报错、不声称做了什么。
+/// 未配置网关的部署不因为引入这个特性而改变任何行为。
+#[test]
+fn a_lazy_gateway_adopts_nothing_at_startup() {
+    let (service, config_path, ledger_path) = service_with(None);
+    let adoption = service
+        .adopt_legacy_state(&[LegacyKeyBalance {
+            key_id: 1,
+            used: 3.0,
+            limit: Some(10.0),
+        }])
+        .unwrap();
+    assert_eq!(adoption, StartupAdoption::default());
+    assert!(!ledger_path.exists(), "惰性状态下不该创建账本");
+    let _ = std::fs::remove_file(config_path);
+}
+
+/// 配置过的网关在启动时把遗留余额搬进账本，并认领上个进程遗留的在飞预留。
+#[test]
+fn a_configured_gateway_adopts_balances_and_orphaned_reservations() {
+    let (service, config_path, ledger_path) = service_with(Some(configured(
+        vec![model("opus5", vec![binding("b1", "u1", true)])],
+        vec![upstream("u1", true)],
+    )));
+
+    let adoption = service
+        .adopt_legacy_state(&[LegacyKeyBalance {
+            key_id: 7,
+            used: 3.5,
+            limit: Some(10.0),
+        }])
+        .unwrap();
+    assert_eq!(adoption.import.imported, vec![7]);
+    assert!(adoption.import.sealed);
+    assert_eq!(adoption.recovered_in_flight, 0, "没有遗留预留时不该虚报");
+
+    let ledger = service.ledger().unwrap();
+    let account = ledger
+        .accounts(7)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .expect("遗留 Key 应已立户");
+    assert_eq!(account.available, Some("6.5".parse().unwrap()));
+
+    // 模拟上个进程崩在"已预留、未结算"处：留下一条在飞记录。
+    ledger
+        .reserve(ReservationInput {
+            request_id: "orphan".into(),
+            attempt_id: "orphan:1".into(),
+            key_id: 7,
+            unit: BillingUnit::KiroCredit,
+            public_model: "opus5".into(),
+            upstream_id: "u1".into(),
+            upper_bound: None,
+            bound_kind: BoundKind::Unknown,
+            snapshot: PriceSnapshot {
+                config_revision: 1,
+                price_revision: 1,
+                binding_id: "b1".into(),
+                upstream_kind: UpstreamKind::Kiro,
+                upstream_model: "real-model-b1".into(),
+                cost_prices: None,
+                sell_prices: None,
+            },
+        })
+        .unwrap();
+    assert_eq!(ledger.accounts(7).unwrap()[0].in_flight, 1);
+
+    // 再启动一次：认领那条孤儿预留，且封存后不再重复导入。
+    let again = service.adopt_legacy_state(&[]).unwrap();
+    assert_eq!(
+        again.recovered_in_flight, 1,
+        "上个进程遗留的预留必须被认领，而不是当作没发生过"
+    );
+    assert!(again.import.sealed);
+    assert_eq!(again.import.imported, Vec::<u64>::new());
+
+    // 认领 = 转成待结算，不是释放：这笔消耗可能真的发生过。
+    let account = &ledger.accounts(7).unwrap()[0];
+    assert_eq!(account.in_flight, 0);
+    assert_eq!(account.customer_pending, 1, "不得被当作没发生过释放掉");
+
     let _ = std::fs::remove_file(config_path);
     let _ = std::fs::remove_file(ledger_path);
 }

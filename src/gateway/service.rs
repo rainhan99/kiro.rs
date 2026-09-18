@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::config_store::{ConfigSnapshot, ConfigStore};
+use super::import::{ImportReport, LegacyKeyBalance, import_opening_balances};
 use super::ledger::Ledger;
 use super::routing::{Candidate, RoutingEngine};
 use super::{GatewayConfig, ModelBinding, PublicModel, RoutingMode};
@@ -58,6 +59,14 @@ impl RequestPlan {
     }
 }
 
+/// 启动收尾的如实结果。
+#[derive(Debug, Default, PartialEq)]
+pub struct StartupAdoption {
+    /// 上个进程遗留、本次转成待结算的预留笔数。
+    pub recovered_in_flight: u64,
+    pub import: ImportReport,
+}
+
 pub struct GatewayService {
     config: ConfigStore,
     routing: RoutingEngine,
@@ -88,6 +97,26 @@ impl GatewayService {
             config,
             routing,
             ledger,
+        })
+    }
+
+    /// 启动时的一次性收尾，在开始接受请求**之前**做完。
+    ///
+    /// 两件事都只在账本存在时发生。惰性网关没有账本，这里必须是彻底的空操作——
+    /// 未配置网关的部署不因为引入这个特性而改变任何行为。
+    ///
+    /// 一、认领上个进程遗留的在飞预留。预留先于发送，所以崩溃时账本上会留下一条
+    /// in-flight 记录；它代表一次**可能已经发生**的消耗，转成待结算等人工或证据
+    /// 裁决，而不是当作没发生过释放掉。
+    ///
+    /// 二、为尚未立户的遗留 Key 建立积分开账余额（见 [`super::import`]）。
+    pub fn adopt_legacy_state(&self, keys: &[LegacyKeyBalance]) -> Result<StartupAdoption> {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return Ok(StartupAdoption::default());
+        };
+        Ok(StartupAdoption {
+            recovered_in_flight: ledger.recover_inflight()?,
+            import: import_opening_balances(ledger, keys)?,
         })
     }
 

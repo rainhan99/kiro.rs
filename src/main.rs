@@ -254,6 +254,44 @@ async fn main() {
             std::process::exit(1);
         }),
     );
+    // 启动收尾必须在开始接受请求**之前**做完：先认领上个进程遗留的在飞预留，
+    // 再为尚未立户的遗留 Key 建立积分开账余额。失败与网关初始化同样致命——
+    // 带着一笔来历不明的在飞预留、或者一批还没立户的 Key 开始收费，是错的。
+    {
+        let balances: Vec<gateway::import::LegacyKeyBalance> = client_key_manager
+            .list()
+            .iter()
+            .map(|k| gateway::import::LegacyKeyBalance {
+                key_id: k.id,
+                used: k.total_credits,
+                limit: k.max_credits,
+            })
+            .collect();
+        let adoption = gateway.adopt_legacy_state(&balances).unwrap_or_else(|e| {
+            tracing::error!("网关启动收尾失败: {:#}", e);
+            std::process::exit(1);
+        });
+        if adoption.recovered_in_flight > 0 {
+            tracing::warn!(
+                count = adoption.recovered_in_flight,
+                "认领上次运行遗留的在飞预留，已转为待结算"
+            );
+        }
+        if !adoption.import.imported.is_empty() {
+            tracing::info!(
+                count = adoption.import.imported.len(),
+                "已为遗留 Key 建立积分开账余额"
+            );
+        }
+        for (id, reason) in &adoption.import.rejected {
+            tracing::error!(
+                key_id = id,
+                "遗留积分数字无法记入账本，该 Key 未立户（迁移保持未封存，修好后重启可补）: {}",
+                reason
+            );
+        }
+    }
+
     {
         let managed = gateway.public_models();
         if managed.is_empty() {
