@@ -5,6 +5,7 @@ pub mod amount;
 pub mod config;
 pub mod config_store;
 pub mod coordinator;
+pub mod execute;
 pub mod import;
 pub mod ledger;
 pub mod protocol;
