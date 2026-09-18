@@ -77,7 +77,9 @@ fn fingerprints_ignore_headers_but_separate_wire_from_static_prefix() {
     let mut headers = http::HeaderMap::new();
     headers.insert("amz-sdk-invocation-id", "changed".parse().unwrap());
     headers.insert("authorization", "Bearer SECRET".parse().unwrap());
-    let c = p.audit(&body.to_string(), "ide", 2, &headers, None).unwrap();
+    let c = p
+        .audit(&body.to_string(), "ide", 2, &headers, None)
+        .unwrap();
     assert_eq!(b["wireFingerprint"], c["wireFingerprint"]);
     assert!(!c.to_string().contains("SECRET"));
     assert!(!c.to_string().contains("secret-profile"));
@@ -92,7 +94,9 @@ fn fingerprints_ignore_headers_but_separate_wire_from_static_prefix() {
     ] {
         let mut next = body.clone();
         *next.pointer_mut(pointer).unwrap() = json!(changed);
-        let audit = p.audit(&next.to_string(), "ide", 2, &headers, None).unwrap();
+        let audit = p
+            .audit(&next.to_string(), "ide", 2, &headers, None)
+            .unwrap();
         assert_ne!(audit["scopeFingerprint"], c["scopeFingerprint"]); // G diagnostic partition only.
     }
 }
@@ -144,8 +148,12 @@ fn offline_abce_prove_construction_not_cache_hits() {
         },
     ]);
     let c = fixture_wire(&p, &mut c);
-    let aa = p.audit(&a, "ide", 1, &http::HeaderMap::new(), None).unwrap();
-    let cc = p.audit(&c, "ide", 1, &http::HeaderMap::new(), None).unwrap();
+    let aa = p
+        .audit(&a, "ide", 1, &http::HeaderMap::new(), None)
+        .unwrap();
+    let cc = p
+        .audit(&c, "ide", 1, &http::HeaderMap::new(), None)
+        .unwrap();
     assert_eq!(aa["staticPrefixFingerprint"], cc["staticPrefixFingerprint"]);
     assert_eq!(aa["metrics"]["cachePointCount"], 1);
     assert_eq!(aa["cacheHitProven"], false);
@@ -469,7 +477,10 @@ fn unknown_model_ceiling_is_reported_as_unknown() {
     let audit = p
         .audit(&wire.to_string(), "ide", 1, &http::HeaderMap::new(), None)
         .unwrap();
-    assert_eq!(audit["tokenMetrics"]["maxInputTokens"], serde_json::Value::Null);
+    assert_eq!(
+        audit["tokenMetrics"]["maxInputTokens"],
+        serde_json::Value::Null
+    );
     assert_eq!(audit["tokenMetrics"]["headroom"], serde_json::Value::Null);
     assert!(audit["tokenMetrics"]["total"].as_u64().unwrap() > 0);
 }
@@ -482,7 +493,13 @@ fn known_ceiling_yields_headroom_that_may_go_negative() {
         "content":"问题正文".repeat(50)
     }}}});
     let audit = p
-        .audit(&wire.to_string(), "ide", 1, &http::HeaderMap::new(), Some(1))
+        .audit(
+            &wire.to_string(),
+            "ide",
+            1,
+            &http::HeaderMap::new(),
+            Some(1),
+        )
         .unwrap();
     let total = audit["tokenMetrics"]["total"].as_i64().unwrap();
     assert_eq!(audit["tokenMetrics"]["maxInputTokens"], 1);
@@ -494,12 +511,19 @@ fn known_ceiling_yields_headroom_that_may_go_negative() {
 #[test]
 fn byte_and_token_dimensions_stay_separately_labelled() {
     let p = RequestPipeline::new(config::PipelineConfig::default());
-    let wire = json!({"conversationState":{"currentMessage":{"userInputMessage":{"content":"问题"}}}});
+    let wire =
+        json!({"conversationState":{"currentMessage":{"userInputMessage":{"content":"问题"}}}});
     let audit = p
         .audit(&wire.to_string(), "ide", 1, &http::HeaderMap::new(), None)
         .unwrap();
-    assert!(audit["metrics"]["bodyBytes"].as_u64().unwrap() > 0, "字节口径仍在");
-    assert!(audit["tokenMetrics"]["total"].as_u64().unwrap() > 0, "token 口径并列");
+    assert!(
+        audit["metrics"]["bodyBytes"].as_u64().unwrap() > 0,
+        "字节口径仍在"
+    );
+    assert!(
+        audit["tokenMetrics"]["total"].as_u64().unwrap() > 0,
+        "token 口径并列"
+    );
     assert_eq!(
         audit["tokenMetrics"]["source"], "estimate",
         "token 分项是估算，必须自带标注，不得被读成原生用量"
@@ -525,7 +549,10 @@ fn admission_refuses_above_the_declared_ceiling() {
     let p = admitting_pipeline();
     let wire = admission_wire(500);
     let estimated = measure_wire_tokens(&wire).unwrap().total;
-    assert!(p.admit(&wire, Some(estimated as i64)).is_ok(), "恰好等于上限应放行");
+    assert!(
+        p.admit(&wire, Some(estimated as i64)).is_ok(),
+        "恰好等于上限应放行"
+    );
     let err = p.admit(&wire, Some(estimated as i64 - 1)).unwrap_err();
     let message = err.to_string();
     assert!(message.contains("local_token_admission"));
@@ -541,7 +568,10 @@ fn admission_does_not_refuse_without_a_declared_ceiling() {
     let p = admitting_pipeline();
     let wire = admission_wire(5000);
     assert!(p.admit(&wire, None).is_ok(), "未知上限不得拦截");
-    assert!(p.admit(&wire, Some(0)).is_ok(), "0 视为无有效声明，不得当成零配额拦死");
+    assert!(
+        p.admit(&wire, Some(0)).is_ok(),
+        "0 视为无有效声明，不得当成零配额拦死"
+    );
     assert!(p.admit(&wire, Some(-1)).is_ok());
 }
 
@@ -571,25 +601,52 @@ fn tool_result_payload(body: &str) -> crate::anthropic::types::MessagesRequest {
         model: "claude-sonnet-4.5".into(),
         max_tokens: 1024,
         messages: vec![
-            Message { role: "user".into(), content: json!("读文件") },
-            Message { role: "assistant".into(), content: json!([
-                {"type":"tool_use","id":"t1","name":"read","input":{"path":"/a"}}]) },
-            Message { role: "user".into(), content: json!([
-                {"type":"tool_result","tool_use_id":"t1","content": body}]) },
+            Message {
+                role: "user".into(),
+                content: json!("读文件"),
+            },
+            Message {
+                role: "assistant".into(),
+                content: json!([
+                {"type":"tool_use","id":"t1","name":"read","input":{"path":"/a"}}]),
+            },
+            Message {
+                role: "user".into(),
+                content: json!([
+                {"type":"tool_result","tool_use_id":"t1","content": body}]),
+            },
         ],
-        stream: false, system: None, tools: None, tool_choice: None, thinking: None,
-        output_config: None, metadata: None, cache_control: None,
+        stream: false,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: None,
+        cache_control: None,
     }
 }
 
-fn body_for(payload: &crate::anthropic::types::MessagesRequest, cfg: &config::PipelineConfig) -> String {
+fn body_for(
+    payload: &crate::anthropic::types::MessagesRequest,
+    cfg: &config::PipelineConfig,
+) -> String {
     let converted = crate::anthropic::converter::convert_request_with_pipeline(
-        payload, crate::model::config::ToolCompatibilityMode::Raw, cfg).unwrap();
-    serialize_request(payload, &KiroRequest {
-        conversation_state: converted.conversation_state,
-        profile_arn: None,
-        additional_model_request_fields: converted.additional_model_request_fields,
-    }, cfg).unwrap()
+        payload,
+        crate::model::config::ToolCompatibilityMode::Raw,
+        cfg,
+    )
+    .unwrap();
+    serialize_request(
+        payload,
+        &KiroRequest {
+            conversation_state: converted.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: converted.additional_model_request_fields,
+        },
+        cfg,
+    )
+    .unwrap()
 }
 
 /// 开启恢复策略后，修正体应当真的不同于原体（分片生效）。
@@ -601,8 +658,12 @@ fn recovery_body_applies_the_lossless_correction() {
     let payload = tool_result_payload(&"工具输出的一行\n".repeat(2000));
     let original = body_for(&payload, &cfg);
     let corrected = crate::pipeline::recovery_body(
-        &payload, crate::model::config::ToolCompatibilityMode::Raw, &cfg, &original)
-        .expect("超长工具结果应产出修正体");
+        &payload,
+        crate::model::config::ToolCompatibilityMode::Raw,
+        &cfg,
+        &original,
+    )
+    .expect("超长工具结果应产出修正体");
     assert_ne!(corrected, original);
     // 稳态形状不受影响：原体仍是单条目。
     assert_eq!(original.matches("\"text\"").count(), 1);
@@ -618,16 +679,30 @@ fn recovery_body_refuses_to_resend_identical_bytes() {
     // 工具结果很短，分片无从下手 → 修正体与原体一致 → 不得重发。
     let payload = tool_result_payload("short");
     let original = body_for(&payload, &cfg);
-    assert!(crate::pipeline::recovery_body(
-        &payload, crate::model::config::ToolCompatibilityMode::Raw, &cfg, &original).is_none());
+    assert!(
+        crate::pipeline::recovery_body(
+            &payload,
+            crate::model::config::ToolCompatibilityMode::Raw,
+            &cfg,
+            &original
+        )
+        .is_none()
+    );
 
     // 分片已在稳态启用时，重试产出的也是同样的字节 → 同样不得重发。
     let mut already = cfg.clone();
     already.tool_results.strategy = config::ToolResultStrategy::LosslessChunks;
     let payload = tool_result_payload(&"工具输出的一行\n".repeat(2000));
     let original = body_for(&payload, &already);
-    assert!(crate::pipeline::recovery_body(
-        &payload, crate::model::config::ToolCompatibilityMode::Raw, &already, &original).is_none());
+    assert!(
+        crate::pipeline::recovery_body(
+            &payload,
+            crate::model::config::ToolCompatibilityMode::Raw,
+            &already,
+            &original
+        )
+        .is_none()
+    );
 }
 
 /// 默认关闭时永不产出修正体。
@@ -636,6 +711,162 @@ fn recovery_body_is_inert_while_disabled() {
     let cfg = config::PipelineConfig::default();
     let payload = tool_result_payload(&"工具输出的一行\n".repeat(2000));
     let original = body_for(&payload, &cfg);
-    assert!(crate::pipeline::recovery_body(
-        &payload, crate::model::config::ToolCompatibilityMode::Raw, &cfg, &original).is_none());
+    assert!(
+        crate::pipeline::recovery_body(
+            &payload,
+            crate::model::config::ToolCompatibilityMode::Raw,
+            &cfg,
+            &original
+        )
+        .is_none()
+    );
+}
+
+// ---------- 末尾 assistant（prefill）----------
+
+fn prefill_request() -> MessagesRequest {
+    serde_json::from_value(json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "Question one"},
+            {"role": "assistant", "content": "I'll start by"}
+        ]
+    }))
+    .unwrap()
+}
+
+/// 默认拒绝，且**一个字都不丢**。
+///
+/// 0.9.0 及更早是静默截断到最后一条 user：请求看起来成功，客户端给的那段开头
+/// 却被扔掉了，模型表现异常而没人知道为什么。
+#[test]
+fn a_trailing_assistant_turn_is_refused_by_default() {
+    let mut payload = prefill_request();
+    let before = payload.messages.len();
+    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+
+    // `ContextSession` 刻意不实现 Debug——它持有转存的原文，实现 Debug 等于
+    // 给内容开一条进日志的路。所以这里用 let-else 而不是 unwrap_err。
+    let Err(error) = pipeline.prepare(&mut payload, 1) else {
+        panic!("末尾 assistant 必须被拒绝");
+    };
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("assistant prefill"), "{rendered}");
+    assert!(
+        rendered.contains("no messages have been dropped"),
+        "要说清什么都没丢：{rendered}"
+    );
+    assert_eq!(payload.messages.len(), before, "拒绝的请求不得被改动");
+}
+
+/// 错误里要带**角色序列**，否则分不清这是刻意的开头续写还是别的形状被误判。
+/// 序列里只有 role，内容一个字都不出现。
+#[test]
+fn the_refusal_names_the_role_sequence_without_any_content() {
+    let mut payload = prefill_request();
+    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+    let Err(error) = pipeline.prepare(&mut payload, 1) else {
+        panic!("末尾 assistant 必须被拒绝");
+    };
+    let rendered = format!("{error:#}");
+
+    assert!(
+        rendered.contains("Roles received: [user, assistant]"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("Question one") && !rendered.contains("I'll start by"),
+        "错误里不得出现任何消息内容：{rendered}"
+    );
+    // 并且要告诉运维怎么改回旧行为。
+    assert!(rendered.contains("requestPipeline.prefill"), "{rendered}");
+}
+
+/// 长会话的角色序列要折叠，不能把整段历史铺开。
+#[test]
+fn a_long_conversation_folds_its_role_sequence() {
+    let mut messages = Vec::new();
+    for _ in 0..10 {
+        messages.push(json!({"role": "user", "content": "q"}));
+        messages.push(json!({"role": "assistant", "content": "a"}));
+    }
+    let mut payload: MessagesRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4", "max_tokens": 100, "messages": messages
+    }))
+    .unwrap();
+    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+    let Err(error) = pipeline.prepare(&mut payload, 1) else {
+        panic!("末尾 assistant 必须被拒绝");
+    };
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("…12 more…"), "中段应折叠：{rendered}");
+}
+
+/// 显式选择 `drop` 时恢复 0.9.0 的行为：截断到最后一条 user 继续。
+#[test]
+fn choosing_drop_restores_the_pre_0_9_1_truncation() {
+    let mut cfg = config::PipelineConfig::default();
+    cfg.prefill = config::PrefillStrategy::Drop;
+    let pipeline = RequestPipeline::new(cfg);
+    let mut payload = prefill_request();
+
+    assert!(
+        pipeline.prepare(&mut payload, 1).is_ok(),
+        "选了 drop 就不该报错"
+    );
+    let converted = crate::anthropic::converter::convert_request_with_pipeline(
+        &payload,
+        crate::model::config::ToolCompatibilityMode::Raw,
+        &pipeline.config,
+    )
+    .expect("转换应当成功");
+    // 转换器截断到最后一条 user；payload 本身没有被就地改写。
+    assert_eq!(payload.messages.len(), 2, "prepare 不该就地删消息");
+    assert!(
+        !serde_json::to_string(&converted.conversation_state)
+            .unwrap()
+            .contains("I'll start by"),
+        "被丢弃的 prefill 不该出现在送出的请求里"
+    );
+}
+
+/// prefill 的处理与 `mode` **正交**：把预算强制关掉，不等于同意悄悄丢内容。
+///
+/// 这两件事此前是绑在一起的——`mode` 一旦不是 enforce，`prepare` 就提前返回，
+/// 转换器那条静默丢弃路径接管，同一份配置在两条路径上表现不同。
+#[test]
+fn turning_off_enforcement_does_not_silently_re_enable_dropping() {
+    for mode in [
+        config::PipelineMode::Off,
+        config::PipelineMode::Audit,
+        config::PipelineMode::Enforce,
+    ] {
+        let mut cfg = config::PipelineConfig::default();
+        cfg.mode = mode;
+        let pipeline = RequestPipeline::new(cfg);
+        let mut payload = prefill_request();
+        assert!(
+            pipeline.prepare(&mut payload, 1).is_err(),
+            "{mode:?}：prefill 默认拒绝，与 mode 无关"
+        );
+    }
+}
+
+/// 转换器是最后一道：`prepare()` 不在调用路径上时（内部轮次、compaction 通道）
+/// 由它兜住，免得同一份配置在两条路径上表现不同。
+#[test]
+fn the_converter_refuses_too_when_prepare_is_not_in_the_path() {
+    let cfg = config::PipelineConfig::default();
+    let payload = prefill_request();
+    let error = crate::anthropic::converter::convert_request_with_pipeline(
+        &payload,
+        crate::model::config::ToolCompatibilityMode::Raw,
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error}").contains("assistant prefill"),
+        "实得：{error}"
+    );
 }

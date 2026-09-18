@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+/// 末尾出现 assistant 消息（prefill）时怎么办。
+///
+/// Kiro 不支持 assistant prefill。0.9.0 及更早的转换器**静默截断**到最后一条 user
+/// 就继续了——请求看起来成功，但客户端给出的那段开头被悄悄扔掉，模型表现异常而
+/// 没人知道为什么。请求管线随后改为拒绝，于是同一个请求在升级后从"能跑"变成"报错"。
+///
+/// 这两种处理各有道理，但**不该由 `mode` 顺带决定**。它是一个独立的选择，
+/// 所以单独成项：默认拒绝（不丢内容），需要旧行为的可以显式改回。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefillStrategy {
+    /// 报错，一个字都不丢。
+    #[default]
+    Refuse,
+    /// 截断到最后一条 user 继续。这是 0.9.0 及更早的行为。
+    Drop,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PipelineMode {
@@ -210,6 +228,10 @@ pub struct WireLimits {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct PipelineConfig {
     pub mode: PipelineMode,
+    /// 末尾 assistant 消息的处理方式。与 `mode` 正交——关掉预算强制不等于
+    /// 同意悄悄丢内容。
+    #[serde(default)]
+    pub prefill: PrefillStrategy,
     pub strip_billing_header: bool,
     pub cache_strategy: CacheStrategy,
     pub agent_mode: String,
@@ -230,6 +252,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             mode: PipelineMode::Enforce,
+            prefill: PrefillStrategy::Refuse,
             strip_billing_header: true,
             cache_strategy: CacheStrategy::Off,
             agent_mode: "vibe".into(),

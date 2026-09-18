@@ -2,14 +2,14 @@
 pub mod artifacts;
 pub mod calibration;
 pub mod chunked_map;
-pub mod tool_catalog;
 pub mod config;
 pub mod images;
 pub mod inspect;
+pub mod tool_catalog;
 
 use crate::anthropic::types::MessagesRequest;
 use crate::kiro::model::requests::kiro::KiroRequest;
-use config::{CacheStrategy, PipelineConfig, PipelineMode};
+use config::{CacheStrategy, PipelineConfig, PipelineMode, PrefillStrategy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -80,14 +80,24 @@ impl RequestPipeline {
     ) -> anyhow::Result<Option<artifacts::ContextSession>> {
         anyhow::ensure!(payload.max_tokens > 0, "max_tokens must be greater than 0");
         crate::anthropic::handlers::override_thinking_from_model_name(payload);
+        // prefill 的处理与 `mode` 正交：关掉预算强制不等于同意悄悄丢内容，
+        // 所以这条判定在 mode 的早退之前。
+        if self.config.prefill == PrefillStrategy::Refuse
+            && payload.messages.last().is_some_and(|m| m.role != "user")
+        {
+            // 把**角色序列**附在错误里（只有 role，不含任何内容）：光说"不支持 prefill"
+            // 无法分辨这是客户端刻意的开头续写，还是某种被误判的形状。
+            anyhow::bail!(
+                "Kiro does not support assistant prefill; supply a final user turn \
+                 (no messages have been dropped). Roles received: [{}]. \
+                 Set requestPipeline.prefill to \"drop\" to restore the pre-0.9.1 behaviour \
+                 of truncating to the last user turn.",
+                role_sequence(&payload.messages)
+            );
+        }
         if self.config.mode != PipelineMode::Enforce {
             return Ok(None);
         }
-        // Refuse unsupported prefill rather than silently deleting instructions.
-        anyhow::ensure!(
-            payload.messages.last().is_none_or(|m| m.role == "user"),
-            "Kiro does not support assistant prefill; supply a final user turn (no messages have been dropped)"
-        );
         if self.config.strip_billing_header {
             if let Some(first) = payload.system.as_mut().and_then(|s| s.first_mut()) {
                 first.text = strip_billing_line(&first.text).to_string();
@@ -774,7 +784,13 @@ pub fn measure_wire(body: &str) -> anyhow::Result<WireMetrics> {
                     m.largest_tool_result_bytes =
                         m.largest_tool_result_bytes.max(value.to_string().len());
                 }
-                ["userInputMessageContext", "toolResults", "*", "content", "*"] => {
+                [
+                    "userInputMessageContext",
+                    "toolResults",
+                    "*",
+                    "content",
+                    "*",
+                ] => {
                     m.tool_result_entry_count += 1;
                 }
                 ["cachePoint"] | ["userInputMessageContext", "tools", "*", "cachePoint"]
@@ -816,3 +832,18 @@ pub fn measure_wire(body: &str) -> anyhow::Result<WireMetrics> {
 
 #[cfg(test)]
 mod tests;
+
+/// 角色序列，长序列中段折叠。绝不包含消息内容。
+fn role_sequence(messages: &[crate::anthropic::types::Message]) -> String {
+    const EDGE: usize = 4;
+    let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+    if roles.len() <= EDGE * 2 + 1 {
+        return roles.join(", ");
+    }
+    format!(
+        "{}, …{} more…, {}",
+        roles[..EDGE].join(", "),
+        roles.len() - EDGE * 2,
+        roles[roles.len() - EDGE..].join(", ")
+    )
+}

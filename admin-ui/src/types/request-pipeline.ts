@@ -1,5 +1,7 @@
 export interface PipelineConfig {
   mode: 'off' | 'audit' | 'enforce'
+  /** 末尾 assistant 消息（prefill）的处理。与 mode 正交。 */
+  prefill: 'refuse' | 'drop'
   stripBillingHeader: boolean
   cacheStrategy: 'off' | 'static-prefix'
   agentMode: 'vibe' | 'spec'

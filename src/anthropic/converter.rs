@@ -757,6 +757,7 @@ pub fn convert_request_with_mode(
         tool_compatibility_mode,
         false,
         crate::pipeline::config::ToolResultConfig::default(),
+        crate::pipeline::config::PrefillStrategy::default(),
         ConversionPurpose::Generate,
     )
 }
@@ -771,6 +772,7 @@ pub fn convert_request_with_pipeline(
         mode,
         config.mode == crate::pipeline::config::PipelineMode::Enforce,
         config.tool_results.clone(),
+        config.prefill,
         ConversionPurpose::Generate,
     )
 }
@@ -790,6 +792,7 @@ pub(crate) fn convert_request_with_purpose(
         mode,
         config.mode == crate::pipeline::config::PipelineMode::Enforce,
         config.tool_results.clone(),
+        config.prefill,
         purpose,
     )
 }
@@ -799,6 +802,7 @@ fn convert_request_inner(
     tool_compatibility_mode: ToolCompatibilityMode,
     preserve: bool,
     tool_results_config: crate::pipeline::config::ToolResultConfig,
+    prefill: crate::pipeline::config::PrefillStrategy,
     purpose: ConversionPurpose,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
@@ -815,10 +819,20 @@ fn convert_request_inner(
         return Err(ConversionError::EmptyMessages);
     }
 
-    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
-    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
+    // 2.5. 末尾 assistant（prefill）：Claude 4.x 已弃用，Kiro API 也不支持。
+    //
+    // 怎么处理由 `requestPipeline.prefill` 决定，与管线的 `mode` 无关——关掉预算
+    // 强制不等于同意悄悄丢内容。这里是最后一道：`prepare()` 不在调用路径上时
+    // （内部轮次、compaction 通道）由它兜住，免得同一份配置两条路径表现不同。
     let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
-        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
+        if prefill == crate::pipeline::config::PrefillStrategy::Refuse {
+            return Err(ConversionError::InvalidMessageSequence(
+                "Kiro does not support assistant prefill; supply a final user turn \
+                 (no messages have been dropped)"
+                    .to_string(),
+            ));
+        }
+        tracing::info!("检测到末尾 assistant 消息（prefill），按配置丢弃并截断到最后一条 user");
         let last_user_idx = req
             .messages
             .iter()

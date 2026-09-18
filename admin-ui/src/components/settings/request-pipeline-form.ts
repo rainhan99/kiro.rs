@@ -76,7 +76,9 @@ export function validateDraft(draft: PipelineDraft): { config?: PipelineConfig; 
   }
   if (Object.keys(errors).length) return { errors }
   return { errors, config: {
-    mode: draft.mode as PipelineConfig['mode'], stripBillingHeader: draft.stripBillingHeader === true,
+    mode: draft.mode as PipelineConfig['mode'],
+    prefill: (draft.prefill as PipelineConfig['prefill']) || 'refuse',
+    stripBillingHeader: draft.stripBillingHeader === true,
     cacheStrategy: draft.cacheStrategy as PipelineConfig['cacheStrategy'], agentMode: draft.agentMode as PipelineConfig['agentMode'],
     ingressMaxBytes: n('ingressMaxBytes'),
     limits: { bodyBytes: numbers['limits.bodyBytes'], textFieldBytes: numbers['limits.textFieldBytes'], toolResultBytes: numbers['limits.toolResultBytes'], imageBase64Bytes: numbers['limits.imageBase64Bytes'] },
