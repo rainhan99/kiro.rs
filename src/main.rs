@@ -283,6 +283,25 @@ async fn main() {
                 "已为遗留 Key 建立积分开账余额"
             );
         }
+        // Key 的 id 一旦在账本上出现过就永不重用：`next_id` 是按存活 Key 推的，
+        // 删掉 id 最大的 Key 再重启，新建的 Key 会拿到同一个 id，连同前一个
+        // 同 id Key 的余额与历史一起继承。
+        match gateway.highest_recorded_key_id() {
+            Ok(Some(highest)) => {
+                if client_key_manager.reserve_ids_through(highest) {
+                    tracing::info!(
+                        highest,
+                        "已把新建 Key 的 id 下界抬到账本记录之上，避免重用已删 Key 的身份"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!("读取账本最大 key id 失败: {error:#}");
+                std::process::exit(1);
+            }
+        }
+
         for (id, reason) in &adoption.import.rejected {
             tracing::error!(
                 key_id = id,

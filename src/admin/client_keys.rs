@@ -428,6 +428,23 @@ impl ClientKeyManager {
         Some(snapshot)
     }
 
+    /// 保证此后新建的 Key 不会用到 `highest` 及以下的 id。
+    ///
+    /// `next_id` 是按**存活** Key 的最大 id 推出来的，所以删掉 id 最大的那个 Key
+    /// 再重启，下一个新建的 Key 会拿到同一个 id——连同账本里前一个同 id Key 的
+    /// 余额与历史。账本记得所有出现过的 key_id，启动时用它把下界抬上来。
+    ///
+    /// 返回是否真的抬高了。
+    pub fn reserve_ids_through(&self, highest: u64) -> bool {
+        let mut inner = self.inner.write();
+        if inner.next_id > highest {
+            return false;
+        }
+        inner.next_id = highest + 1;
+        self.save_locked(&inner);
+        true
+    }
+
     /// 重置计数（保留 Key 与名称）
     pub fn reset_stats(&self, id: u64) -> bool {
         let mut inner = self.inner.write();

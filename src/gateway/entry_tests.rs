@@ -804,3 +804,140 @@ async fn an_unrepresentable_native_credit_settles_as_pending() {
     let _ = std::fs::remove_file(config_path);
     let _ = std::fs::remove_file(ledger_path);
 }
+
+/// 已删 Key 的身份**永不重用**。
+///
+/// `next_id` 是按存活 Key 的最大 id 推出来的，所以删掉 id 最大的那个 Key 再重启，
+/// 下一个新建的 Key 会拿到同一个 id——连同账本里前一个同 id Key 的余额与历史。
+/// 账本记得所有出现过的 key_id，启动时用它把下界抬上来。
+#[tokio::test]
+async fn a_deleted_key_id_is_never_handed_to_a_new_key() {
+    let keys_path = temp("keys.json");
+    let config_path = temp("config.json");
+    let ledger_path = temp("billing.db");
+    let mut credit = binding();
+    credit.billing_unit = BillingUnit::KiroCredit;
+    credit.cost_prices = None;
+    credit.sell_prices = None;
+    let config = GatewayConfig {
+        models: vec![PublicModel {
+            id: "opus5".into(),
+            display_name: None,
+            routing_mode: None,
+            affinity_ttl_secs: None,
+            bindings: vec![credit],
+        }],
+        upstreams: vec![Upstream {
+            kind: UpstreamKind::Kiro,
+            base_url: None,
+            api_key: None,
+            has_api_key: false,
+            ..upstream("unused")
+        }],
+        ..GatewayConfig::default()
+    };
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let service = Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap());
+
+    // 三个 Key，第三个在账本上有余额。
+    let keys = crate::admin::client_keys::ClientKeyManager::load(keys_path.clone()).unwrap();
+    for name in ["a", "b", "c"] {
+        keys.create(name.into(), None, None);
+    }
+    crate::gateway::import::import_opening_balances(
+        service.ledger().unwrap(),
+        &[crate::gateway::import::LegacyKeyBalance {
+            key_id: 3,
+            used: 40.0,
+            limit: Some(100.0),
+        }],
+    )
+    .unwrap();
+
+    // 删掉 id 最大的那个，然后重启（重新 load）。
+    assert!(keys.delete(3));
+    drop(keys);
+    let reloaded = crate::admin::client_keys::ClientKeyManager::load(keys_path.clone()).unwrap();
+
+    // 没有这道保护的话，新建的 Key 会拿到 id 3。
+    let highest = service.highest_recorded_key_id().unwrap().unwrap();
+    assert_eq!(highest, 3, "账本记得 3 号出现过");
+    assert!(reloaded.reserve_ids_through(highest), "下界应被抬高");
+
+    let fresh = reloaded.create("d".into(), None, None);
+    assert_eq!(fresh.id, 4, "绝不能重用 3 号——那会继承前一个 Key 的余额");
+
+    // 3 号的历史仍在账本上，没有因为 Key 被删而消失。
+    let account = service
+        .ledger()
+        .unwrap()
+        .accounts(3)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .expect("删 Key 不该删掉账本历史");
+    assert_eq!(account.used, "40".parse().unwrap());
+
+    let _ = std::fs::remove_file(keys_path);
+    let _ = std::fs::remove_file(config_path);
+    let _ = std::fs::remove_file(ledger_path);
+}
+
+/// 「重置统计」碰不到账本：它只清分析视图，恢复不了财务额度。
+#[tokio::test]
+async fn resetting_stats_cannot_restore_ledger_balance() {
+    let keys_path = temp("keys.json");
+    let config_path = temp("config.json");
+    let ledger_path = temp("billing.db");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&GatewayConfig {
+            models: vec![PublicModel {
+                id: "opus5".into(),
+                display_name: None,
+                routing_mode: None,
+                affinity_ttl_secs: None,
+                bindings: vec![binding()],
+            }],
+            upstreams: vec![upstream("https://api.example.test")],
+            ..GatewayConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let service = GatewayService::open(&config_path, &ledger_path).unwrap();
+
+    let keys = crate::admin::client_keys::ClientKeyManager::load(keys_path.clone()).unwrap();
+    let key = keys.create("a".into(), None, None);
+    keys.record_usage(key.id, 10, 10, 0, 0, 7.5);
+    crate::gateway::import::import_opening_balances(
+        service.ledger().unwrap(),
+        &[crate::gateway::import::LegacyKeyBalance {
+            key_id: key.id,
+            used: 7.5,
+            limit: Some(10.0),
+        }],
+    )
+    .unwrap();
+
+    assert!(keys.reset_stats(key.id));
+
+    let account = service
+        .ledger()
+        .unwrap()
+        .accounts(key.id)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.policy.unit == BillingUnit::KiroCredit)
+        .unwrap();
+    assert_eq!(
+        account.used,
+        "7.5".parse().unwrap(),
+        "重置统计只清分析视图，动不了账本"
+    );
+    assert_eq!(account.available, Some("2.5".parse().unwrap()));
+
+    let _ = std::fs::remove_file(keys_path);
+    let _ = std::fs::remove_file(config_path);
+    let _ = std::fs::remove_file(ledger_path);
+}

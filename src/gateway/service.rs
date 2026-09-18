@@ -120,6 +120,17 @@ impl GatewayService {
         })
     }
 
+    /// 账本里出现过的最大 key id。惰性网关下为 `None`。
+    ///
+    /// 用来防止已删 Key 的 id 被重新分配——那会把前一个同 id Key 的余额与历史
+    /// 交给一个毫无关系的新 Key。
+    pub fn highest_recorded_key_id(&self) -> Result<Option<u64>> {
+        match self.ledger.as_ref() {
+            Some(ledger) => ledger.max_recorded_key_id(),
+            None => Ok(None),
+        }
+    }
+
     pub fn snapshot(&self) -> ConfigSnapshot {
         self.config.snapshot()
     }
