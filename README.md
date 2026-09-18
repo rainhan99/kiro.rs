@@ -799,8 +799,8 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 校验 `Cargo.toml` 版本和 tag 一致。
 - 构建 Admin UI。
 - 构建多平台二进制。
-- 构建并推送 Docker Hub 多架构镜像。
-- 创建 GitHub Release。
+- 构建并推送 Docker Hub 多架构镜像（**可选**：仓库未配置 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets 时自动跳过）。
+- 创建 GitHub Release（**不受镜像发布影响**：应用内在线更新只读 GitHub Release，所以镜像跳过或失败都不会扣住它）。
 
 本仓库自 v0.9.0 起独立开发，不再跟随上游；应用内在线更新指向
 [本仓库的 Release](https://github.com/rainhan99/kiro.rs/releases/latest)。

@@ -28,7 +28,25 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      has_dockerhub: ${{ steps.dockerhub.outputs.has_dockerhub }}
     steps:
+      # Job-level `if` cannot read the secrets context. Without Docker Hub
+      # credentials this workflow has nothing to publish, so it skips quietly
+      # instead of failing on every push to master.
+      - name: Detect Docker Hub credentials
+        id: dockerhub
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "has_dockerhub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Docker Hub credentials are not configured; skipping beta image build."
+            echo "has_dockerhub=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
@@ -45,7 +63,7 @@ jobs:
 
   build:
     needs: pre-check
-    if: needs.pre-check.outputs.should_build == 'true'
+    if: needs.pre-check.outputs.should_build == 'true' && needs.pre-check.outputs.has_dockerhub == 'true'
     runs-on: ${{ matrix.runner }}
 
     strategy:

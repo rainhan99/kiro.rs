@@ -33,9 +33,29 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       target: ${{ steps.meta.outputs.target }}
+      has_dockerhub: ${{ steps.dockerhub.outputs.has_dockerhub }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Job-level `if` cannot read the secrets context, so presence is probed
+      # once here and passed on as a plain boolean. Publishing images is
+      # optional: a fork without Docker Hub credentials must still be able to
+      # cut a GitHub Release, because that is what in-app self-update reads.
+      - name: Detect Docker Hub credentials
+        id: dockerhub
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "has_dockerhub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Docker Hub credentials are not configured; image jobs will be skipped and the GitHub Release will still publish."
+            echo "has_dockerhub=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Validate version
         id: meta
@@ -242,6 +262,7 @@ jobs:
     needs:
       - prepare
       - build-artifacts
+    if: needs.prepare.outputs.has_dockerhub == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -308,6 +329,7 @@ jobs:
     needs:
       - prepare
       - build-images
+    if: needs.prepare.outputs.has_dockerhub == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Log in to Docker Hub
@@ -340,6 +362,10 @@ jobs:
       - prepare
       - build-artifacts
       - publish-image-manifest
+    # Images are an optional distribution channel; the GitHub Release is what
+    # in-app self-update reads. A skipped or failed image job must not withhold
+    # the release, so this depends on the artifacts only and tolerates the rest.
+    if: ${{ !cancelled() && needs.build-artifacts.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
