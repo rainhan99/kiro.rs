@@ -50,6 +50,36 @@ impl Default for ArtifactConfig {
     }
 }
 
+/// 工具声明的发送策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolCatalogStrategy {
+    /// 既有行为：一次性发送全部工具 schema。
+    #[default]
+    Inline,
+    /// 声明体积超过 `budgetBytes` 时改为分页目录 + 按需揭示。
+    ///
+    /// **可达性无损**：没有工具被移除，网关也不替模型判断哪些工具重要。代价是选工具
+    /// 时看到的是名称与描述而非完整 schema，且够到一个工具要多花轮次。
+    OnDemand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolCatalogConfig {
+    pub strategy: ToolCatalogStrategy,
+    /// 全部工具序列化后的字节预算；超过才启用按需发现。
+    pub budget_bytes: usize,
+}
+impl Default for ToolCatalogConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ToolCatalogStrategy::Inline,
+            budget_bytes: 131_072,
+        }
+    }
+}
+
 /// 发送前的 token 准入策略。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -156,6 +186,7 @@ pub struct PipelineConfig {
     pub tool_results: ToolResultConfig,
     pub admission: AdmissionStrategy,
     pub recovery: RecoveryStrategy,
+    pub tool_catalog: ToolCatalogConfig,
     pub audit_enabled: bool,
     pub allow_simulated_cache: bool,
     pub kiro_only: bool,
@@ -174,6 +205,7 @@ impl Default for PipelineConfig {
             tool_results: ToolResultConfig::default(),
             admission: AdmissionStrategy::Off,
             recovery: RecoveryStrategy::Off,
+            tool_catalog: ToolCatalogConfig::default(),
             audit_enabled: true,
             allow_simulated_cache: false,
             kiro_only: true,
@@ -248,6 +280,11 @@ impl PipelineConfig {
                 "active toolResults.chunkBytes must fit limits.toolResultBytes"
             );
         }
+        let c = &self.tool_catalog;
+        anyhow::ensure!(
+            (1024..=100 * 1024 * 1024).contains(&c.budget_bytes),
+            "requestPipeline.toolCatalog.budgetBytes must be between 1024 and 104857600"
+        );
         Ok(())
     }
 }

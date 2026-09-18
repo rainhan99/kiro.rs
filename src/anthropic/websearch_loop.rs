@@ -234,8 +234,11 @@ impl ToolRoundDisposition {
 }
 
 fn is_server_tool(name: &str) -> bool {
-    name == "web_search" || is_internal_tool(name)
+    name == "web_search" || is_internal_tool(name) || crate::pipeline::tool_catalog::is_catalog_tool(name)
 }
+
+/// 目录轮次上限。模型可以反复列目录与索取 schema，但不能无限循环下去。
+const MAX_CATALOG_ROUNDS: usize = 8;
 
 /// Client calls must be handed back before another model round: their results
 /// are not available locally, so continuing would create unpaired history.
@@ -244,9 +247,21 @@ fn tool_round_disposition(
     context_limit: Option<usize>,
     context_rounds: usize,
     search_rounds: usize,
+    catalog_rounds: usize,
 ) -> ToolRoundDisposition {
     if tool_uses.is_empty() || tool_uses.iter().any(|tool| !is_server_tool(&tool.name)) {
         return ToolRoundDisposition::Flush;
+    }
+    // 目录调用由网关本地执行，与检索同样需要继续下一轮；但轮次有上限。
+    if tool_uses
+        .iter()
+        .any(|tool| crate::pipeline::tool_catalog::is_catalog_tool(&tool.name))
+    {
+        return if catalog_rounds < MAX_CATALOG_ROUNDS {
+            ToolRoundDisposition::Continue
+        } else {
+            ToolRoundDisposition::ContextLimitExceeded
+        };
     }
     let has_context = tool_uses.iter().any(|tool| is_internal_tool(&tool.name));
     if has_context {
@@ -716,6 +731,25 @@ fn append_server_round(
         content: Value::Array(tool_results),
     });
     Ok(())
+}
+
+fn execute_catalog_tool(
+    catalog: Option<&mut crate::pipeline::tool_catalog::CatalogSession>,
+    tool: &CompletedToolUse,
+) -> Value {
+    let result = match catalog {
+        Some(session) => session.execute(&tool.name, &tool.input),
+        None => Err(anyhow::anyhow!("tool catalog session is unavailable")),
+    };
+    match result {
+        Ok(value) => json!({
+            "type": "tool_result", "tool_use_id": tool.id, "content": value.to_string()
+        }),
+        Err(error) => json!({
+            "type": "tool_result", "tool_use_id": tool.id, "is_error": true,
+            "content": json!({"error": "tool_catalog_error", "message": error.to_string()}).to_string()
+        }),
+    }
 }
 
 fn execute_context_tool(
@@ -1500,6 +1534,7 @@ pub(super) async fn run_web_search_loop(
         group,
         tool_compatibility_mode,
         None,
+        None,
     )
     .await
 }
@@ -1514,7 +1549,8 @@ pub async fn run_context_loop(
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
-    context: ContextSession,
+    context: Option<ContextSession>,
+    catalog: Option<crate::pipeline::tool_catalog::CatalogSession>,
 ) -> Response {
     run_server_tool_loop(
         provider,
@@ -1524,7 +1560,8 @@ pub async fn run_context_loop(
         stream_client,
         group,
         tool_compatibility_mode,
-        Some(context),
+        context,
+        catalog,
     )
     .await
 }
@@ -1538,6 +1575,7 @@ async fn run_server_tool_loop(
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
     context: Option<ContextSession>,
+    catalog: Option<crate::pipeline::tool_catalog::CatalogSession>,
 ) -> Response {
     if !stream_client {
         return run_web_search_loop_inner(
@@ -1548,6 +1586,7 @@ async fn run_server_tool_loop(
             group,
             tool_compatibility_mode,
             context,
+            catalog,
             None,
         )
         .await;
@@ -1578,6 +1617,7 @@ async fn run_server_tool_loop(
                 group,
                 tool_compatibility_mode,
                 context,
+                catalog,
                 Some(&mut emitter),
             ))
             .catch_unwind(),
@@ -1619,8 +1659,10 @@ async fn run_web_search_loop_inner(
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
     context: Option<ContextSession>,
+    mut catalog: Option<crate::pipeline::tool_catalog::CatalogSession>,
     mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Response {
+    let mut catalog_rounds = 0_usize;
     let mut presentation: Vec<Value> = Vec::new();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
@@ -1729,6 +1771,7 @@ async fn run_web_search_loop_inner(
             context_limit,
             context_rounds,
             search_rounds,
+            catalog_rounds,
         );
         if let Some((error_type, message)) = disposition.error() {
             settlement.finish("error", "error", Some(outcome::UNKNOWN), Some(message));
@@ -1784,6 +1827,9 @@ async fn run_web_search_loop_inner(
                     // SSE receiver can cancel before another retrieval starts.
                     tokio::task::yield_now().await;
                     tool_results.push(execute_context_tool(context.as_ref(), tu, context_rounds));
+                } else if crate::pipeline::tool_catalog::is_catalog_tool(&tu.name) {
+                    tokio::task::yield_now().await;
+                    tool_results.push(execute_catalog_tool(catalog.as_mut(), tu));
                 }
             }
         }
@@ -1812,6 +1858,17 @@ async fn run_web_search_loop_inner(
             }
             if round.tool_uses.iter().any(|tool| tool.name == "web_search") {
                 search_rounds += 1;
+            }
+            if round
+                .tool_uses
+                .iter()
+                .any(|tool| crate::pipeline::tool_catalog::is_catalog_tool(&tool.name))
+            {
+                catalog_rounds += 1;
+                // 被揭示的工具从下一轮起才真正声明给上游，否则模型拿到 schema 也调不了。
+                if let Some(session) = catalog.as_ref() {
+                    payload.tools = Some(session.active_tools());
+                }
             }
             continue;
         }
@@ -2463,23 +2520,23 @@ mod tests {
     fn context_round_limit_errors_only_while_internal_work_remains() {
         let context_only = vec![tu("kiro_context_read")];
         assert_eq!(
-            tool_round_disposition(&context_only, Some(2), 1, 0),
+            tool_round_disposition(&context_only, Some(2), 1, 0, 0),
             ToolRoundDisposition::Continue
         );
-        let exhausted = tool_round_disposition(&context_only, Some(2), 2, 0);
+        let exhausted = tool_round_disposition(&context_only, Some(2), 2, 0, 0);
         assert_eq!(exhausted, ToolRoundDisposition::ContextLimitExceeded);
         assert_eq!(exhausted.error().unwrap().0, "context_round_limit_exceeded");
         assert_eq!(
-            tool_round_disposition(&[], Some(2), 2, 0),
+            tool_round_disposition(&[], Some(2), 2, 0, 0),
             ToolRoundDisposition::Flush
         );
         assert_eq!(
-            tool_round_disposition(&context_only, None, 0, 0),
+            tool_round_disposition(&context_only, None, 0, 0, 0),
             ToolRoundDisposition::ContextUnavailable
         );
         let mixed = vec![tu("kiro_context_read"), tu("web_search"), tu("exec")];
         assert_eq!(
-            tool_round_disposition(&mixed, Some(2), 2, 0),
+            tool_round_disposition(&mixed, Some(2), 2, 0, 0),
             ToolRoundDisposition::Flush
         );
     }
@@ -2488,15 +2545,15 @@ mod tests {
     fn context_and_search_have_independent_round_limits() {
         let combined = vec![tu("kiro_context_read"), tu("web_search")];
         assert_eq!(
-            tool_round_disposition(&combined, Some(2), 0, 1),
+            tool_round_disposition(&combined, Some(2), 0, 1, 0),
             ToolRoundDisposition::Continue
         );
         assert_eq!(
-            tool_round_disposition(&combined, Some(2), 2, 1),
+            tool_round_disposition(&combined, Some(2), 2, 1, 0),
             ToolRoundDisposition::ContextLimitExceeded
         );
         assert_eq!(
-            tool_round_disposition(&combined, Some(2), 0, MAX_WEB_SEARCH_ROUNDS),
+            tool_round_disposition(&combined, Some(2), 0, MAX_WEB_SEARCH_ROUNDS, 0),
             ToolRoundDisposition::SearchLimitExceeded
         );
         assert_eq!(
@@ -2504,9 +2561,34 @@ mod tests {
                 &[tu("kiro_context_read")],
                 Some(2),
                 0,
-                MAX_WEB_SEARCH_ROUNDS
+                MAX_WEB_SEARCH_ROUNDS,
+                0
             ),
             ToolRoundDisposition::Continue
+        );
+    }
+
+    /// 目录调用由网关本地执行，应当继续下一轮；到达上限后不再继续。
+    #[test]
+    fn catalog_calls_continue_until_the_round_limit() {
+        let catalog = [tu(crate::pipeline::tool_catalog::LIST_TOOL)];
+        assert_eq!(
+            tool_round_disposition(&catalog, None, 0, 0, 0),
+            ToolRoundDisposition::Continue,
+            "目录不依赖 artifact 会话，没有 context 也应继续"
+        );
+        assert_eq!(
+            tool_round_disposition(&catalog, None, 0, 0, MAX_CATALOG_ROUNDS),
+            ToolRoundDisposition::ContextLimitExceeded
+        );
+        // 混入客户端工具时必须交还，不得再进服务端轮次。
+        let mixed = [
+            tu(crate::pipeline::tool_catalog::REVEAL_TOOL),
+            tu("client_tool"),
+        ];
+        assert_eq!(
+            tool_round_disposition(&mixed, None, 0, 0, 0),
+            ToolRoundDisposition::Flush
         );
     }
 
@@ -2521,7 +2603,7 @@ mod tests {
         round.known_tool_names = names(&["kiro_context_read", "exec"]);
         reclaim_round_tool_uses(&mut round);
         assert_eq!(
-            tool_round_disposition(&round.tool_uses, Some(2), 0, 0),
+            tool_round_disposition(&round.tool_uses, Some(2), 0, 0, 0),
             ToolRoundDisposition::Flush
         );
         let content = build_flush_content(
@@ -2551,7 +2633,7 @@ mod tests {
         assert_eq!(round.tool_uses.len(), 1);
         assert_eq!(round.tool_uses[0].name, "kiro_context_read");
         assert_eq!(
-            tool_round_disposition(&round.tool_uses, Some(2), 0, 0),
+            tool_round_disposition(&round.tool_uses, Some(2), 0, 0, 0),
             ToolRoundDisposition::Continue,
         );
     }
@@ -2572,7 +2654,7 @@ mod tests {
         assert_eq!(round.tool_uses[0].id, "native-id");
         assert!(!round.text.contains("<invoke"));
         assert_eq!(
-            tool_round_disposition(&round.tool_uses, Some(2), 0, 0),
+            tool_round_disposition(&round.tool_uses, Some(2), 0, 0, 0),
             ToolRoundDisposition::Continue
         );
     }

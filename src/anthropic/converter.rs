@@ -1259,6 +1259,12 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     short
 }
 
+/// 测试辅助：暴露工具名映射结果，供内部工具名稳定性断言使用。
+#[cfg(test)]
+pub(crate) fn map_tool_name_for_test(name: &str) -> String {
+    map_tool_name(name, &mut HashMap::new())
+}
+
 /// 转换工具定义
 /// Claude Code 内置工具名 → Kiro 内置工具名。
 fn claude_code_tool_name_to_kiro(name: &str) -> Option<&'static str> {

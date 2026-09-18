@@ -844,7 +844,10 @@ pub async fn post_messages(
                 .into_response();
         }
     };
-    if let Some(context) = context {
+    // 按需工具发现：声明的 schema 体积超预算时，改为提供分页目录 + 揭示接口。
+    // 没有任何工具被移除；未揭示的工具仍可随时列目录索取，只是需要多花轮次。
+    let catalog = take_tool_catalog(&mut payload, &provider.pipeline().config);
+    if context.is_some() || catalog.is_some() {
         let stream = payload.stream;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
@@ -863,6 +866,7 @@ pub async fn post_messages(
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
             context,
+            catalog,
         )
         .await;
     }
@@ -1082,6 +1086,35 @@ pub async fn post_messages(
         )
         .await
     }
+}
+
+/// 按需工具发现：超预算时把客户端工具换成目录接口，并把原始声明交给会话保管。
+///
+/// 返回 `None` 表示未启用、无工具或未超预算——此时 `payload` 一字未动，行为与改造前
+/// 完全一致。工具**没有被丢弃**：它们被会话持有，模型可随时列目录并索取。
+fn take_tool_catalog(
+    payload: &mut super::types::MessagesRequest,
+    config: &crate::pipeline::config::PipelineConfig,
+) -> Option<crate::pipeline::tool_catalog::CatalogSession> {
+    use crate::pipeline::tool_catalog;
+    if config.tool_catalog.strategy != crate::pipeline::config::ToolCatalogStrategy::OnDemand {
+        return None;
+    }
+    let declared = payload.tools.as_ref()?;
+    if declared.is_empty()
+        || declared.iter().any(|tool| tool_catalog::is_catalog_tool(&tool.name))
+        || !tool_catalog::should_paginate(declared, config.tool_catalog.budget_bytes)
+    {
+        return None;
+    }
+    let session = tool_catalog::CatalogSession::new(declared.clone());
+    tracing::info!(
+        declared = session.total(),
+        declared_bytes = tool_catalog::declared_bytes(declared),
+        "工具声明体积超预算，改为按需发现（工具未被移除，需多轮索取）"
+    );
+    payload.tools = Some(session.active_tools());
+    Some(session)
 }
 
 /// 分类明确的长度拒绝 + 已构造出的修正体 → 允许再发一次。
@@ -1996,7 +2029,10 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
-    if let Some(context) = context {
+    // 按需工具发现：声明的 schema 体积超预算时，改为提供分页目录 + 揭示接口。
+    // 没有任何工具被移除；未揭示的工具仍可随时列目录索取，只是需要多花轮次。
+    let catalog = take_tool_catalog(&mut payload, &provider.pipeline().config);
+    if context.is_some() || catalog.is_some() {
         let stream = payload.stream;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
@@ -2015,6 +2051,7 @@ pub async fn post_messages_cc(
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
             context,
+            catalog,
         )
         .await;
     }
@@ -2643,6 +2680,83 @@ mod tests {
             canonical_attempt_outcome(outcome::ACCOUNT_SUSPENDED),
             outcome::ACCOUNT_SUSPENDED
         );
+    }
+
+    fn request_with_tools(count: usize) -> crate::anthropic::types::MessagesRequest {
+        use crate::anthropic::types::{Message, MessagesRequest, Tool};
+        let tools = (0..count)
+            .map(|i| Tool {
+                tool_type: None,
+                name: format!("client_tool_{i}"),
+                description: "x".repeat(400),
+                input_schema: Default::default(),
+                max_uses: None,
+                cache_control: None,
+            })
+            .collect();
+        MessagesRequest {
+            model: "claude-sonnet-4.5".into(),
+            max_tokens: 64,
+            messages: vec![Message { role: "user".into(), content: serde_json::json!("hi") }],
+            stream: false,
+            system: None,
+            tools: Some(tools),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    fn on_demand_config(budget: usize) -> crate::pipeline::config::PipelineConfig {
+        let mut config = crate::pipeline::config::PipelineConfig::default();
+        config.tool_catalog.strategy = crate::pipeline::config::ToolCatalogStrategy::OnDemand;
+        config.tool_catalog.budget_bytes = budget;
+        config
+    }
+
+    /// 超预算时替换为目录接口，但**原始声明一个不少**地交给会话保管。
+    #[test]
+    fn oversized_tool_declarations_become_a_catalog_without_losing_any_tool() {
+        let mut payload = request_with_tools(50);
+        let session = take_tool_catalog(&mut payload, &on_demand_config(4096))
+            .expect("超预算应启用按需发现");
+        assert_eq!(session.total(), 50, "全部工具仍在会话中，未被丢弃");
+        let sent = payload.tools.as_ref().unwrap();
+        assert_eq!(sent.len(), 2, "本轮只声明两个目录工具");
+        assert!(
+            sent.iter()
+                .all(|t| crate::pipeline::tool_catalog::is_catalog_tool(&t.name))
+        );
+    }
+
+    /// 关闭、未超预算、无工具时一字不动——行为与改造前完全一致。
+    #[test]
+    fn tool_catalog_is_inert_when_disabled_or_under_budget() {
+        let mut payload = request_with_tools(50);
+        let before = serde_json::to_value(&payload.tools).unwrap();
+        assert!(
+            take_tool_catalog(&mut payload, &crate::pipeline::config::PipelineConfig::default())
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(&payload.tools).unwrap(),
+            before,
+            "关闭时不得改动 payload"
+        );
+
+        let mut payload = request_with_tools(2);
+        let before = serde_json::to_value(&payload.tools).unwrap();
+        assert!(take_tool_catalog(&mut payload, &on_demand_config(10_000_000)).is_none());
+        assert_eq!(
+            serde_json::to_value(&payload.tools).unwrap(),
+            before,
+            "未超预算不得改动 payload"
+        );
+
+        let mut payload = request_with_tools(0);
+        assert!(take_tool_catalog(&mut payload, &on_demand_config(1024)).is_none());
     }
 
     fn rejection(body: &str) -> anyhow::Error {
