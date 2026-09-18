@@ -4,6 +4,7 @@ pub mod admission;
 pub mod amount;
 pub mod config;
 pub mod config_store;
+pub mod coordinator;
 pub mod ledger;
 pub mod protocol;
 pub mod sse;
