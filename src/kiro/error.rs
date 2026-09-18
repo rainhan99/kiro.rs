@@ -66,6 +66,16 @@ pub enum UpstreamRejectionKind {
     Unclassified,
 }
 
+impl UpstreamRejectionKind {
+    /// 该分类是否指向某条**长度**预算。
+    ///
+    /// 只有这类拒绝才可能被无损修正补救：协议配对错误再怎么改尺寸也不会通过，
+    /// 未分类的拒绝更不该被当作长度问题去乱动 payload。
+    pub fn names_a_length_budget(self) -> bool {
+        matches!(self, Self::ContentLengthThreshold | Self::InputTooLong)
+    }
+}
+
 /// 上游请求层拒绝的结构化错误。
 ///
 /// 取代此前把 `状态码 + 报文` 拼成一行字符串、再由 handler 用 `contains` 还原分类的

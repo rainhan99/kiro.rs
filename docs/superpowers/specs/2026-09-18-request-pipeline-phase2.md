@@ -64,11 +64,21 @@ credentials, and never truncates or summarizes to fit.
 Off by default. At most one additional attempt, on the same model, under the same
 credential-selection rules as any other request.
 
-Recovery triggers only on a classified rejection whose class names a specific budget line, and
-only when a lossless remedy for that line is enabled. When no remedy is enabled the rejection
-is returned exactly as it is today. This phase adds no new remedy: the only lossless
-correction available is the tool-result chunking delivered in phase 1, and enabling recovery
-does not enable it.
+Recovery triggers only on a classified rejection whose class names a length budget, and it
+adds no new remedy: the only lossless correction available is the tool-result chunking
+delivered in phase 1.
+
+Enabling recovery does not change the steady-state shape of ordinary requests. The remedy is
+applied to the retry alone, so the shape whose upstream acceptance is unverified is sent only
+after the upstream has already refused the ordinary shape — the attempt it could spoil had
+already failed. Enabling recovery is the operator's explicit consent to that one attempt; it
+does not turn the remedy on for traffic that was never refused.
+
+The retry happens only when the remedy actually changes the payload. If applying it produces
+the same bytes — because the remedy was already in effect, or because nothing in the request
+was large enough for it to act on — there is nothing to correct and the rejection is returned
+unchanged. Re-sending an identical payload in the hope of a different answer is a blind
+resend, which this project does not do.
 
 The remedy is applied to the payload and the request is rebuilt from it. Nothing is truncated,
 summarized, dropped, reordered or downgraded, and the model is not changed. If the second

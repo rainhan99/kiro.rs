@@ -986,6 +986,16 @@ pub async fn post_messages(
         "Kiro request prepared (content redacted)"
     );
 
+    // 预先构造「一次修改后重试」用的修正体（策略关闭时为 None，不产生任何开销差异
+    // 之外的行为变化）。只有上游按长度拒绝时才会用到它；若修正没改变任何字节，
+    // 这里就是 None，从而不可能发生原样重发。
+    let recovery_body = crate::pipeline::recovery_body(
+        &payload,
+        state.tool_compatibility_mode,
+        &provider.pipeline().config,
+        &request_body,
+    );
+
     // 估算输入 tokens
     let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -1039,6 +1049,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            recovery_body,
         )
         .await
     } else {
@@ -1067,9 +1078,23 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            recovery_body,
         )
         .await
     }
+}
+
+/// 分类明确的长度拒绝 + 已构造出的修正体 → 允许再发一次。
+///
+/// 其它任何情形都不重试：协议配对错误改尺寸无用，未分类的拒绝更不该被当作长度问题；
+/// 修正体为 `None` 时说明策略关闭或修正没改变任何字节（见 `pipeline::recovery_body`）。
+fn recoverable_body<'a>(error: &anyhow::Error, recovery: Option<&'a str>) -> Option<&'a str> {
+    let rejection = error.downcast_ref::<crate::kiro::error::UpstreamRequestError>()?;
+    rejection
+        .kind()
+        .names_a_length_budget()
+        .then_some(recovery)
+        .flatten()
 }
 
 /// 处理流式请求
@@ -1085,12 +1110,29 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    recovery_body: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
+    let first = provider
         .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+        .await;
+    // 一次修改后重试：仅在拒绝分类指向长度预算、且修正确实改变了 payload 时发生。
+    // 同模型、最多一次；第二次失败就是失败，没有第三次、不换补救手段、不换账号碰运气。
+    let outcome = match first {
+        Ok(resp) => Ok(resp),
+        Err(first_error) => match recoverable_body(&first_error, recovery_body.as_deref()) {
+            Some(corrected) => {
+                tracing::info!(
+                    "上游按长度拒绝；对 payload 施加一次无损修正后重发（同模型，仅此一次）"
+                );
+                provider
+                    .call_api_stream(corrected, Some(tracer.as_ref()), group.as_deref())
+                    .await
+            }
+            None => Err(first_error),
+        },
+    };
+    let call_result = match outcome {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1424,12 +1466,28 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    recovery_body: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
+    let first = provider
         .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+        .await;
+    // 与流式路径同一条规则：分类指向长度预算、且修正确实改了 payload 才重发一次。
+    let outcome = match first {
+        Ok(resp) => Ok(resp),
+        Err(first_error) => match recoverable_body(&first_error, recovery_body.as_deref()) {
+            Some(corrected) => {
+                tracing::info!(
+                    "上游按长度拒绝；对 payload 施加一次无损修正后重发（同模型，仅此一次）"
+                );
+                provider
+                    .call_api(corrected, Some(tracer.as_ref()), group.as_deref())
+                    .await
+            }
+            None => Err(first_error),
+        },
+    };
+    let call_result = match outcome {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -2077,6 +2135,16 @@ pub async fn post_messages_cc(
         "Kiro request prepared (content redacted)"
     );
 
+    // 预先构造「一次修改后重试」用的修正体（策略关闭时为 None，不产生任何开销差异
+    // 之外的行为变化）。只有上游按长度拒绝时才会用到它；若修正没改变任何字节，
+    // 这里就是 None，从而不可能发生原样重发。
+    let recovery_body = crate::pipeline::recovery_body(
+        &payload,
+        state.tool_compatibility_mode,
+        &provider.pipeline().config,
+        &request_body,
+    );
+
     // 计算总 input tokens
     let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -2154,6 +2222,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            recovery_body,
         )
         .await
     }
@@ -2574,6 +2643,63 @@ mod tests {
             canonical_attempt_outcome(outcome::ACCOUNT_SUSPENDED),
             outcome::ACCOUNT_SUSPENDED
         );
+    }
+
+    fn rejection(body: &str) -> anyhow::Error {
+        crate::kiro::error::UpstreamRequestError::api("非流式", StatusCode::BAD_REQUEST, body).into()
+    }
+
+    const LENGTH_REJECTION: &str = r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+
+    /// 长度拒绝 + 有修正体 → 允许重发一次。
+    #[test]
+    fn length_rejection_with_a_correction_is_recoverable() {
+        assert_eq!(
+            recoverable_body(&rejection(LENGTH_REJECTION), Some("corrected")),
+            Some("corrected")
+        );
+        assert_eq!(
+            recoverable_body(
+                &rejection(r#"{"message":"Input is too long for requested model."}"#),
+                Some("corrected")
+            ),
+            Some("corrected")
+        );
+    }
+
+    /// 分类没有指向长度预算时一律不重试：协议配对错误改尺寸不会通过，
+    /// 未分类的拒绝更不该被当作长度问题去乱动 payload。
+    #[test]
+    fn non_length_rejections_are_never_recoverable() {
+        assert!(
+            recoverable_body(
+                &rejection(r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#),
+                Some("corrected")
+            )
+            .is_none()
+        );
+        assert!(
+            recoverable_body(
+                &rejection(r#"{"reason":"INTERNAL_SERVER_ERROR"}"#),
+                Some("corrected")
+            )
+            .is_none()
+        );
+    }
+
+    /// 非上游拒绝（网络错误等）不进入恢复路径。
+    #[test]
+    fn non_upstream_errors_are_never_recoverable() {
+        assert!(
+            recoverable_body(&anyhow::anyhow!("connection reset"), Some("corrected")).is_none()
+        );
+    }
+
+    /// 没有修正体就不重发——策略关闭，或修正后字节毫无变化。
+    /// 后者若放行就是被禁止的盲目原样重发。
+    #[test]
+    fn without_a_correction_there_is_no_retry() {
+        assert!(recoverable_body(&rejection(LENGTH_REJECTION), None).is_none());
     }
 
     fn stream_ctx(model: &str) -> StreamContext {

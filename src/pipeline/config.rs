@@ -65,6 +65,21 @@ pub enum AdmissionStrategy {
     DeclaredCeiling,
 }
 
+/// 收到分类明确的长度拒绝后的恢复策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryStrategy {
+    /// 既有行为：上游拒绝即结束。
+    #[default]
+    Off,
+    /// 对 payload 施加一次无损修正并**仅重发一次**，同模型。
+    ///
+    /// 不改变正常请求的稳态形状：修正只作用于这一次重试，所以接受性未验证的形状
+    /// 只会在上游**已经拒绝**了常规形状之后发出——它可能搞砸的那次尝试本来就已经
+    /// 失败了。修正后若字节毫无变化则不重发，那是被禁止的盲目原样重发。
+    LosslessRetry,
+}
+
 /// 工具结果的线上形状策略。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -140,6 +155,7 @@ pub struct PipelineConfig {
     pub images: ImageConfig,
     pub tool_results: ToolResultConfig,
     pub admission: AdmissionStrategy,
+    pub recovery: RecoveryStrategy,
     pub audit_enabled: bool,
     pub allow_simulated_cache: bool,
     pub kiro_only: bool,
@@ -157,6 +173,7 @@ impl Default for PipelineConfig {
             images: ImageConfig::default(),
             tool_results: ToolResultConfig::default(),
             admission: AdmissionStrategy::Off,
+            recovery: RecoveryStrategy::Off,
             audit_enabled: true,
             allow_simulated_cache: false,
             kiro_only: true,

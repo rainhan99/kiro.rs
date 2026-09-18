@@ -564,3 +564,78 @@ fn hardcoded_window_table_is_never_used_as_a_ceiling() {
     // admit 只接受显式传入的声明上限；没有任何路径会把猜测表喂进来。
     assert!(p.admit(&wire, None).is_ok());
 }
+
+fn tool_result_payload(body: &str) -> crate::anthropic::types::MessagesRequest {
+    use crate::anthropic::types::{Message, MessagesRequest};
+    MessagesRequest {
+        model: "claude-sonnet-4.5".into(),
+        max_tokens: 1024,
+        messages: vec![
+            Message { role: "user".into(), content: json!("读文件") },
+            Message { role: "assistant".into(), content: json!([
+                {"type":"tool_use","id":"t1","name":"read","input":{"path":"/a"}}]) },
+            Message { role: "user".into(), content: json!([
+                {"type":"tool_result","tool_use_id":"t1","content": body}]) },
+        ],
+        stream: false, system: None, tools: None, tool_choice: None, thinking: None,
+        output_config: None, metadata: None, cache_control: None,
+    }
+}
+
+fn body_for(payload: &crate::anthropic::types::MessagesRequest, cfg: &config::PipelineConfig) -> String {
+    let converted = crate::anthropic::converter::convert_request_with_pipeline(
+        payload, crate::model::config::ToolCompatibilityMode::Raw, cfg).unwrap();
+    serialize_request(payload, &KiroRequest {
+        conversation_state: converted.conversation_state,
+        profile_arn: None,
+        additional_model_request_fields: converted.additional_model_request_fields,
+    }, cfg).unwrap()
+}
+
+/// 开启恢复策略后，修正体应当真的不同于原体（分片生效）。
+#[test]
+fn recovery_body_applies_the_lossless_correction() {
+    let mut cfg = config::PipelineConfig::default();
+    cfg.recovery = config::RecoveryStrategy::LosslessRetry;
+    cfg.tool_results.chunk_bytes = 4096;
+    let payload = tool_result_payload(&"工具输出的一行\n".repeat(2000));
+    let original = body_for(&payload, &cfg);
+    let corrected = crate::pipeline::recovery_body(
+        &payload, crate::model::config::ToolCompatibilityMode::Raw, &cfg, &original)
+        .expect("超长工具结果应产出修正体");
+    assert_ne!(corrected, original);
+    // 稳态形状不受影响：原体仍是单条目。
+    assert_eq!(original.matches("\"text\"").count(), 1);
+    assert!(corrected.matches("\"text\"").count() > 1);
+}
+
+/// 修正后字节毫无变化时必须返回 None——原样重发一个刚被拒的 payload 是碰运气。
+#[test]
+fn recovery_body_refuses_to_resend_identical_bytes() {
+    let mut cfg = config::PipelineConfig::default();
+    cfg.recovery = config::RecoveryStrategy::LosslessRetry;
+    cfg.tool_results.chunk_bytes = 4096;
+    // 工具结果很短，分片无从下手 → 修正体与原体一致 → 不得重发。
+    let payload = tool_result_payload("short");
+    let original = body_for(&payload, &cfg);
+    assert!(crate::pipeline::recovery_body(
+        &payload, crate::model::config::ToolCompatibilityMode::Raw, &cfg, &original).is_none());
+
+    // 分片已在稳态启用时，重试产出的也是同样的字节 → 同样不得重发。
+    let mut already = cfg.clone();
+    already.tool_results.strategy = config::ToolResultStrategy::LosslessChunks;
+    let payload = tool_result_payload(&"工具输出的一行\n".repeat(2000));
+    let original = body_for(&payload, &already);
+    assert!(crate::pipeline::recovery_body(
+        &payload, crate::model::config::ToolCompatibilityMode::Raw, &already, &original).is_none());
+}
+
+/// 默认关闭时永不产出修正体。
+#[test]
+fn recovery_body_is_inert_while_disabled() {
+    let cfg = config::PipelineConfig::default();
+    let payload = tool_result_payload(&"工具输出的一行\n".repeat(2000));
+    let original = body_for(&payload, &cfg);
+    assert!(crate::pipeline::recovery_body(
+        &payload, crate::model::config::ToolCompatibilityMode::Raw, &cfg, &original).is_none());
+}

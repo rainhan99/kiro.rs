@@ -476,6 +476,56 @@ fn strip_billing_line(text: &str) -> &str {
     }
 }
 
+/// 为「一次修改后重试」构造修正后的请求体。
+///
+/// 在稳态配置之上**仅**强制启用工具结果无损分片，其余一律不变——这是本项目目前唯一
+/// 的无损修正手段。正常请求的形状完全不受影响：修正只作用于这一次重试。
+///
+/// 返回 `None` 表示不该重试：策略关闭、转换/序列化失败，或者**修正后字节毫无变化**。
+/// 最后一条是硬约束——原样重发一个刚被拒绝的 payload 只是在碰运气，本项目不做。
+pub fn recovery_body(
+    payload: &MessagesRequest,
+    tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
+    config: &PipelineConfig,
+    original_body: &str,
+) -> Option<String> {
+    if config.recovery != config::RecoveryStrategy::LosslessRetry {
+        return None;
+    }
+    let mut corrected = config.clone();
+    corrected.tool_results.strategy = config::ToolResultStrategy::LosslessChunks;
+    let converted = crate::anthropic::converter::convert_request_with_pipeline(
+        payload,
+        tool_compatibility_mode,
+        &corrected,
+    )
+    .ok()?;
+    let request = KiroRequest {
+        conversation_state: converted.conversation_state,
+        profile_arn: None,
+        additional_model_request_fields: converted.additional_model_request_fields,
+    };
+    let body = serialize_request(payload, &request, &corrected).ok()?;
+    // 必须比较**语义**而非整串：`conversationId` / `agentContinuationId` 每次转换都会
+    // 重新生成，整串比较两次必然不同，"没变化就不重发"的约束会形同虚设——守卫永远
+    // 不触发，于是每个长度拒绝都会被原样重发一次。与 audit 的 semanticFingerprint 同源。
+    // 任一侧无法解析时保守地不重发。
+    (semantic_key(&body)? != semantic_key(original_body)?).then_some(body)
+}
+
+/// 去掉每次转换都会重新生成的会话标识，只留语义部分用于比较。
+fn semantic_key(body: &str) -> Option<String> {
+    let mut value: Value = serde_json::from_str(body).ok()?;
+    if let Some(state) = value
+        .get_mut("conversationState")
+        .and_then(Value::as_object_mut)
+    {
+        state.remove("conversationId");
+        state.remove("agentContinuationId");
+    }
+    serde_json::to_string(&value).ok()
+}
+
 pub fn serialize_request(
     payload: &MessagesRequest,
     request: &KiroRequest,

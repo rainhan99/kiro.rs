@@ -55,7 +55,8 @@ Files: `src/anthropic/handlers.rs`, `src/pipeline/config.rs`.
 
 - [ ] RED: tests asserting exactly one extra attempt; no retry when the rejection class names no budget line; no retry when the matching remedy is disabled; no third attempt when the second fails.
 - [ ] GREEN: on a classified rejection with an enabled lossless remedy, apply it to the payload, rebuild the request and send once more on the same model.
-- [ ] Gate behind configuration, default off. Enabling recovery must not enable a remedy.
+- [ ] Gate behind configuration, default off. Enabling recovery must not change the steady-state shape of ordinary requests; the remedy applies to the retry alone.
+- [ ] No retry when applying the remedy leaves the payload byte-identical — that would be a blind resend.
 - [ ] Verify nothing is truncated, summarized, dropped or downgraded, and that an unverified remedy stays labelled unverified.
 
 ### Task 5: Integrate, verify, document
