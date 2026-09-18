@@ -1137,7 +1137,7 @@ impl AdminService {
         let started = std::time::Instant::now();
         let (credential_id, bytes) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                let call = provider.call_api(&body, None, None).await?;
+                let call = provider.call_api(&body, None, None, true).await?;
                 let credential_id = call.credential_id;
                 let bytes = call.response.bytes().await?;
                 Ok::<_, anyhow::Error>((credential_id, bytes))

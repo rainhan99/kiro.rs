@@ -37,7 +37,7 @@ use super::routing::RouteContext;
 use super::service::{GatewayService, RequestPlan};
 use super::settlement::{KiroRoute, Settlement};
 use super::usage::{NativeUsage, normalize_usage, token_cost};
-use super::{Amount, BillingUnit, ModelBinding, Upstream, UpstreamKind};
+use super::{Amount, BillingUnit, ModelBinding, RoutingMode, Upstream, UpstreamKind};
 
 /// 分发的结局。
 pub enum Dispatched {
@@ -127,6 +127,8 @@ pub async fn dispatch(
             return Dispatched::UseKiro(Box::new(KiroRoute {
                 upstream_model: attempt.upstream_model.clone(),
                 group,
+                // 随机分发要一路随机到底，否则第一次选中的凭据会接管整个会话。
+                sticky: plan.mode != RoutingMode::WeightedRandom,
                 settlement: Arc::new(Settlement::new(
                     gateway.clone(),
                     attempt.attempt_id.clone(),

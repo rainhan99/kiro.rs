@@ -34,7 +34,7 @@ use crate::pipeline::artifacts::{ContextSession, is_internal_tool};
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_pipeline, get_context_window_size};
-use super::handlers::{
+use super::handlers::{KiroRouting, 
     RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
     map_provider_error,
 };
@@ -524,7 +524,7 @@ async fn run_round(
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
     tracer: &RequestTracer,
-    group: Option<&str>,
+    routing: &KiroRouting,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let config = &provider.token_manager().config().request_pipeline;
@@ -588,7 +588,12 @@ async fn run_round(
     };
 
     let call_result = match provider
-        .call_api_stream(&request_body, Some(tracer), group)
+        .call_api_stream(
+            &request_body,
+            Some(tracer),
+            routing.group.as_deref(),
+            routing.sticky,
+        )
         .await
     {
         Ok(r) => r,
@@ -755,7 +760,7 @@ async fn execute_chunked_map(
     tool: &CompletedToolUse,
     model: &str,
     tracer: &RequestTracer,
-    group: Option<&str>,
+    routing: &KiroRouting,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Value {
     use crate::pipeline::chunked_map;
@@ -805,7 +810,7 @@ async fn execute_chunked_map(
             &request,
             fallback,
             tracer,
-            group,
+            routing,
             tool_compatibility_mode,
         )
         .await
@@ -1528,7 +1533,7 @@ async fn execute_web_search(
     provider: &Arc<KiroProvider>,
     tool_use: &CompletedToolUse,
     tracer: &RequestTracer,
-    group: Option<&str>,
+    routing: &KiroRouting,
     final_round: bool,
     emitter: &mut Option<&mut WebSearchSseEmitter>,
 ) -> anyhow::Result<Option<WebSearchResults>> {
@@ -1542,7 +1547,7 @@ async fn execute_web_search(
     let result = if let Some(query) = query {
         log_normalized_web_search_query(tool_use, &query);
         let (_, mcp_request) = websearch::create_mcp_request(&query);
-        match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), group).await {
+        match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), routing.group.as_deref()).await {
             Ok(response) => websearch::parse_search_results(&response),
             Err(error) if websearch::is_no_results_mcp_error(&error) => {
                 tracing::warn!(
@@ -1616,7 +1621,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     tracer: Arc<RequestTracer>,
     stream_client: bool,
-    group: Option<String>,
+    routing: KiroRouting,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
     run_server_tool_loop(
@@ -1625,7 +1630,7 @@ pub(super) async fn run_web_search_loop(
         hook,
         tracer,
         stream_client,
-        group,
+        routing,
         tool_compatibility_mode,
         None,
         None,
@@ -1641,7 +1646,7 @@ pub async fn run_context_loop(
     hook: UsageRecordHook,
     tracer: Arc<RequestTracer>,
     stream_client: bool,
-    group: Option<String>,
+    routing: KiroRouting,
     tool_compatibility_mode: ToolCompatibilityMode,
     context: Option<ContextSession>,
     catalog: Option<crate::pipeline::tool_catalog::CatalogSession>,
@@ -1652,7 +1657,7 @@ pub async fn run_context_loop(
         hook,
         tracer,
         stream_client,
-        group,
+        routing,
         tool_compatibility_mode,
         context,
         catalog,
@@ -1666,7 +1671,7 @@ async fn run_server_tool_loop(
     hook: UsageRecordHook,
     tracer: Arc<RequestTracer>,
     stream_client: bool,
-    group: Option<String>,
+    routing: KiroRouting,
     tool_compatibility_mode: ToolCompatibilityMode,
     context: Option<ContextSession>,
     catalog: Option<crate::pipeline::tool_catalog::CatalogSession>,
@@ -1677,7 +1682,7 @@ async fn run_server_tool_loop(
             payload,
             hook,
             tracer,
-            group,
+            routing.clone(),
             tool_compatibility_mode,
             context,
             catalog,
@@ -1708,7 +1713,7 @@ async fn run_server_tool_loop(
                 payload,
                 hook,
                 tracer,
-                group,
+                routing.clone(),
                 tool_compatibility_mode,
                 context,
                 catalog,
@@ -1750,7 +1755,7 @@ async fn run_web_search_loop_inner(
     mut payload: MessagesRequest,
     hook: UsageRecordHook,
     tracer: Arc<RequestTracer>,
-    group: Option<String>,
+    routing: KiroRouting,
     tool_compatibility_mode: ToolCompatibilityMode,
     context: Option<ContextSession>,
     mut catalog: Option<crate::pipeline::tool_catalog::CatalogSession>,
@@ -1779,7 +1784,7 @@ async fn run_web_search_loop_inner(
                 &payload,
                 round_fallback_input_tokens,
                 tracer.as_ref(),
-                group.as_deref(),
+                &routing,
                 tool_compatibility_mode,
             )
             .await
@@ -1887,7 +1892,7 @@ async fn run_web_search_loop_inner(
                     &provider,
                     tu,
                     tracer.as_ref(),
-                    group.as_deref(),
+                    &routing,
                     !continue_round,
                     &mut emitter,
                 )
@@ -1932,7 +1937,7 @@ async fn run_web_search_loop_inner(
                             tu,
                             &payload.model,
                             tracer.as_ref(),
-                            group.as_deref(),
+                            &routing,
                             tool_compatibility_mode,
                         )
                         .await,

@@ -41,6 +41,30 @@ use super::types::{
 };
 use super::websearch;
 
+/// 这一次请求交给 Kiro 通道时的选路参数。
+///
+/// 用一个结构替掉原来单独的 `group`，是为了在不撑大已经很长的参数表的前提下
+/// 把粘性开关一并带下去。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KiroRouting {
+    pub group: Option<String>,
+    /// 是否允许 Kiro 的会话粘性把凭据钉到会话上。
+    ///
+    /// 网关按权重随机分发时为 `false`：粘性会让第一次选中的凭据接管整个会话，
+    /// "随机"于是只在第一次生效。
+    pub sticky: bool,
+}
+
+impl KiroRouting {
+    /// 既有路径的默认：沿用 Key 绑定的分组，粘性照旧开着。
+    pub fn legacy(group: Option<String>) -> Self {
+        Self {
+            group,
+            sticky: true,
+        }
+    }
+}
+
 /// 请求结束时记录用量的钩子
 ///
 /// 在 handler 入口构造，调用 [`Self::record`] 时把当次请求的 input/output token、
@@ -923,6 +947,11 @@ pub async fn post_messages(
     if let Some(route) = &gateway_route {
         route.apply(&mut payload.model, &mut key_ctx.group);
     }
+    let kiro_routing = KiroRouting {
+        group: key_ctx.group.clone(),
+        // 既有路径保持粘性；网关只在按权重随机分发时关掉它。
+        sticky: gateway_route.as_ref().is_none_or(|route| route.sticky),
+    };
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -994,7 +1023,7 @@ pub async fn post_messages(
             hook,
             tracer,
             stream,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
             state.tool_compatibility_mode,
             context,
             catalog,
@@ -1052,7 +1081,7 @@ pub async fn post_messages(
             hook,
             tracer,
             payload_stream,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
             state.tool_compatibility_mode,
         )
         .await;
@@ -1187,7 +1216,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
             recovery_body,
         )
         .await
@@ -1216,7 +1245,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
             recovery_body,
         )
         .await
@@ -1300,12 +1329,17 @@ async fn handle_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
+    routing: KiroRouting,
     recovery_body: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let first = provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(
+            request_body,
+            Some(tracer.as_ref()),
+            routing.group.as_deref(),
+            routing.sticky,
+        )
         .await;
     // 一次修改后重试：仅在拒绝分类指向长度预算、且修正确实改变了 payload 时发生。
     // 同模型、最多一次；第二次失败就是失败，没有第三次、不换补救手段、不换账号碰运气。
@@ -1317,7 +1351,12 @@ async fn handle_stream_request(
                     "上游按长度拒绝；对 payload 施加一次无损修正后重发（同模型，仅此一次）"
                 );
                 provider
-                    .call_api_stream(corrected, Some(tracer.as_ref()), group.as_deref())
+                    .call_api_stream(
+                    corrected,
+                    Some(tracer.as_ref()),
+                    routing.group.as_deref(),
+                    routing.sticky,
+                )
                     .await
             }
             None => Err(first_error),
@@ -1674,7 +1713,7 @@ async fn handle_non_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
+    routing: KiroRouting,
     recovery_body: Option<String>,
 ) -> Response {
     match execute_non_stream_request(
@@ -1687,7 +1726,7 @@ async fn handle_non_stream_request(
         hook,
         cache_usage,
         tracer,
-        group,
+        routing,
         recovery_body,
     )
     .await
@@ -1708,14 +1747,19 @@ pub(crate) async fn execute_non_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
+    routing: KiroRouting,
     // 一次修改后重试用的修正体。compaction 通道传 None：它有自己的溢出处理，
     // 不应再叠加一次无损修正重试。
     recovery_body: Option<String>,
 ) -> Result<serde_json::Value, NonStreamExecutionError> {
     // 调用 Kiro API（支持多凭据故障转移）
     let first = provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api(
+            request_body,
+            Some(tracer.as_ref()),
+            routing.group.as_deref(),
+            routing.sticky,
+        )
         .await;
     // 与流式路径同一条规则：分类指向长度预算、且修正确实改了 payload 才重发一次。
     let outcome = match first {
@@ -1726,7 +1770,12 @@ pub(crate) async fn execute_non_stream_request(
                     "上游按长度拒绝；对 payload 施加一次无损修正后重发（同模型，仅此一次）"
                 );
                 provider
-                    .call_api(corrected, Some(tracer.as_ref()), group.as_deref())
+                    .call_api(
+                    corrected,
+                    Some(tracer.as_ref()),
+                    routing.group.as_deref(),
+                    routing.sticky,
+                )
                     .await
             }
             None => Err(first_error),
@@ -2179,9 +2228,19 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
+    Extension(mut key_ctx): Extension<KeyContext>,
+    gateway_route: Option<Extension<crate::gateway::settlement::KiroRoute>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let gateway_route = gateway_route.map(|Extension(route)| route);
+    // 与 /v1 同一套请求级覆盖：真实模型名、凭据分组、粘性。
+    if let Some(route) = &gateway_route {
+        route.apply(&mut payload.model, &mut key_ctx.group);
+    }
+    let kiro_routing = KiroRouting {
+        group: key_ctx.group.clone(),
+        sticky: gateway_route.as_ref().is_none_or(|route| route.sticky),
+    };
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -2267,7 +2326,7 @@ pub async fn post_messages_cc(
             hook,
             tracer,
             stream,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
             state.tool_compatibility_mode,
             context,
             catalog,
@@ -2322,7 +2381,7 @@ pub async fn post_messages_cc(
             hook,
             tracer,
             payload_stream,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
             state.tool_compatibility_mode,
         )
         .await;
@@ -2456,7 +2515,7 @@ pub async fn post_messages_cc(
             total_input_tokens,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
         )
         .await
     } else {
@@ -2481,7 +2540,7 @@ pub async fn post_messages_cc(
             hook,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            kiro_routing.clone(),
             recovery_body,
         )
         .await
@@ -2503,11 +2562,16 @@ async fn handle_stream_request_buffered(
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
+    routing: KiroRouting,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(
+            request_body,
+            Some(tracer.as_ref()),
+            routing.group.as_deref(),
+            routing.sticky,
+        )
         .await
     {
         Ok(resp) => resp,

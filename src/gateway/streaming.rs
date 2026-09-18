@@ -37,6 +37,7 @@ use super::protocol::WireProtocol;
 use super::routing::RouteContext;
 use super::service::GatewayService;
 use super::settlement::{KiroRoute, Settlement};
+use super::RoutingMode;
 use super::sse::{SseEvent, SseParser, StreamTranslator};
 use super::usage::normalize_usage;
 
@@ -181,6 +182,7 @@ async fn run(
                 let _ = decided.send(Decision::UseKiro(Box::new(KiroRoute {
                     upstream_model: attempt.upstream_model.clone(),
                     group,
+                    sticky: plan.mode != RoutingMode::WeightedRandom,
                     settlement: Arc::new(Settlement::new(
                         gateway.clone(),
                         attempt.attempt_id.clone(),

@@ -262,7 +262,7 @@ async fn run_attempt(
         hook,
         cache_usage,
         tracer,
-        key_ctx.group.clone(),
+        crate::anthropic::handlers::KiroRouting::legacy(key_ctx.group.clone()),
         // compaction 有自己的溢出重试，不再叠加一次无损修正重试。
         None,
     )

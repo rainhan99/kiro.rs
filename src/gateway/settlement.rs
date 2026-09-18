@@ -136,6 +136,11 @@ pub struct KiroRoute {
     pub upstream_model: String,
     /// 这一路使用的凭据分组。`None` 表示不限，沿用 Key 自己的绑定。
     pub group: Option<String>,
+    /// 是否允许 Kiro 的会话粘性把凭据钉到会话上。
+    ///
+    /// 网关按权重随机分发时为 `false`：粘性会让第一次选中的凭据接管整个会话，
+    /// 于是"随机"只在第一次生效，之后每一轮都落在同一个凭据上。
+    pub sticky: bool,
     pub settlement: Arc<Settlement>,
 }
 

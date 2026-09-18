@@ -261,24 +261,32 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
     /// `sink` 可选，用于逐跳上报链路追踪。
+    /// `sticky` 决定是否允许会话粘性把凭据钉到会话上。既有路径传 `true`；
+    /// 网关按权重随机分发时传 `false`，否则第一次选中的凭据会接管整个会话，
+    /// "随机"只在第一次生效。
     pub async fn call_api(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        sticky: bool,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group)
+        self.call_api_with_retry(request_body, false, sink, group, sticky)
             .await
     }
 
     /// 发送流式 API 请求
+    /// `sticky` 决定是否允许会话粘性把凭据钉到会话上。既有路径传 `true`；
+    /// 网关按权重随机分发时传 `false`，否则第一次选中的凭据会接管整个会话，
+    /// "随机"只在第一次生效。
     pub async fn call_api_stream(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        sticky: bool,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group)
+        self.call_api_with_retry(request_body, true, sink, group, sticky)
             .await
     }
 
@@ -730,6 +738,7 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        sticky: bool,
     ) -> anyhow::Result<KiroCallResult> {
         // Deterministic client errors stop before credentials, profile discovery or
         // retry logic. Final endpoint-specific payload is checked again below.
@@ -764,6 +773,9 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型与会话标识
         let (model, session_id) = Self::extract_routing_hints(request_body);
+        // 关掉粘性就是**彻底**不参与：既不按会话选号，也不把结果钉回会话。
+        // 只做其中一半，会话仍会被上一次的绑定拖住。
+        let session_id = Self::routing_session(session_id, sticky);
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
@@ -1337,6 +1349,13 @@ impl KiroProvider {
         });
     }
 
+    /// 关掉粘性时不把会话标识交给选号，**同时**也就不会在成功后钉回会话：
+    /// `bind_session` 用的是同一个值。只做其中一半的话，这一次不按会话选号，
+    /// 但仍会把结果绑上去，下一次照样被钉住，等于没关。
+    fn routing_session(session_id: Option<String>, sticky: bool) -> Option<String> {
+        if sticky { session_id } else { None }
+    }
+
     /// 一次解析同时取出调度需要的两个提示：
     /// - 模型 id（`conversationState.currentMessage.userInputMessage.modelId`），用于按模型过滤凭据
     /// - 会话 id（`conversationState.conversationId`），用于会话粘性路由
@@ -1432,6 +1451,23 @@ fn account_rate_limit_with_fallback(
 
 #[cfg(test)]
 mod rate_limit_tests {
+
+    /// 关掉粘性必须**彻底**：同一个值既喂给选号，也用于成功后的会话绑定。
+    /// 只做其中一半——这次不按会话选号但仍绑回去——下一次照样被钉住，等于没关。
+    #[test]
+    fn turning_off_stickiness_withholds_the_session_from_both_ends() {
+        let session = Some("sess-1".to_string());
+        assert_eq!(
+            KiroProvider::routing_session(session.clone(), true),
+            Some("sess-1".to_string()),
+            "粘性开着时会话照常参与"
+        );
+        assert_eq!(
+            KiroProvider::routing_session(session, false),
+            None,
+            "关掉粘性就不该把会话交出去——选号与绑定用的是同一个值"
+        );
+    }
     use super::*;
 
     #[test]

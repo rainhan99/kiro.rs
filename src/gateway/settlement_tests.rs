@@ -53,6 +53,7 @@ fn applying_a_route_replaces_both_the_model_and_the_group() {
     let route = KiroRoute {
         upstream_model: "real-upstream-model".into(),
         group: Some("team-a".into()),
+        sticky: true,
         settlement: Arc::new(Settlement::new(
             Arc::new(
                 GatewayService::open(

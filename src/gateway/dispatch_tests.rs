@@ -777,3 +777,51 @@ async fn a_kiro_failure_releases_only_when_nothing_reached_the_client() {
         );
     }
 }
+
+/// 按权重随机分发时必须关掉 Kiro 的会话粘性。
+///
+/// 粘性会把第一次选中的凭据钉到整个会话上，于是"随机"只在第一次生效，
+/// 之后每一轮都落回同一个凭据——配了随机却得到固定，而且看不出来。
+#[tokio::test]
+async fn random_routing_turns_off_kiro_session_stickiness() {
+    for (mode, expect_sticky) in [
+        (RoutingMode::WeightedRandom, false),
+        (RoutingMode::Sticky, true),
+    ] {
+        let config_path = temp("config.json");
+        let ledger_path = temp("billing.db");
+        let config = GatewayConfig {
+            models: vec![PublicModel {
+                id: "opus5".into(),
+                display_name: None,
+                routing_mode: Some(mode),
+                affinity_ttl_secs: None,
+                bindings: vec![credit_binding("k", "kiro", 0)],
+            }],
+            upstreams: vec![kiro_upstream()],
+            ..GatewayConfig::default()
+        };
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let f = Fixture {
+            service: Arc::new(GatewayService::open(&config_path, &ledger_path).unwrap()),
+            config_path,
+            ledger_path,
+        };
+        credit_account(&f, 7, 0.0, Some(100.0));
+
+        let fake = Fake::default();
+        let Dispatched::UseKiro(route) = dispatch(
+            &f.service,
+            &fake,
+            WireProtocol::Anthropic,
+            &request(),
+            &ctx(),
+            "r1",
+        )
+        .await
+        else {
+            panic!("{mode:?}：应交回 Kiro 通道");
+        };
+        assert_eq!(route.sticky, expect_sticky, "{mode:?}");
+    }
+}
