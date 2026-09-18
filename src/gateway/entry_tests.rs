@@ -454,3 +454,134 @@ async fn managed_aliases_are_listed_even_without_a_kiro_provider() {
     assert_eq!(models[0]["context_window"], 200_000);
     assert_eq!(models[0]["max_tokens"], 8_000);
 }
+
+/// 额度判定从鉴权挪到了知道模型名的那一层。三种情形必须各自正确：
+///
+/// 1. 积分耗尽的 Key 请求**网关接管**的按钱计费别名 → 放行（账本按路判定）；
+/// 2. 同一个 Key 请求**未接管**的别名 → 仍按遗留计数器拒绝，措辞不变；
+/// 3. 网关没接管任何模型时 → 与从前逐字一致，鉴权层直接拒绝。
+///
+/// 第 1 条是整件事的目的：一个积分用完、但人民币账户有余额的 Key，
+/// 走按钱计费的路完全应该放行。从前它在鉴权层就被拦死了。
+#[tokio::test]
+async fn a_credit_exhausted_key_still_reaches_a_money_route() {
+    let base = upstream_server().await;
+    let f = fixture(&base, false);
+    let client = crate::gateway::execute::build_client(
+        std::time::Duration::from_secs(5),
+        crate::model::config::TlsBackend::Rustls,
+        None,
+    )
+    .unwrap();
+    let entry = Arc::new(GatewayEntry::new(f.service.clone(), client));
+
+    let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    let key = keys.create_with_key("t".into(), None, None, "sk-test-key".into());
+    // 积分用满：遗留计数器判定为耗尽。
+    assert!(keys.set_max_credits(key.id, Some(10.0)));
+    keys.record_usage(key.id, 0, 0, 0, 0, 10.0);
+    // 但人民币账户有余额。
+    f.service
+        .ledger()
+        .unwrap()
+        .set_account(
+            key.id,
+            BudgetPolicy {
+                unit: BillingUnit::Cny,
+                limit: Some("100".parse().unwrap()),
+                enforcement: BudgetEnforcement::Soft,
+                max_in_flight: 8,
+                max_pending: 16,
+                allowed_models: vec![],
+                allowed_upstreams: vec![],
+            },
+        )
+        .unwrap();
+
+    let app = crate::anthropic::create_router_with_shared_provider(
+        None,
+        false,
+        crate::model::config::ToolCompatibilityMode::default(),
+        Some(keys.clone()),
+        None,
+        None,
+        None,
+        None,
+        Some(entry),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = reqwest::Client::new();
+
+    // 1) 接管的别名：放行。
+    let response = http
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "sk-test-key")
+        .json(&serde_json::json!({
+            "model": "opus5", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "积分耗尽不该挡住一条按钱计费、且账户有余额的路"
+    );
+
+    // 2) 未接管的别名：仍按遗留计数器拒绝。
+    let response = http
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "sk-test-key")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429, "遗留路径仍由遗留计数器管着");
+    let error: Value = response.json().await.unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("积分使用上限"),
+        "措辞不得变，运维与客户端都认得它"
+    );
+}
+
+/// 没有网关时行为与从前逐字一致：鉴权层直接 429。
+#[tokio::test]
+async fn without_a_gateway_the_legacy_limit_still_stops_at_auth() {
+    let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    let key = keys.create_with_key("t".into(), None, None, "sk-test-key".into());
+    assert!(keys.set_max_credits(key.id, Some(10.0)));
+    keys.record_usage(key.id, 0, 0, 0, 0, 10.0);
+
+    let app = crate::anthropic::create_router_with_shared_provider(
+        None,
+        false,
+        crate::model::config::ToolCompatibilityMode::default(),
+        Some(keys),
+        None,
+        None,
+        None,
+        None,
+        None, // 没有网关
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "sk-test-key")
+        .json(&serde_json::json!({"model": "anything", "max_tokens": 1, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+}

@@ -30,6 +30,12 @@ pub struct KeyContext {
     pub key_source: TraceKeySource,
     /// 客户端 IP（转发头优先，回落到 TCP 对端），仅用于请求日志
     pub client_ip: Option<String>,
+    /// 遗留积分计数器已达上限时的 (已用, 上限)。
+    ///
+    /// 鉴权层知道这件事，却**不知道请求的是哪个模型**，因此不再自己下结论：
+    /// 一个积分耗尽、但人民币账户有余额的 Key，走按钱计费的路完全应该放行。
+    /// 判定挪到知道模型名的那一层（见 [`gateway_middleware`]）。
+    pub legacy_credit_exhausted: Option<(f64, f64)>,
 }
 
 /// 应用共享状态
@@ -117,6 +123,13 @@ impl AppState {
     }
 }
 
+fn legacy_exhausted(request: &axum::extract::Request) -> Option<(f64, f64)> {
+    request
+        .extensions()
+        .get::<KeyContext>()
+        .and_then(|c| c.legacy_credit_exhausted)
+}
+
 /// 网关入口中间件。
 ///
 /// 只有被网关接管的别名会在这里被截走；其余请求**原样**继续走既有路径，
@@ -132,15 +145,21 @@ pub async fn gateway_middleware(
         return next.run(request).await;
     };
     if !entry.manages_anything() {
+        // 配置可能在鉴权之后被改小了。鉴权已经把判定让给了这一层，
+        // 这里不能让一个积分耗尽的 Key 就这么过去。
+        if let Some((used, limit)) = legacy_exhausted(&request) {
+            return over_limit_response(used, limit);
+        }
         return next.run(request).await;
     }
     let Some(protocol) = crate::gateway::entry::protocol_for_path(request.uri().path()) else {
         return next.run(request).await;
     };
-    let Some(key_id) = request.extensions().get::<KeyContext>().map(|c| c.key_id) else {
+    let Some(key_ctx) = request.extensions().get::<KeyContext>().cloned() else {
         // 没有身份就不该走到这里；交回既有路径由它按自己的规则处理。
         return next.run(request).await;
     };
+    let key_id = key_ctx.key_id;
 
     let (parts, body) = request.into_parts();
     // 请求体上限已由路由层的 DefaultBodyLimit 管着，这里不再设第二道。
@@ -164,6 +183,14 @@ pub async fn gateway_middleware(
             .run(axum::extract::Request::from_parts(parts, Body::from(bytes)))
             .await;
     };
+
+    // 未被网关接管的别名仍走既有 Kiro 路径，那条路的额度由遗留计数器管着。
+    // 只有网关接管的别名才由账本按路判定。
+    if let Some((used, limit)) = key_ctx.legacy_credit_exhausted
+        && !entry.manages(value.get("model").and_then(serde_json::Value::as_str).unwrap_or(""))
+    {
+        return over_limit_response(used, limit);
+    }
 
     let request_id = uuid::Uuid::new_v4().to_string();
     match entry.handle(protocol, value, key_id, request_id).await {
@@ -202,18 +229,31 @@ pub async fn auth_middleware(
                     group,
                     key_source: TraceKeySource::ClientKey,
                     client_ip,
+                    legacy_credit_exhausted: None,
                 });
                 return next.run(request).await;
             }
-            KeyAuth::OverLimit { used, limit, .. } => {
-                let error = ErrorResponse::new(
-                    "rate_limit_error",
-                    format!(
-                        "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
-                        used, limit
-                    ),
-                );
-                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            KeyAuth::OverLimit { id, used, limit } => {
+                // 网关没接管任何模型时，这里就是终点，行为与从前逐字一致。
+                let gateway_may_serve = state
+                    .gateway
+                    .as_ref()
+                    .is_some_and(|entry| entry.manages_anything());
+                if !gateway_may_serve {
+                    return over_limit_response(used, limit);
+                }
+                // 接管了：带着这个事实往下走，由知道模型名的那一层判定。
+                // 与从前一样不累加调用次数——这次还没被放行。
+                let group = mgr.group_of(id);
+                let client_ip = auth::extract_client_ip(&request);
+                request.extensions_mut().insert(KeyContext {
+                    key_id: id,
+                    group,
+                    key_source: TraceKeySource::ClientKey,
+                    client_ip,
+                    legacy_credit_exhausted: Some((used, limit)),
+                });
+                return next.run(request).await;
             }
             KeyAuth::NotFound => {}
         }
@@ -221,6 +261,18 @@ pub async fn auth_middleware(
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+}
+
+/// 遗留积分上限的拒绝应答。措辞与从前逐字一致，客户端与运维都认得它。
+fn over_limit_response(used: f64, limit: f64) -> Response {
+    let error = ErrorResponse::new(
+        "rate_limit_error",
+        format!(
+            "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+            used, limit
+        ),
+    );
+    (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response()
 }
 
 /// CORS 中间件层

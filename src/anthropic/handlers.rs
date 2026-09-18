@@ -2651,6 +2651,7 @@ mod tests {
                     group: None,
                     key_source: TraceKeySource::MasterApiKey,
                     client_ip: None,
+                    legacy_credit_exhausted: None,
                 },
                 model: "test-model".to_string(),
                 is_stream: true,
