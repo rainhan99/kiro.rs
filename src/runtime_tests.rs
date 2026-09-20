@@ -241,3 +241,75 @@ async fn the_defensive_default_endpoint_guard_returns_an_error_not_an_exit() {
         .count();
     assert_eq!(live_exits, 0, "runtime.rs 里不允许出现 process::exit");
 }
+
+/// 网关的失败**必须**让 serve() 整体失败。
+///
+/// 若有人把它改成 warn 后继续，服务会带着一个记不了账的网关跑起来——
+/// 而这条路上正在花真钱。这个测试就是钉住这一点的。
+/// 写一份声明了上游的 `gateway.json`。
+///
+/// 没有它网关是**彻底惰性**的——`GatewayService::open` 只有在配置声明了
+/// upstream 或 model 时才会去开账本（service.rs:90）。测试要触发「账本打不开」，
+/// 就必须先让网关有理由去开它。用 `ConfigStore` 自己来写，避免猜文件格式。
+fn write_gateway_config_with_one_upstream(cache_dir: &std::path::Path) {
+    use crate::gateway::config::{GatewayConfig, Upstream, UpstreamKind};
+    use crate::gateway::config_store::ConfigStore;
+
+    let store = ConfigStore::open(&cache_dir.join("gateway.json")).unwrap();
+    store
+        .update(
+            1,
+            GatewayConfig {
+                upstreams: vec![Upstream {
+                    id: "u1".into(),
+                    name: "upstream 1".into(),
+                    kind: UpstreamKind::Anthropic,
+                    enabled: true,
+                    weight: 10,
+                    base_url: None,
+                    api_key: Some("k".into()),
+                    has_api_key: true,
+                    allow_private_network: false,
+                    kiro_group: None,
+                    cache_usage_policy: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_gateway_that_cannot_open_its_ledger_aborts_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+
+    // cache_dir 取的是凭据文件的父目录，所以网关的两个文件都落在这里。
+    write_gateway_config_with_one_upstream(dir.path());
+    // 用一个**目录**占住 billing.db 的位置：SQLite 打不开它。
+    std::fs::create_dir(dir.path().join("billing.db")).unwrap();
+
+    let err = serve(Options::new(config, creds))
+        .await
+        .expect_err("账本打不开时必须拒绝启动，而不是降级为无账本运行");
+    assert!(
+        format!("{err:#}").contains("网关初始化失败"),
+        "实际: {err:#}"
+    );
+}
+
+/// 与上一条互为对照：**没有**网关配置时，账本位置被占住也不该影响启动。
+///
+/// 这条钉住「未配置网关的部署不因为引入这个特性而改变行为」。少了它，
+/// 有人把 open 改成总是开账本，上一条测试照样绿，而所有没配网关的部署会挂。
+#[tokio::test]
+async fn an_unconfigured_gateway_never_touches_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    std::fs::create_dir(dir.path().join("billing.db")).unwrap();
+
+    let server = serve(Options::new(config, creds))
+        .await
+        .expect("网关未配置时应当完全惰性，不碰账本");
+    server.shutdown().await.unwrap();
+}
