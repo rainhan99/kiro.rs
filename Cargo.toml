@@ -11,9 +11,8 @@ path = "src/lib.rs"
 name = "kiro-rs"
 path = "src/main.rs"
 
-# desktop/src-tauri 在 B1 加入。现在填会因目录不存在而构建失败。
 [workspace]
-members = []
+members = ["desktop/src-tauri"]
 
 [features]
 default = ["native-tls"]

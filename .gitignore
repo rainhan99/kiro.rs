@@ -39,3 +39,7 @@
 /.local-test/
 /aab822_*.json
 /jac0991_*.json
+
+# Tauri 生成物（schema、capabilities 的派生文件）。构建产物本身走 workspace
+# 根的 /target，已在上面忽略。
+/desktop/src-tauri/gen/

@@ -173,7 +173,7 @@ jobs:
       - name: Build app
         env:
           RUSTFLAGS: ${{ contains(matrix.target, 'linux-gnu') && '-C link-arg=-fuse-ld=mold' || '' }}
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+        run: cargo build --release --locked -p kiro-rs --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
       # run 页面要能自己说清「这是什么、产物在哪、正式发版怎么做」，
       # 否则只能从运行列表的提交标题去猜，而那句话说的是提交、不是构建。
