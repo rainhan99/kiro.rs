@@ -18,7 +18,7 @@ pub mod token;
 
 pub mod runtime;
 
-pub use runtime::Options;
+pub use runtime::{Options, RunningServer, serve};
 
 #[cfg(test)]
 #[path = "runtime_tests.rs"]

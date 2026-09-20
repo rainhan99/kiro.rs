@@ -4,7 +4,12 @@
 //! **装配失败必须返回错误，而不是终止进程**。二进制形态下由 `main.rs`
 //! 这层薄壳把错误翻译成退出码，行为与从前一致。
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use axum::Router;
+
+use crate::model::config::Config;
 
 /// 库入口的启动参数。字段公开，调用方直接构造。
 pub struct Options {
@@ -23,4 +28,70 @@ impl Options {
             allow_self_update: true,
         }
     }
+}
+
+/// 正在运行的服务。持有实际监听地址与关停手柄。
+pub struct RunningServer {
+    addr: SocketAddr,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    joined: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl RunningServer {
+    /// 实际监听地址。配置里写 0、或端口被占用而回退时，这里是真正拿到的那个。
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// 优雅关停：停止收新连接，等在飞请求走完。
+    ///
+    /// 这不是可有可无的礼貌。网关的在飞预留要靠请求自己走完既有的结算/释放
+    /// 路径；把 axum 任务直接丢弃会在账本上留下永不结算的记录。
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        let _ = self.shutdown.send(());
+        self.joined.await??;
+        Ok(())
+    }
+}
+
+/// 在当前 tokio 运行时上启动 kiro-rs。
+///
+/// **不自建运行时**：Tauri 自带一个，同进程两个运行时会让 `Handle::current()`
+/// 拿到错误的那个，表现是随机的 "no reactor running" panic。
+pub async fn serve(options: Options) -> anyhow::Result<RunningServer> {
+    let (app, addr_spec) = assemble(&options).await?;
+    let listener = tokio::net::TcpListener::bind(addr_spec).await?;
+    let addr = listener.local_addr()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let joined = tokio::spawn(async move {
+        // with_connect_info：把 TCP 对端地址注入请求扩展，直连部署下作为
+        // 客户端 IP 的兜底。与二进制从前的行为一致，不能省。
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    Ok(RunningServer {
+        addr,
+        shutdown: tx,
+        joined,
+    })
+}
+
+/// 装配整个应用。装配失败返回 `Err`——调用方决定怎么死。
+///
+/// 目前只到「读配置、定地址」。凭据池、端点、网关与路由在 A4–A7 逐步搬入。
+async fn assemble(options: &Options) -> anyhow::Result<(Router, SocketAddr)> {
+    let config = Config::load(&options.config_path)
+        .map_err(|e| anyhow::anyhow!("加载配置失败: {e}"))?;
+
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("监听地址无法解析 {}:{}: {e}", config.host, config.port))?;
+
+    Ok((Router::new(), addr))
 }

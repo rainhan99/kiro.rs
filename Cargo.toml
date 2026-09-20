@@ -60,3 +60,6 @@ tar = "0.4"         # tar 解析（在线更新）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
 rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+
+[dev-dependencies]
+tempfile = "3"        # 库入口测试需要真实的临时配置文件
