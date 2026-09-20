@@ -19,6 +19,7 @@ import {
   PackageOpen,
   ShieldCheck,
   GitBranch,
+  Waypoints,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -91,6 +92,7 @@ export const TABS: readonly TabItem[] = [
     icon: SlidersHorizontal,
     children: [
       { key: "pipeline", label: "请求管线", icon: GitBranch },
+      { key: "gateway", label: "多上游网关", icon: Waypoints },
       { key: "dispatch", label: "调度策略", icon: Gauge },
       { key: "metadata", label: "凭据字段", icon: Tags },
       { key: "models", label: "模型配置", icon: Cpu },

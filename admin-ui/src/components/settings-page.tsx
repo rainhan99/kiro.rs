@@ -46,7 +46,12 @@ type SectionKey =
   | 'pipeline'
   | 'gateway'
 
-const SECTIONS: {
+/// 设置页的分区列表（窄屏顶部导航用）。
+///
+/// 桌面端的入口在 `app-layout.tsx` 的 `TABS` 里，是**另一份**列表。两份必须一一
+/// 对应，否则新加的分区只在一种屏宽下点得到——多上游网关就这么漏过一次：设置页
+/// 加了，侧边栏没加，桌面端根本进不去。`settings-sections.test.js` 钉住这件事。
+export const SECTIONS: {
   key: SectionKey
   label: string
   icon: React.ReactNode
