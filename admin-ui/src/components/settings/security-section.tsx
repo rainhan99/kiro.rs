@@ -7,6 +7,7 @@ import { SettingGroup, SettingRow } from '@/components/console/setting-row'
 import { storage } from '@/lib/storage'
 import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
+import { maskAdminKey, currentKeyRow } from './admin-key-display'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
 /**
@@ -20,10 +21,26 @@ import { useConfirm } from '@/components/ui/confirm-dialog'
  */
 export function SecuritySection() {
   const confirm = useConfirm()
+  const current = currentKeyRow()
+  const [revealed, setRevealed] = useState(false)
   const [draft, setDraft] = useState('')
   const [plain, setPlain] = useState(false)
   const [copied, setCopied] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+
+  const copyCurrent = async () => {
+    const key = storage.getApiKey()
+    if (!key) {
+      toast.error('本地没有登录密钥')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(key)
+      toast.success('当前密钥已复制到剪贴板')
+    } catch {
+      toast.error('复制失败，请点「显示」后手动选中')
+    }
+  }
 
   const copy = async () => {
     if (!draft.trim()) {
@@ -54,7 +71,8 @@ export function SecuritySection() {
     const ok = await confirm({
       title: '替换登录密钥？',
       description:
-        '旧密钥立即失效，使用旧密钥调用 API 的下游都需要换成新密钥。当前浏览器会自动切到新密钥，不会掉线。',
+        '旧密钥立即失效，其它已登录的浏览器需要重新登录。当前浏览器会自动切到新密钥，不会掉线。'
+        + '客户端 API Key 是另一个密钥，下游调用不受影响。',
       confirmText: '替换',
       destructive: true,
     })
@@ -78,12 +96,31 @@ export function SecuritySection() {
   return (
     <SettingGroup
       title="登录密钥"
-      description="用于登录本管理面板，同时是 API 的主密钥（config.json 的 apiKey）"
+      description={current.description}
     >
-      <SettingRow
-        label="替换密钥"
-        hint="旧密钥立即失效。下游客户端需要同步换成新密钥才能继续调用"
-      >
+      <SettingRow label={current.label} hint="桌面版自动登录，这里是查看与复制的地方">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <code className="console-num rounded bg-muted px-2 py-1 text-[12.5px]">
+            {revealed ? (storage.getApiKey() ?? '（未登录）') : maskAdminKey(storage.getApiKey())}
+          </code>
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            onClick={() => setRevealed((v) => !v)}
+            title={revealed ? '隐藏' : '显示'}
+            className="h-7 w-7"
+          >
+            {revealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </Button>
+          <Button size="sm" variant="outline" onClick={copyCurrent}>
+            <Copy className="h-3.5 w-3.5" />
+            复制
+          </Button>
+        </div>
+      </SettingRow>
+
+      <SettingRow label="替换密钥" hint={current.rotateHint}>
         <div className="flex flex-wrap items-center gap-1.5">
           <div className="relative">
             <Input
