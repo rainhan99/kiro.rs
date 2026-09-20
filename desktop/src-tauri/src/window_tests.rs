@@ -50,50 +50,43 @@ fn the_bundle_targets_cover_both_platforms() {
     assert!(targets.contains(&"nsis"), "SC-11 要 Windows 安装包");
 }
 
-/// 免登录注入脚本必须写对 localStorage 的键名。
+/// 桌面端注入的是 **setup token**，不是管理密钥。
 ///
-/// 管理界面读的是 `adminApiKey`（admin-ui/src/lib/storage.ts:8）。写错一个
-/// 字母的表现是「没报错，但还是要你登录」——最难查的那种。
+/// 这是「免登录」被推翻后的替代品：桌面端自己就是打印那串口令的进程，
+/// 没理由让用户再手抄一遍——但密码仍然要用户自己设。
+///
+/// 键名必须与 `admin-ui/src/App.tsx` 的 `readProvidedSetupToken` 一致。
+/// 写错一个字母的表现是「初始化页还是问我要口令」——最难查的那种。
 #[test]
-fn the_auto_login_script_writes_the_key_the_admin_ui_reads() {
-    let script = auto_login_script("sk-admin-abc");
+fn the_injected_script_carries_the_setup_token_not_the_admin_key() {
+    let script = setup_token_script("TOKEN123");
+    assert!(script.contains("localStorage.setItem"), "实际: {script}");
     assert!(
-        script.contains("localStorage.setItem"),
-        "实际: {script}"
+        script.contains("\"kiroSetupToken\""),
+        "键名必须与 App.tsx 的 readProvidedSetupToken 一致，实际: {script}"
     );
+    assert!(script.contains("TOKEN123"));
     assert!(
-        script.contains("\"adminApiKey\""),
-        "键名必须与 admin-ui 的 storage.ts 一致，实际: {script}"
+        !script.contains("adminApiKey"),
+        "绝不能注入管理密钥——那就退回免登录了，实际: {script}"
     );
-    assert!(script.contains("sk-admin-abc"));
 }
 
-/// 密钥来自配置文件，内容是任意字符串——用户可以把它改成带引号、
-/// 反斜杠甚至换行的东西。直接拼进 JS 会造出语法错误，或者更糟：注入。
+/// token 是随机串，但脚本拼接仍要转义：这一行将来可能被改成注入别的东西。
 #[test]
-fn the_auto_login_script_escapes_the_key() {
-    let nasty = "a\"b\\c\nd</script>";
-    let script = auto_login_script(nasty);
-
-    assert!(
-        !script.contains("a\"b"),
-        "原样拼进去了，没有转义: {script}"
-    );
-    assert!(
-        !script.contains('\n') || !script.lines().any(|l| l.contains("a\"b")),
-        "换行没被转义: {script}"
-    );
-    // JSON 转义后应当是一个合法的 JS 字符串字面量
+fn the_injected_script_escapes_its_payload() {
+    let script = setup_token_script("a\"b\\c");
+    assert!(!script.contains("a\"b"), "原样拼进去了: {script}");
     assert!(script.contains("\\\""), "引号要被转义，实际: {script}");
 }
 
-/// 没配置管理密钥时不能注入 "null" 这种字符串——那会让管理界面拿着一个
-/// 假密钥去请求，然后报 401，用户完全看不懂。
+/// 已初始化时不注入任何东西——那时根本没有 token，注入一个空值只会让
+/// 初始化页以为「宿主提供了口令」从而不显示输入框。
 #[test]
-fn no_script_is_produced_without_a_key() {
-    assert!(auto_login_script_for(None).is_none());
-    assert!(auto_login_script_for(Some("   ")).is_none(), "空白串等同没有");
-    assert!(auto_login_script_for(Some("sk-admin-abc")).is_some());
+fn nothing_is_injected_once_the_instance_is_claimed() {
+    assert!(setup_token_script_for(None).is_none());
+    assert!(setup_token_script_for(Some("   ")).is_none(), "空白串等同没有");
+    assert!(setup_token_script_for(Some("TOKEN123")).is_some());
 }
 
 /// `on_page_load` 对**等待页**也会触发。如果服务起得够快、在等待页那次
@@ -101,7 +94,7 @@ fn no_script_is_produced_without_a_key() {
 /// 与管理界面不同源，注进去毫无用处，且脚本已经被 take 走，真正该注的
 /// 那一次反而没有了。表现是「偶尔要登录、偶尔不用」。
 #[test]
-fn only_the_admin_origin_gets_the_auto_login_script() {
+fn only_the_admin_origin_gets_the_injected_script() {
     assert!(should_inject_login("http://127.0.0.1:8990/admin"));
     assert!(should_inject_login("http://127.0.0.1:49152/admin/"));
     assert!(should_inject_login("http://127.0.0.1:8990/admin#x"));
@@ -114,7 +107,7 @@ fn only_the_admin_origin_gets_the_auto_login_script() {
 /// 只认回环。窗口理论上可以被导航到任何地方（将来加个外链、或者管理界面
 /// 里有个跳转），把管理密钥注给外站是不可接受的。
 #[test]
-fn the_auto_login_script_never_leaves_the_loopback() {
+fn the_injected_script_never_leaves_the_loopback() {
     assert!(!should_inject_login("http://example.com/admin"));
     assert!(!should_inject_login("https://evil.test/admin"));
     assert!(!should_inject_login("http://10.0.0.5:8990/admin"));

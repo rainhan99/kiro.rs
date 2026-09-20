@@ -30,44 +30,47 @@ pub async fn start_proxy() -> anyhow::Result<kiro_rs::RunningServer> {
     kiro_rs::serve(options).await
 }
 
-/// 免登录：把管理密钥直接写进管理界面的 localStorage。
+/// 把一次性 setup token 交给管理界面。
 ///
-/// 桌面端自己就是读配置文件把服务起起来的那个进程——它本来就持有密钥。
-/// 再让用户手输一遍是纯粹的仪式，安全上一点没多：能读配置文件的人本来
-/// 就有密钥。
+/// 桌面端自己就是打印这串口令的那个进程，没理由让用户从控制台手抄一遍
+/// ——桌面版根本没有控制台。初始化页拿到它就只问密码。
+///
+/// **注入的是 token 不是管理密钥**。曾经有一版直接注入 adminApiKey 做
+/// 免登录，被否决了：那把门整个拆了，任何走到未锁屏机器前的人双击即得
+/// 管理权。token 只能用来**设置**密码，而且一次性、设完即废。
 ///
 /// **必须在导航之后注入**：等待页跑在 `tauri://`，管理界面跑在
 /// `http://127.0.0.1:<port>`，两者不同源，localStorage 各是各的。
 ///
-/// 键名与 `admin-ui/src/lib/storage.ts` 里的 `API_KEY_STORAGE_KEY` 一致。
-/// 写错一个字母的表现是「没报错，但还是要你登录」。
-pub fn auto_login_script(admin_key: &str) -> String {
-    // JSON 序列化负责转义：密钥来自配置文件，内容是任意字符串，
-    // 直接拼进 JS 会造出语法错误，或者更糟。
-    let literal = serde_json::to_string(admin_key).unwrap_or_else(|_| "\"\"".to_string());
-    format!("try {{ localStorage.setItem(\"adminApiKey\", {literal}); }} catch (e) {{}}")
+/// 键名与 `admin-ui/src/App.tsx` 的 `readProvidedSetupToken` 一致。
+pub fn setup_token_script(token: &str) -> String {
+    // JSON 序列化负责转义。token 本身是随机字母数字，但这一行将来可能
+    // 被改成注入别的东西，转义是便宜的保险。
+    let literal = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+    format!("try {{ localStorage.setItem(\"kiroSetupToken\", {literal}); }} catch (e) {{}}")
 }
 
-/// 没有可用密钥时返回 `None`。
+/// 已初始化时返回 `None`。
 ///
-/// 注入一个空值或 "null" 会让管理界面拿着假密钥去请求然后报 401，
-/// 用户完全看不懂——还不如老老实实显示登录页。
-pub fn auto_login_script_for(admin_key: Option<&str>) -> Option<String> {
-    admin_key
+/// 那时根本没有 token。注入一个空值会让初始化页以为「宿主提供了口令」
+/// 从而不显示输入框——一个既进不去也说不清为什么的死角。
+pub fn setup_token_script_for(token: Option<&str>) -> Option<String> {
+    token
         .map(str::trim)
-        .filter(|k| !k.is_empty())
-        .map(auto_login_script)
+        .filter(|t| !t.is_empty())
+        .map(setup_token_script)
 }
 
-/// 这个 URL 该不该收到免登录脚本。
+/// 这个 URL 该不该收到注入脚本。
 ///
 /// 两条限制，各有理由：
 ///
 /// 1. **只认回环**。窗口理论上可以被导航到任何地方（将来加个外链、或者
-///    管理界面里有个跳转），把管理密钥注给外站是不可接受的。
+///    管理界面里有个跳转），把 setup token 注给外站是不可接受的——
+///    拿着它就能给这个实例设管理密码。
 /// 2. **只认 /admin 路径**。`on_page_load` 对等待页也会触发；等待页跑在
 ///    `tauri://`，与管理界面不同源，注进去毫无用处，而脚本已经被取走，
-///    真正该注的那一次反而没有了。表现是「偶尔要登录、偶尔不用」。
+///    真正该注的那一次反而没有了。表现是「偶尔要我抄口令、偶尔不用」。
 pub fn should_inject_login(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;

@@ -62,16 +62,13 @@ fn the_generated_config_is_usable_by_the_proxy() {
         config.api_key.as_deref().is_some_and(|k| k.starts_with("sk-")),
         "要生成可用的客户端 Key"
     );
+    // 管理密钥**刻意不生成**：管理权由用户在初始化页自己认领，凭应用
+    // 注入的一次性 setup token。一个用户既没设过也记不住的随机串，
+    // 最后的下场是被翻出来抄一遍、或者干脆一直不换。
     assert!(
-        config
-            .admin_api_key
-            .as_deref()
-            .is_some_and(|k| k.starts_with("sk-")),
-        "要生成可用的管理密钥"
-    );
-    assert_ne!(
-        config.api_key, config.admin_api_key,
-        "两个 Key 不能是同一个：管理密钥的权限严格更大"
+        config.admin_api_key.as_deref().is_none_or(str::is_empty),
+        "新配置不该自带管理密钥，实际: {:?}",
+        config.admin_api_key
     );
 }
 

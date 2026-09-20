@@ -9,7 +9,13 @@ import {
 } from "@/lib/theme";
 import { LoginPage } from "@/components/login-page";
 import { SetupPage } from "@/components/setup-page";
-import { decideEntryScreen } from "@/components/setup-logic";
+import {
+  decideEntryScreen,
+  applySetupCompleted,
+  applyLoggedIn,
+  applyLoggedOut,
+  type ShellState,
+} from "@/components/setup-logic";
 import { fetchSetupStatus } from "@/api/setup";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
@@ -77,10 +83,10 @@ function App() {
   const app = useAppShell();
 
   // 状态还没探到时先不画任何一屏：闪一下登录页再跳走，看起来像是掉线了。
-  if (app.screen === null) return null;
+  if (app.screen === "loading") return null;
 
   if (app.screen === "setup") {
-    return <SetupApp providedToken={app.providedSetupToken} onDone={app.handleLogin} />;
+    return <SetupApp providedToken={app.providedSetupToken} onDone={app.handleSetupDone} />;
   }
 
   if (app.screen === "login") {
@@ -115,16 +121,22 @@ function readProvidedSetupToken(): string | null {
 }
 
 function useAppShell() {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [initialized, setInitialized] = useState<boolean | null>(null);
-  const [probed, setProbed] = useState(false);
+  // 外壳状态只有这一份。从前是 isLoggedIn / initialized / probed 三个
+  // 各自独立的 state，屏幕由一段内联表达式拼出来——那段表达式测不到，
+  // 而「设完密码卡在初始化页」的 bug 就住在那里：initialized 挂载时探
+  // 一次就不再更新，另一份状态却变了。
+  const [shell, setShell] = useState<ShellState>({
+    probed: false,
+    initialized: null,
+    hasKey: false,
+  });
   const providedSetupToken = readProvidedSetupToken();
   const [tab, setTab] = useState<Tab>(readTabFromHash);
   const [theme, setTheme] = useState<ThemeSelection>(() => storage.getThemeSelection());
   const [isDarkMode, setIsDarkMode] = useState(() => resolveDarkMode(theme));
 
   useEffect(() => {
-    if (storage.getApiKey()) setIsLoggedIn(true);
+    if (storage.getApiKey()) setShell(applyLoggedIn);
   }, []);
 
   // 先问一句「这个实例被认领过没有」。未初始化时要显示的是初始化页，
@@ -133,8 +145,7 @@ function useAppShell() {
     let alive = true;
     fetchSetupStatus().then((value) => {
       if (!alive) return;
-      setInitialized(value);
-      setProbed(true);
+      setShell((s) => ({ ...s, initialized: value, probed: true }));
     });
     return () => {
       alive = false;
@@ -173,10 +184,13 @@ function useAppShell() {
     setTab(next);
   };
 
-  const handleLogin = () => setIsLoggedIn(true);
+  const handleLogin = () => setShell(applyLoggedIn);
+  /// 初始化完成 ≠ 登录成功。两件事同时发生：实例被认领了，而且认领它
+  /// 的人现在也登录了。只更新后者会卡在初始化页。
+  const handleSetupDone = () => setShell(applySetupCompleted);
   const handleLogout = () => {
     storage.removeApiKey();
-    setIsLoggedIn(false);
+    setShell(applyLoggedOut);
   };
   const selectPalette = (palette: ThemeId) => {
     setTheme((current) => ({ ...current, palette }));
@@ -187,15 +201,10 @@ function useAppShell() {
 
   return {
     handleLogin,
+    handleSetupDone,
     handleLogout,
-    isLoggedIn,
     providedSetupToken,
-    // 探测没回来之前是 null——此时什么都不画，免得闪一下登录页再跳走。
-    screen: probed
-      ? isLoggedIn && initialized !== false
-        ? "console"
-        : decideEntryScreen({ initialized, storedKey: storage.getApiKey() })
-      : null,
+    screen: decideEntryScreen(shell),
     isDarkMode,
     selectMode,
     selectPalette,

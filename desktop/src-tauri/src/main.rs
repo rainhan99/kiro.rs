@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use kiro_rs_desktop_lib::{
     admin_url, start_proxy,
-    window::{auto_login_script_for, on_exit_requested, should_inject_login},
+    window::{on_exit_requested, setup_token_script_for, should_inject_login},
 };
 use tauri::{AppHandle, Manager};
 
@@ -17,7 +17,7 @@ use tauri::{AppHandle, Manager};
 #[derive(Default)]
 struct AppState {
     server: Mutex<Option<kiro_rs::RunningServer>>,
-    pending_login: Mutex<Option<String>>,
+    pending_inject: Mutex<Option<String>>,
 }
 
 fn main() {
@@ -48,10 +48,12 @@ fn main() {
 
                         let url = admin_url(server.addr());
                         let state = handle.state::<AppState>();
-                        // 免登录脚本要在**导航之后**注入：等待页跑在 tauri://，
-                        // 管理界面跑在 http://127.0.0.1，两者不同源。
-                        *state.pending_login.lock().unwrap() =
-                            auto_login_script_for(server.admin_api_key());
+                        // 注入的是**一次性 setup token**，不是管理密钥——
+                        // 桌面版没有控制台，用户无从抄那串口令；但密码仍然
+                        // 要他自己设。要在**导航之后**注入：等待页跑在
+                        // tauri://，管理界面跑在 http://127.0.0.1，不同源。
+                        *state.pending_inject.lock().unwrap() =
+                            setup_token_script_for(server.setup_token());
 
                         if let Some(window) = handle.get_webview_window("main") {
                             match url.parse() {
@@ -73,15 +75,15 @@ fn main() {
         .on_page_load(|window, payload| {
             // 页面开始加载时注入，赶在管理界面的脚本读 localStorage 之前。
             // 只对管理界面那个源注入，见 should_inject_login 的注释。
-            // 注入一次就清空：之后用户在界面里换了密钥，不该被我们覆盖回去。
+            // 注入一次就清空：token 是一次性的，设完即废。
             if !should_inject_login(payload.url().as_str()) {
                 return;
             }
             let state = window.state::<AppState>();
-            let script = state.pending_login.lock().unwrap().take();
+            let script = state.pending_inject.lock().unwrap().take();
             if let Some(script) = script {
                 if let Err(error) = window.eval(script) {
-                    tracing::warn!("免登录注入失败，将回落到登录页: {error}");
+                    tracing::warn!("setup token 注入失败，初始化页会要求手动粘贴: {error}");
                 }
             }
         })

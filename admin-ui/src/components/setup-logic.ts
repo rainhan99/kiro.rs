@@ -56,18 +56,54 @@ export function validateSetupForm(
 }
 
 /**
- * 进门该看到哪一屏。
+ * 应用外壳的状态。
+ *
+ * 只有这三个字段，屏幕完全由它们决定。**不要**在别处再存一份「是否已
+ * 登录」——两个重叠的真相源正是那个「设完密码卡在初始化页」的 bug 的
+ * 来源：`initialized` 在挂载时探一次就不再更新，而另一份状态变了。
+ */
+export type ShellState = {
+  /** 初始化状态探测是否已经回来。 */
+  probed: boolean
+  /** 实例是否已被认领。`null` 表示没探到。 */
+  initialized: boolean | null
+  /** 本地是否存着可用的管理密钥。 */
+  hasKey: boolean
+}
+
+export type Screen = 'loading' | 'setup' | 'login' | 'console'
+
+/**
+ * 该看到哪一屏。这是唯一的决策点。
  *
  * `initialized === null` 表示状态**没探到**（服务刚起来、网络抖动）。
- * 这时不能猜「未初始化」——那会把初始化页摆到一个已经配好的实例的
- * 用户脸上，看起来像是配置丢了。保守回落到登录页：最坏情况只是让人
- * 多输一次密码。
+ * 这时不能猜「未初始化」——那会把初始化页摆到一个已经配好的实例的用户
+ * 脸上，看起来像是配置丢了。保守回落：有密钥就照常进，没有就登录页。
  */
-export function decideEntryScreen(state: {
-  initialized: boolean | null
-  storedKey: string | null
-}): 'setup' | 'login' | 'console' {
+export function decideEntryScreen(state: ShellState): Screen {
+  if (!state.probed) return 'loading'
   if (state.initialized === false) return 'setup'
-  if (state.initialized === true && state.storedKey) return 'console'
+  if (state.hasKey) return 'console'
   return 'login'
+}
+
+/**
+ * 初始化完成。
+ *
+ * 两件事同时发生，缺一不可：实例被认领了（`initialized`），而且认领它
+ * 的人现在也登录了（`hasKey`）。只更新后者就会卡在初始化页——那正是
+ * 真机跑出来的那个 bug。
+ */
+export function applySetupCompleted(state: ShellState): ShellState {
+  return { ...state, initialized: true, hasKey: true }
+}
+
+/** 登录成功。 */
+export function applyLoggedIn(state: ShellState): ShellState {
+  return { ...state, hasKey: true }
+}
+
+/** 登出。回到登录页而不是初始化页——实例已经被认领了。 */
+export function applyLoggedOut(state: ShellState): ShellState {
+  return { ...state, hasKey: false }
 }

@@ -2,15 +2,24 @@ import { describe, expect, test } from 'bun:test'
 import { maskAdminKey, currentKeyRow } from './admin-key-display'
 
 describe('当前登录密钥的展示', () => {
-  /// 桌面版免登录后用户从没见过这个密钥，而从浏览器或另一台机器连过来时
-  /// 需要它。所以要能看见——但默认脱敏：设置页常在别人能看到屏幕的场合打开。
-  test('默认脱敏，保留首尾便于核对是不是同一个', () => {
-    expect(maskAdminKey('sk-admin-vsUr5HI0EsOJHJRz4qn5Tr9G')).toBe('sk-admin-…qn5Tr9G')
+  /// 管理密钥现在**永远是用户自设的密码**（F1 之后不再生成随机串）。
+  /// 密码没有「前缀不是秘密」这种结构，露出任何一段都是泄露。
+  ///
+  /// 这条是真机跑出来的：原来的实现有一句「太短就原样返回」，
+  /// 那是给 32 位随机串写的理由；换成用户密码之后，它直接把密码打在屏幕上。
+  test('任何长度的密钥都完全遮住，不露出任何一段', () => {
+    for (const key of ['test1234', 'a', 'short', '我的密码', 'sk-admin-vsUr5HI0EsOJHJRz4qn5Tr9G']) {
+      const masked = maskAdminKey(key)
+      expect(masked).not.toContain(key)
+      for (const ch of new Set(key)) {
+        expect(masked).not.toContain(ch)
+      }
+    }
   })
 
-  test('短到脱不了敏的就原样给出，不要造出比原文还长的东西', () => {
-    expect(maskAdminKey('sk-admin-')).toBe('sk-admin-')
-    expect(maskAdminKey('abc')).toBe('abc')
+  /// 连长度都不该透露——密码的长度本身就是给爆破用的情报。
+  test('遮罩长度固定，不随密钥长度变化', () => {
+    expect(maskAdminKey('ab')).toBe(maskAdminKey('a-very-long-password-here'))
   })
 
   /// 没登录/没密钥时不能显示 "undefined" 或 "null" —— 那看起来像是坏了。
@@ -18,6 +27,10 @@ describe('当前登录密钥的展示', () => {
     expect(maskAdminKey(null)).toBe('（未登录）')
     expect(maskAdminKey('')).toBe('（未登录）')
     expect(maskAdminKey('   ')).toBe('（未登录）')
+  })
+
+  test('遮罩看得出是「有东西但被遮住了」，不是空白', () => {
+    expect(maskAdminKey('test1234').trim().length).toBeGreaterThan(0)
   })
 })
 
