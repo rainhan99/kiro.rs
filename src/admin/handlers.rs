@@ -2049,7 +2049,7 @@ pub async fn perform_setup(
 /// GET /api/admin/config/security
 pub async fn get_security_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "requireAuthOnLaunch": state.service.require_auth_on_launch(),
+        "adminSessionTtlHours": state.service.admin_session_ttl_hours(),
     }))
 }
 
@@ -2063,8 +2063,59 @@ pub async fn set_security_config(
 ) -> impl IntoResponse {
     state
         .service
-        .set_require_auth_on_launch(payload.require_auth_on_launch);
+        .set_admin_session_ttl_hours(payload.admin_session_ttl_hours);
+    // 落盘之后还要同步到**正在运行**的会话表——否则新设置要等重启才生效，
+    // 而「我刚把过期时间调短了」的人期待的是现在就短。
+    state
+        .sessions
+        .set_ttl_hours(payload.admin_session_ttl_hours);
     Json(serde_json::json!({
-        "requireAuthOnLaunch": payload.require_auth_on_launch,
+        "adminSessionTtlHours": payload.admin_session_ttl_hours,
     }))
+}
+
+// ============ 会话 ============
+
+/// POST /api/admin/session —— **无需鉴权，它就是鉴权本身**
+///
+/// 用管理密码换一个有 TTL 的 token。密码错就 401，不给任何 token，
+/// 也不回显密码。
+pub async fn create_session(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::CreateSessionRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+
+    let configured = state.admin_api_key.read().clone();
+    // 空密钥永不放行，与 admin_auth_middleware 同一条规矩。
+    let ok = !configured.trim().is_empty()
+        && crate::common::auth::constant_time_eq(&payload.key, &configured);
+
+    if !ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(super::types::AdminErrorResponse::authentication_error()),
+        )
+            .into_response();
+    }
+
+    let issued = state.sessions.issue();
+    Json(serde_json::json!({
+        "token": issued.token,
+        "expiresAt": issued.expires_at,
+    }))
+    .into_response()
+}
+
+/// DELETE /api/admin/session —— 登出
+///
+/// 只作废当前这一个 token。别的设备上的会话不受影响，密码本身更不受影响。
+pub async fn delete_session(
+    State(state): State<AdminState>,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    if let Some(presented) = crate::common::auth::extract_api_key(&request) {
+        state.sessions.revoke(&presented);
+    }
+    Json(super::types::SuccessResponse::new("已登出"))
 }

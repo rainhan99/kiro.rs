@@ -80,7 +80,8 @@ pub(super) fn wiring(base: &Foundation, books: Accounting, options: &Options) ->
                 group_manager.clone(),
             )
             .with_gateway(Some(gateway.clone()))
-            .with_setup(base.setup.clone());
+            .with_setup(base.setup.clone())
+            .with_sessions(base.sessions.clone());
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

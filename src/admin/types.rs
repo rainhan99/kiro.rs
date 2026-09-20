@@ -1351,6 +1351,14 @@ pub struct SetupRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecurityConfigRequest {
-    /// 桌面端每次启动都要重新输入管理密码。
-    pub require_auth_on_launch: bool,
+    /// 管理界面会话有效期（小时）。0 表示不过期。
+    pub admin_session_ttl_hours: u64,
+}
+
+/// 登录请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSessionRequest {
+    /// 管理密码。
+    pub key: String,
 }

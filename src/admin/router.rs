@@ -19,7 +19,8 @@ use super::{
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
         get_current_models, get_custom_models, get_global_proxy, get_load_balancing_mode,
         get_log_governance_config, get_proxy_pool, get_request_pipeline, get_self_heal_config,
-        get_security_config, get_session_affinity_config, get_setup_status, get_update_config,
+        create_session, delete_session, get_security_config, get_session_affinity_config,
+        get_setup_status, get_update_config,
         list_client_keys,
         list_groups, list_traces,
         poll_idc_login, poll_idc_relogin, poll_social_login, poll_social_relogin,
@@ -266,7 +267,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
     // 逐个访问有代表性的既有端点，确认它们仍然 401。
     let public = Router::new()
         .route("/setup/status", get(get_setup_status))
-        .route("/setup", post(perform_setup));
+        .route("/setup", post(perform_setup))
+        // 登录端点也在鉴权层之外——它**就是**鉴权。它自己校验密码，
+        // 错了就 401；这与「整层不设防」是两回事。
+        .route("/session", post(create_session).delete(delete_session));
 
     Router::new()
         .merge(authenticated)

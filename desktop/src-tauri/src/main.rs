@@ -52,10 +52,8 @@ fn main() {
                         // 桌面版没有控制台，用户无从抄那串口令；但密码仍然
                         // 要他自己设。要在**导航之后**注入：等待页跑在
                         // tauri://，管理界面跑在 http://127.0.0.1，不同源。
-                        *state.pending_inject.lock().unwrap() = injection_script(
-                            server.setup_token(),
-                            server.require_auth_on_launch(),
-                        );
+                        *state.pending_inject.lock().unwrap() =
+                            injection_script(server.setup_token(), false);
 
                         if let Some(window) = handle.get_webview_window("main") {
                             match url.parse() {

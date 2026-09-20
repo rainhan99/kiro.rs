@@ -1017,27 +1017,27 @@ async fn an_unset_admin_key_authenticates_nobody_not_even_an_empty_one() {
     server.shutdown().await.unwrap();
 }
 
-/// 「每次启动都要验证」开关：读得到、写得进、落盘、要鉴权。
+/// 会话 TTL：读得到、写得进、落盘、要鉴权，且**立刻**作用于运行中的会话。
 #[tokio::test]
-async fn the_require_auth_setting_round_trips_and_needs_a_key() {
+async fn the_session_ttl_round_trips_and_applies_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let (config, creds) = minimal_files(dir.path());
     let server = serve(Options::new(&config, &creds)).await.unwrap();
     let base = format!("http://{}", server.addr());
     let client = reqwest::Client::new();
 
-    // 它能改变桌面端的进门方式，所以必须要鉴权。
+    // 它能改变谁进得来，所以必须要鉴权。
     let anonymous = client
         .put(format!("{base}/api/admin/config/security"))
-        .json(&serde_json::json!({ "requireAuthOnLaunch": true }))
+        .json(&serde_json::json!({ "adminSessionTtlHours": 8 }))
         .send()
         .await
         .unwrap();
-    assert_eq!(anonymous.status(), 401, "这个开关不能匿名改");
+    assert_eq!(anonymous.status(), 401, "这个设置不能匿名改");
 
-    let read = |c: &reqwest::Client| {
+    let read = || {
         let url = format!("{base}/api/admin/config/security");
-        let c = c.clone();
+        let c = client.clone();
         async move {
             c.get(url)
                 .header("x-api-key", "sk-admin-test")
@@ -1051,28 +1051,216 @@ async fn the_require_auth_setting_round_trips_and_needs_a_key() {
     };
 
     assert_eq!(
-        read(&client).await["requireAuthOnLaunch"],
-        serde_json::json!(false),
-        "默认关"
+        read().await["adminSessionTtlHours"],
+        serde_json::json!(0),
+        "默认不过期——升级上来的人不该某天突然被要求重新登录"
     );
 
     let wrote = client
         .put(format!("{base}/api/admin/config/security"))
         .header("x-api-key", "sk-admin-test")
-        .json(&serde_json::json!({ "requireAuthOnLaunch": true }))
+        .json(&serde_json::json!({ "adminSessionTtlHours": 8 }))
         .send()
         .await
         .unwrap();
     assert_eq!(wrote.status(), 200);
-    assert_eq!(
-        read(&client).await["requireAuthOnLaunch"],
-        serde_json::json!(true)
-    );
+    assert_eq!(read().await["adminSessionTtlHours"], serde_json::json!(8));
 
-    // 落盘了才算数——这个开关的整个意义就在下次启动时兑现。
+    // 落盘了才算数——重启后要还在。
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
-    assert_eq!(saved["requireAuthOnLaunch"], serde_json::json!(true));
+    assert_eq!(saved["adminSessionTtlHours"], serde_json::json!(8));
+
+    // 而且要立刻作用于**正在运行**的会话表，不是等重启。
+    // 「我刚把过期时间调短了」的人期待的是现在就短。
+    let issued: serde_json::Value = client
+        .post(format!("{base}/api/admin/session"))
+        .json(&serde_json::json!({ "key": "sk-admin-test" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        issued["expiresAt"].as_i64().is_some(),
+        "TTL 已经设成 8 小时，新会话就该有到期时间，实际: {issued}"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+// ---------------- 服务端会话 ----------------
+
+/// 用管理密码换 token，token 可用于任意 admin 端点。
+#[tokio::test]
+async fn session_a_correct_password_exchanges_for_a_working_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let base = format!("http://{}", server.addr());
+    let client = reqwest::Client::new();
+
+    let body: serde_json::Value = client
+        .post(format!("{base}/api/admin/session"))
+        .json(&serde_json::json!({ "key": "sk-admin-test" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = body["token"].as_str().expect("要给出 token").to_string();
+    assert!(token.len() >= 32);
+    assert!(
+        !body.to_string().contains("sk-admin-test"),
+        "响应里不该回显密码: {body}"
+    );
+
+    let status = client
+        .get(format!("{base}/api/admin/credentials"))
+        .header("x-api-key", &token)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200, "token 应当能访问 admin 端点");
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_a_wrong_password_gets_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let base = format!("http://{}", server.addr());
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/session"))
+        .json(&serde_json::json!({ "key": "wrong" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let text = resp.text().await.unwrap();
+    assert!(!text.contains("token"), "失败时不该给出任何 token: {text}");
+
+    server.shutdown().await.unwrap();
+}
+
+/// **SC-23：原始管理密钥仍然直接可用。**
+///
+/// 脚本、curl、既有自动化用的都是它，`--show-keys` 给出的也是它。
+/// 引入会话不能把这些全打断——那是一次静默的破坏性变更，用户只会看到
+/// 「升级之后我的脚本全 401 了」。
+#[tokio::test]
+async fn session_the_raw_admin_key_keeps_working_for_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let base = format!("http://{}", server.addr());
+    let client = reqwest::Client::new();
+
+    for header in ["x-api-key", "authorization"] {
+        let value = if header == "authorization" {
+            "Bearer sk-admin-test".to_string()
+        } else {
+            "sk-admin-test".to_string()
+        };
+        let status = client
+            .get(format!("{base}/api/admin/credentials"))
+            .header(header, value)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 200, "原始密钥经 {header} 必须仍然可用");
+    }
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_logging_out_kills_the_token_but_not_the_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let base = format!("http://{}", server.addr());
+    let client = reqwest::Client::new();
+
+    let token = client
+        .post(format!("{base}/api/admin/session"))
+        .json(&serde_json::json!({ "key": "sk-admin-test" }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let out = client
+        .delete(format!("{base}/api/admin/session"))
+        .header("x-api-key", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.status(), 200);
+
+    let after = client
+        .get(format!("{base}/api/admin/credentials"))
+        .header("x-api-key", &token)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(after, 401, "登出后 token 必须立刻失效");
+
+    // 密码本身没被动过
+    let with_password = client
+        .get(format!("{base}/api/admin/credentials"))
+        .header("x-api-key", "sk-admin-test")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(with_password, 200, "登出不该影响密码本身");
+
+    server.shutdown().await.unwrap();
+}
+
+/// 登录端点必须在鉴权层之外——它就是鉴权本身。但也只有它，
+/// 别的端点不能跟着一起开。
+#[tokio::test]
+async fn session_the_login_endpoint_is_public_but_nothing_else_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let base = format!("http://{}", server.addr());
+    let client = reqwest::Client::new();
+
+    // 登录端点无需凭证即可访问（虽然会 401，但那是密码错不是没鉴权）
+    let login = client
+        .post(format!("{base}/api/admin/session"))
+        .json(&serde_json::json!({ "key": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 401, "密码错应当是 401 而不是 404");
+
+    for path in ["/api/admin/credentials", "/api/admin/client-keys"] {
+        let status = client
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401, "{path} 不该跟着一起开放");
+    }
 
     server.shutdown().await.unwrap();
 }

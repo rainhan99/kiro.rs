@@ -39,6 +39,8 @@ pub struct AdminState {
     pub gateway: Option<Arc<crate::gateway::service::GatewayService>>,
     /// 首次初始化状态。未初始化时持有一次性 setup token。
     pub setup: Arc<super::setup::SetupState>,
+    /// 管理界面的会话。浏览器拿 token，脚本继续拿原始密钥。
+    pub sessions: Arc<super::session::SessionStore>,
 }
 
 impl AdminState {
@@ -54,6 +56,12 @@ impl AdminState {
     /// 注入首次初始化状态。
     pub fn with_setup(mut self, setup: Arc<super::setup::SetupState>) -> Self {
         self.setup = setup;
+        self
+    }
+
+    /// 注入会话表。
+    pub fn with_sessions(mut self, sessions: Arc<super::session::SessionStore>) -> Self {
+        self.sessions = sessions;
         self
     }
 
@@ -78,6 +86,8 @@ impl AdminState {
             setup: Arc::new(super::setup::SetupState::from_configured_key(Some(
                 "configured",
             ))),
+            // 默认不过期，由 wiring 用 with_sessions 换成真正的那份。
+            sessions: Arc::new(super::session::SessionStore::new(0)),
         }
     }
 }
@@ -104,8 +114,18 @@ pub async fn admin_auth_middleware(
         return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
     }
 
+    // 两种凭证都收：
+    //
+    // - **会话 token**：浏览器登录后拿到的，有 TTL，过期即废。
+    // - **原始管理密钥**：脚本、curl、既有自动化用的就是它，
+    //   `--show-keys` 给出的也是它。引入会话不能把这些全打断——
+    //   那是一次静默的破坏性变更，用户只会看到「升级后我的脚本全 401 了」。
+    //
+    // 这也是会话的防护上限所在：谁能读 config.json 谁就永远进得去。
+    // 界面上如实说明，不让人以为加了会话就锁死了。
     match api_key {
         Some(key) if auth::constant_time_eq(&key, &current_key) => next.run(request).await,
+        Some(key) if state.sessions.validate(&key) => next.run(request).await,
         _ => {
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

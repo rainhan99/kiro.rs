@@ -27,6 +27,8 @@ pub(crate) struct Foundation {
     pub configured_api_key: Option<String>,
     /// 首次初始化状态。未初始化时持有一次性 setup token。
     pub setup: Arc<crate::admin::setup::SetupState>,
+    /// 管理界面的会话表。
+    pub sessions: Arc<crate::admin::session::SessionStore>,
     /// 所有运行期文件的落脚点：客户端 Key、用量日志、分组、账本、trace、缓存计量。
     /// 取的是凭据文件的父目录——只要调用方传绝对路径，这些文件就不会落到 CWD。
     pub cache_dir: PathBuf,
@@ -188,9 +190,14 @@ pub(crate) fn foundation(options: &Options) -> anyhow::Result<Foundation> {
         config.admin_api_key.as_deref(),
     ));
 
+    let sessions = Arc::new(crate::admin::session::SessionStore::new(
+        config.admin_session_ttl_hours.unwrap_or(0),
+    ));
+
     Ok(Foundation {
         config,
         setup,
+        sessions,
         token_manager,
         kiro_provider,
         endpoint_names,
