@@ -45,10 +45,29 @@ pub fn data_dir_for(_app: &str) -> anyhow::Result<PathBuf> {
 /// 在应用数据目录里准备好配置与凭据文件。
 ///
 /// 已存在则**原样保留**。覆盖用户配置是不可逆的，这里只做「不存在才建」。
+///
+/// 生成逻辑复用 `kiro_rs::runtime::ensure_config_files_with_host`，不在这里
+/// 另写一份——两份实现迟早会在默认值或文件权限上漂移，而那种漂移要等到
+/// 用户双击应用才发现。区别只有一个参数：桌面端绑 `127.0.0.1`。
 pub fn ensure_data_files(base: &Path) -> anyhow::Result<DataPaths> {
     std::fs::create_dir_all(base)?;
     let config = base.join("config.json");
     let credentials = base.join("credentials.json");
+
+    kiro_rs::runtime::ensure_config_files_with_host(
+        &config.to_string_lossy(),
+        &credentials.to_string_lossy(),
+        // 桌面端没有「让局域网里的别人连过来」这个需求，而绑 0.0.0.0
+        // 会把一个带着凭据的代理暴露到局域网。
+        "127.0.0.1",
+    );
+
+    anyhow::ensure!(
+        config.exists() && credentials.exists(),
+        "无法在 {} 下创建配置文件——目录不可写？",
+        base.display()
+    );
+
     Ok(DataPaths {
         config,
         credentials,

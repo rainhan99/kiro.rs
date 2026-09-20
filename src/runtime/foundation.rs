@@ -192,7 +192,20 @@ pub(crate) fn foundation(options: &Options) -> anyhow::Result<Foundation> {
     })
 }
 
+/// 文件不存在时初始化配置/凭证文件。二进制形态用，绑 `0.0.0.0` 适配容器。
 fn ensure_config_files(config_path: &str, credentials_path: &str) {
+    ensure_config_files_with_host(config_path, credentials_path, "0.0.0.0");
+}
+
+/// 文件不存在时初始化配置/凭证文件，`host` 由调用方决定。
+///
+/// 桌面端传 `127.0.0.1`：它没有「让局域网里的别人连过来」这个需求，
+/// 而绑 `0.0.0.0` 会把一个带着凭据的代理暴露到局域网。
+///
+/// 两种形态共用这一份实现，避免各写一份后默认值与权限策略漂移。
+/// 任一步失败都仅打印警告，不中断启动；后续 `Config::load` /
+/// `CredentialsConfig::load` 仍会按既有逻辑处理（失败再退出）。
+pub fn ensure_config_files_with_host(config_path: &str, credentials_path: &str, host: &str) {
     let config_p = std::path::Path::new(config_path);
     if !config_p.exists() {
         if let Some(parent) = config_p.parent() {
@@ -205,7 +218,7 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         let api_key = format!("sk-kiro-rs-{}", random_token(24));
         let admin_api_key = format!("sk-admin-{}", random_token(24));
         let default = serde_json::json!({
-            "host": "0.0.0.0",
+            "host": host,
             "port": 8990,
             "apiKey": api_key,
             "adminApiKey": admin_api_key,
@@ -215,7 +228,7 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         });
         match serde_json::to_string_pretty(&default)
             .map_err(anyhow::Error::from)
-            .and_then(|s| std::fs::write(config_p, s).map_err(anyhow::Error::from))
+            .and_then(|s| write_private(config_p, s.as_bytes()))
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
@@ -236,7 +249,7 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
                 }
             }
         }
-        if let Err(e) = std::fs::write(cred_p, "[]\n") {
+        if let Err(e) = write_private(cred_p, b"[]\n") {
             tracing::warn!("写入空凭证文件失败 {}: {}", cred_p.display(), e);
         } else {
             tracing::info!(
@@ -244,6 +257,35 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
                 cred_p.display()
             );
         }
+    }
+}
+
+/// 写一个只有属主可读写的文件。
+///
+/// `config.json` 里有 `apiKey` 与 `adminApiKey`，`credentials.json` 里有刷新
+/// 令牌。世界可读的话，同机任何进程都能拿走它们——桌面端尤其容易中招，
+/// 因为用户不会想到去看权限。
+///
+/// 非 Unix 平台没有 mode 概念，退化成普通写入（Windows 上用户目录默认
+/// 就不是世界可读的）。
+fn write_private(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+        Ok(())
     }
 }
 

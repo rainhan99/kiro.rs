@@ -17,6 +17,8 @@ mod wiring;
 // `pub(crate)` 意味着它们出不了这个 crate——对外只有 serve()/Options/RunningServer。
 pub(crate) use accounting::{Accounting, accounting};
 pub(crate) use foundation::{Foundation, foundation};
+// 桌面应用用它生成自己的默认配置——同一份实现，避免默认值与权限策略漂移。
+pub use foundation::ensure_config_files_with_host;
 pub use wiring::log_startup_banner;
 use wiring::wiring;
 
