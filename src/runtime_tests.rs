@@ -491,21 +491,9 @@ async fn absolute_paths_keep_every_runtime_file_out_of_the_working_directory() {
     );
 }
 
-/// 会落在 `cache_dir` 下、且内容足以让人冒充或花钱的文件。
-///
-/// - `config.json`：apiKey 与 adminApiKey
-/// - `credentials.json`：Kiro 刷新令牌
-/// - `client_api_keys.json`：明文 `sk-…` 客户端 Key
-/// - `gateway.json`：上游 API Key
-/// - `billing.db`：账本
-const SECRET_BEARING_FILES: &[&str] = &[
-    "config.json",
-    "credentials.json",
-    "client_api_keys.json",
-    "gateway.json",
-    "billing.db",
-    "traces.db",
-];
+// 秘密文件清单住在 `common::fs::SECRET_FILES`——与 harden_data_dir 同源。
+// 两处各写一张表迟早会漂移，而漂移的表现是「守卫还在，但漏了新文件」。
+use crate::common::fs::SECRET_FILES;
 
 /// 这些文件一个都不能是世界可读的。
 ///
@@ -535,7 +523,7 @@ async fn no_secret_bearing_runtime_file_is_world_readable() {
     server.shutdown().await.unwrap();
 
     let mut offenders = Vec::new();
-    for name in SECRET_BEARING_FILES {
+    for name in SECRET_FILES {
         let path = dir.path().join(name);
         if !path.exists() {
             continue;
@@ -591,4 +579,40 @@ fn the_startup_banner_reports_the_actual_address() {
         std::path::Path::new("/data"),
     );
     assert!(lines.join("\n").contains("49152"));
+}
+
+/// 升级路径：老部署里已经躺着一批 644 的秘密文件，启动时必须被收紧。
+///
+/// 这条是真机跑出来的。`write_private` 只在**写入**时收紧，而
+/// `client_api_keys.json` 只有内容变化时才写——一个没加过 Key 的部署，
+/// 它可以几个月都不被写一次，于是永远停在 644。
+///
+/// 结论：不能只在写入点设防，启动时要主动扫一遍。
+#[cfg(unix)]
+#[tokio::test]
+async fn pre_existing_world_readable_files_are_tightened_at_startup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+
+    // 模拟老部署：文件已存在且是 644，且启动过程中不会被改写。
+    let legacy = dir.path().join("client_api_keys.json");
+    std::fs::write(&legacy, "[]").unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // 配置里也放宽一次，确认连它自己都会被收紧
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    server.shutdown().await.unwrap();
+
+    for path in [&legacy, &config] {
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} 启动后仍是 {mode:o}——老部署的宽权限文件没被收紧",
+            path.display()
+        );
+    }
 }

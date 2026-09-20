@@ -2,8 +2,23 @@
 // 否则开发时看不到日志。
 #![cfg_attr(not(debug_assertions), cfg_attr(windows, windows_subsystem = "windows"))]
 
-use kiro_rs_desktop_lib::{admin_url, start_proxy};
-use tauri::Manager;
+use std::sync::Mutex;
+
+use kiro_rs_desktop_lib::{
+    admin_url, start_proxy,
+    window::{auto_login_script_for, on_exit_requested, should_inject_login},
+};
+use tauri::{AppHandle, Manager};
+
+/// 被 Tauri 托管的运行期状态。
+///
+/// - `server`：退出时取回来做优雅关停（否则网关的在飞预留会被直接丢弃）。
+/// - `pending_login`：导航到管理界面后要注入的免登录脚本，注入一次就清空。
+#[derive(Default)]
+struct AppState {
+    server: Mutex<Option<kiro_rs::RunningServer>>,
+    pending_login: Mutex<Option<String>>,
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -15,17 +30,25 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        .manage(AppState::default())
         .setup(|app| {
             let handle = app.handle().clone();
-            // 窗口此刻显示的是打包进应用的等待页。代理在后台起，
-            // 拿到实际地址后再导航过去——顺序反了用户会看到「无法连接」。
+            // 窗口此刻显示的是打包进应用的等待页。代理在后台起，拿到实际
+            // 地址后再导航过去——顺序反了用户会看到「无法连接」。
             tauri::async_runtime::spawn(async move {
                 match start_proxy().await {
                     Ok(server) => {
                         // 与命令行同一份横幅：形态不同不该让「服务在哪、
                         // 数据在哪」这两件事的说法也不同。
                         kiro_rs::runtime::log_startup_banner(server.addr(), server.data_dir());
+
                         let url = admin_url(server.addr());
+                        let state = handle.state::<AppState>();
+                        // 免登录脚本要在**导航之后**注入：等待页跑在 tauri://，
+                        // 管理界面跑在 http://127.0.0.1，两者不同源。
+                        *state.pending_login.lock().unwrap() =
+                            auto_login_script_for(server.admin_api_key());
+
                         if let Some(window) = handle.get_webview_window("main") {
                             match url.parse() {
                                 Ok(parsed) => {
@@ -36,31 +59,71 @@ fn main() {
                                 Err(error) => tracing::error!("地址无法解析 {url}: {error}"),
                             }
                         }
-                        // 交给 Tauri 托管，退出时才能拿回来做优雅关停（B4）。
-                        handle.manage(ProxyHandle(std::sync::Mutex::new(Some(server))));
+                        *state.server.lock().unwrap() = Some(server);
                     }
-                    Err(error) => {
-                        // 启动失败不能留一个空窗口。把原因摆到等待页上。
-                        //
-                        // 用 eval 而不是 Tauri 事件：事件要在 webview 里暴露
-                        // 全局 Tauri API（withGlobalTauri），为了一条错误消息
-                        // 不值得扩大那个面。JSON 序列化负责转义——错误串里
-                        // 可能有引号和换行。
-                        let message = format!("{error:#}");
-                        tracing::error!("{message}");
-                        if let Some(window) = handle.get_webview_window("main") {
-                            let literal = serde_json::to_string(&message)
-                                .unwrap_or_else(|_| "\"启动失败\"".to_string());
-                            let _ = window.eval(format!("window.__kiroStartupFailed({literal})"));
-                        }
-                    }
+                    Err(error) => report_startup_failure(&handle, error),
                 }
             });
             Ok(())
+        })
+        .on_page_load(|window, payload| {
+            // 页面开始加载时注入，赶在管理界面的脚本读 localStorage 之前。
+            // 只对管理界面那个源注入，见 should_inject_login 的注释。
+            // 注入一次就清空：之后用户在界面里换了密钥，不该被我们覆盖回去。
+            if !should_inject_login(payload.url().as_str()) {
+                return;
+            }
+            let state = window.state::<AppState>();
+            let script = state.pending_login.lock().unwrap().take();
+            if let Some(script) = script {
+                if let Err(error) = window.eval(script) {
+                    tracing::warn!("免登录注入失败，将回落到登录页: {error}");
+                }
+            }
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // 先拦下关闭，等在飞请求走完再真的退出。
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                // 关停要等在飞请求，不能阻塞 UI 线程。
+                std::thread::spawn(move || {
+                    let for_exit = app.clone();
+                    on_exit_requested(|| shutdown_proxy(&app), move || for_exit.exit(0));
+                });
+            }
         })
         .run(tauri::generate_context!())
         .expect("Tauri 运行时启动失败");
 }
 
-/// 被 Tauri 托管的代理句柄。退出时取回来做优雅关停。
-pub struct ProxyHandle(pub std::sync::Mutex<Option<kiro_rs::RunningServer>>);
+/// 启动失败不能留一个空窗口。把原因摆到等待页上。
+///
+/// 用 `eval` 而不是 Tauri 事件：事件要在 webview 里暴露全局 Tauri API
+/// （withGlobalTauri），为了一条错误消息不值得扩大那个面。
+fn report_startup_failure(handle: &tauri::AppHandle, error: anyhow::Error) {
+    let message = format!("{error:#}");
+    tracing::error!("{message}");
+    if let Some(window) = handle.get_webview_window("main") {
+        // JSON 序列化负责转义——错误串里可能有引号和换行。
+        let literal =
+            serde_json::to_string(&message).unwrap_or_else(|_| "\"启动失败\"".to_string());
+        let _ = window.eval(format!("window.__kiroStartupFailed({literal})"));
+    }
+}
+
+/// 关窗即退出时走优雅关停。
+///
+/// 直接 exit 会把 axum 任务连同在飞请求一起丢弃，网关账本上会留下永不
+/// 结算的预留记录——那是钱的记录，不是日志。
+fn shutdown_proxy(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let server = state.server.lock().unwrap().take();
+    if let Some(server) = server {
+        tauri::async_runtime::block_on(async {
+            if let Err(error) = server.shutdown().await {
+                tracing::warn!("优雅关停失败: {error:#}");
+            }
+        });
+    }
+}

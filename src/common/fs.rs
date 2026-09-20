@@ -65,6 +65,41 @@ pub fn harden(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// 会落在数据目录下、且内容足以让人冒充或花钱的文件。
+///
+/// 这张表是**唯一**的真相源：`harden_data_dir` 按它扫，
+/// `runtime_tests` 的守卫也按它查。新增一个秘密文件只要加进这里。
+pub const SECRET_FILES: &[&str] = &[
+    "config.json",            // apiKey / adminApiKey
+    "credentials.json",       // Kiro 刷新令牌
+    "client_api_keys.json",   // 明文 sk-… 客户端 Key
+    "groups.json",            // 分组本身不是秘密，但同一套规矩
+    "gateway.json",           // 上游 API Key
+    "billing.db",             // 账本
+    "traces.db",              // 请求链路
+    "kiro_balance_cache.json",
+    "proxy_pool.json",
+    "cache_metering.json",
+];
+
+/// 启动时把数据目录里已有的秘密文件收紧到 0600。
+///
+/// 为什么不能只在写入点设防：`write_private` 只在**写入**时生效，而好几个
+/// 文件只有内容变化时才写——一个没加过 Key 的部署，`client_api_keys.json`
+/// 可以几个月不被写一次，于是永远停在升级前的 644。这是真机跑出来的。
+///
+/// SQLite 的 `-wal` / `-shm` 一并扫：WAL 里有还没落主库的数据。
+pub fn harden_data_dir(dir: &Path) {
+    for name in SECRET_FILES {
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.join(format!("{name}{suffix}"));
+            if let Err(error) = harden(&path) {
+                tracing::warn!("收紧 {} 权限失败: {error}", path.display());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +153,39 @@ mod tests {
     fn harden_is_a_no_op_for_a_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         harden(&dir.path().join("never-created")).unwrap();
+    }
+
+    /// 目录扫描收紧已有文件，且不因为缺文件而中断。
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_sweep_tightens_what_is_there_and_ignores_what_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        let present = dir.path().join("client_api_keys.json");
+        std::fs::write(&present, "[]").unwrap();
+        std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // 其余九个都不存在——扫描必须照样走完
+
+        harden_data_dir(dir.path());
+
+        let mode = std::fs::metadata(&present).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "实际 {mode:o}");
+    }
+
+    /// 非秘密文件不该被顺手改权限——那会让人以为程序在乱动他的文件。
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_leaves_unrelated_files_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = dir.path().join("README.txt");
+        std::fs::write(&unrelated, "hi").unwrap();
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        harden_data_dir(dir.path());
+
+        let mode = std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "无关文件被改了权限");
     }
 }

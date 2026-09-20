@@ -42,6 +42,11 @@ pub(crate) async fn accounting(base: &Foundation) -> anyhow::Result<Accounting> 
     let token_manager = &base.token_manager;
     let configured_api_key = &base.configured_api_key;
 
+    // 升级路径：老部署里躺着的秘密文件可能还是 644。只在写入点设防不够——
+    // 好几个文件只有内容变化时才写，不写就永远修不好。开始接受请求之前
+    // 先扫一遍。
+    crate::common::fs::harden_data_dir(cache_dir);
+
     // 客户端 Key 管理器 + 用量记录器 + 聚合器（cache_dir 由 foundation 交出，与凭据文件同目录）
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
     let client_key_manager = std::sync::Arc::new(

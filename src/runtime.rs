@@ -51,6 +51,7 @@ impl Options {
 pub struct RunningServer {
     addr: SocketAddr,
     data_dir: PathBuf,
+    admin_api_key: Option<String>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     joined: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -67,6 +68,15 @@ impl RunningServer {
     /// 告诉用户——双击启动的人没有任何别的途径知道它。
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    /// 管理 API 的登录密钥，未配置时为 `None`。
+    ///
+    /// 嵌入方要能回答「我怎么访问自己刚起的这个管理接口」——桌面端用它
+    /// 做免登录。这不是新增暴露面：能调 `serve()` 的人手里就攥着配置文件
+    /// 路径，直接读文件同样拿得到。
+    pub fn admin_api_key(&self) -> Option<&str> {
+        self.admin_api_key.as_deref()
     }
 
     /// 优雅关停：停止收新连接，等在飞请求走完。
@@ -95,7 +105,7 @@ impl RunningServer {
 /// **不自建运行时**：Tauri 自带一个，同进程两个运行时会让 `Handle::current()`
 /// 拿到错误的那个，表现是随机的 "no reactor running" panic。
 pub async fn serve(options: Options) -> anyhow::Result<RunningServer> {
-    let (app, addr_spec, data_dir) = assemble(&options).await?;
+    let (app, addr_spec, data_dir, admin_api_key) = assemble(&options).await?;
     let listener = bind_with_fallback(addr_spec).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -114,6 +124,7 @@ pub async fn serve(options: Options) -> anyhow::Result<RunningServer> {
     Ok(RunningServer {
         addr,
         data_dir,
+        admin_api_key,
         shutdown: tx,
         joined,
     })
@@ -144,7 +155,9 @@ async fn bind_with_fallback(spec: SocketAddr) -> anyhow::Result<tokio::net::TcpL
 /// 装配整个应用：三段依次做完，任一段失败就整体失败。
 ///
 /// 装配失败返回 `Err`——调用方决定怎么死。库不替它做这个决定。
-async fn assemble(options: &Options) -> anyhow::Result<(Router, SocketAddr, PathBuf)> {
+async fn assemble(
+    options: &Options,
+) -> anyhow::Result<(Router, SocketAddr, PathBuf, Option<String>)> {
     let base = foundation(options)?;
     let books = accounting(&base).await?;
 
@@ -159,5 +172,10 @@ async fn assemble(options: &Options) -> anyhow::Result<(Router, SocketAddr, Path
         })?;
 
     let data_dir = base.cache_dir.clone();
-    Ok((wiring(&base, books, options), addr, data_dir))
+    let admin_api_key = base
+        .config
+        .admin_api_key
+        .clone()
+        .filter(|k| !k.trim().is_empty());
+    Ok((wiring(&base, books, options), addr, data_dir, admin_api_key))
 }
