@@ -425,3 +425,66 @@ async fn the_auto_update_scheduler_does_not_start_when_self_update_is_disabled()
         "二进制形态下调度器照常启动"
     );
 }
+
+/// kiro-rs 在运行期会创建的文件。全部由 `cache_dir` join 出来，
+/// 而 `cache_dir` 取的是 credentials 文件的父目录。
+const RUNTIME_FILES: &[&str] = &[
+    "client_api_keys.json",
+    "groups.json",
+    "gateway.json",
+    "billing.db",
+    "traces.db",
+    "cache_metering.json",
+    "kiro_balance_cache.json",
+    "proxy_pool.json",
+];
+
+fn runtime_files_in(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Default::default();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| RUNTIME_FILES.contains(&name.as_str()) || name.starts_with("usage_log."))
+        .collect()
+}
+
+/// `cache_dir` 取的是 credentials 文件的父目录，上面那一串运行期文件全部
+/// join 在它下面。这个测试钉住那条链：给绝对路径，当前工作目录里不得多出
+/// 任何一个运行期文件。
+///
+/// 将来谁加一个新的运行期文件却用了相对路径，这里会红——那正是 SC-3 会被
+/// 悄悄破掉的方式（加文件的人通常不会想起桌面端）。
+///
+/// 不改进程 CWD：那是全局状态，会影响并行跑的其它测试。改成按**已知文件名**
+/// 判定，既不需要串行化，也不会被无关的临时文件干扰。
+#[tokio::test]
+async fn absolute_paths_keep_every_runtime_file_out_of_the_working_directory() {
+    let cwd = std::env::current_dir().unwrap();
+    let before = runtime_files_in(&cwd);
+
+    let data = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(data.path());
+    let server = serve(Options::new(config, creds)).await.unwrap();
+    server.shutdown().await.unwrap();
+
+    let after = runtime_files_in(&cwd);
+    let leaked: Vec<_> = after.difference(&before).collect();
+    assert!(
+        leaked.is_empty(),
+        "运行期文件落到了工作目录，说明有人用了相对路径：{leaked:?}"
+    );
+
+    // 反过来：它们确实落在数据目录里。少了这半条，把所有路径写成 /dev/null
+    // 也能让上面那条绿。
+    //
+    // 用 traces.db 做锚点：它是启动时**无条件**创建的。client_api_keys.json
+    // 与 groups.json 是惰性的——没有 key / 没有分组就不落盘，拿它们当锚点
+    // 这条测试会假红。
+    let landed = runtime_files_in(data.path());
+    assert!(
+        landed.contains("traces.db"),
+        "运行期文件应当落在凭据文件所在目录，实际只有: {landed:?}"
+    );
+}
