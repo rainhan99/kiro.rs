@@ -202,7 +202,7 @@ fn validate_model_id(model_id: &str) -> Result<&str, AdminServiceError> {
 }
 
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
-pub(crate) enum ImportStatus {
+pub enum ImportStatus {
     Verified,
     /// 直接导入（未验活）成功
     Imported,
@@ -210,7 +210,7 @@ pub(crate) enum ImportStatus {
     Failed,
 }
 
-pub(crate) struct ImportItemResult {
+pub struct ImportItemResult {
     pub status: ImportStatus,
     pub credential_id: Option<u64>,
     pub email: Option<String>,

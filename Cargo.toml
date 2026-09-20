@@ -3,6 +3,18 @@ name = "kiro-rs"
 version = "0.9.5"
 edition = "2024"
 
+[lib]
+name = "kiro_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kiro-rs"
+path = "src/main.rs"
+
+# desktop/src-tauri 在 B1 加入。现在填会因目录不存在而构建失败。
+[workspace]
+members = []
+
 [features]
 default = ["native-tls"]
 native-tls = ["reqwest/native-tls-vendored"]

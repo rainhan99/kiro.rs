@@ -1,14 +1,6 @@
-mod admin;
-mod admin_ui;
-mod anthropic;
-mod common;
-mod gateway;
-mod http_client;
-mod image_resize;
-mod kiro;
-mod model;
-mod pipeline;
-pub mod token;
+// 模块住在库里（src/lib.rs）。这个二进制只是库的一个使用者——
+// 桌面应用是另一个。
+use kiro_rs::{admin, admin_ui, anthropic, gateway, http_client, kiro, model, pipeline, token};
 
 use std::collections::HashMap;
 use std::sync::Arc;
