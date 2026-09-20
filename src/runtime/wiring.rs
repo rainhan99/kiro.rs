@@ -112,21 +112,75 @@ pub(super) fn wiring(base: &Foundation, books: Accounting, options: &Options) ->
 ///
 /// 地址取**实际**监听到的那个，不是配置里写的：端口被占用时会回退，
 /// 打配置值等于骗人。
-pub fn startup_banner_lines(addr: SocketAddr, data_dir: &std::path::Path) -> Vec<String> {
-    vec![
-        format!("服务已就绪: http://{addr}"),
-        format!("  管理界面  http://{addr}/admin"),
-        format!("  API 端点  http://{addr}/v1/messages"),
+pub fn startup_banner_lines(
+    addr: SocketAddr,
+    data_dir: &std::path::Path,
+    setup_token: Option<&str>,
+) -> Vec<String> {
+    // 绑在通配符上时，`http://0.0.0.0:8990` 是个打不开的地址——它是监听
+    // 通配符，不是可访问地址。照着点必然失败，而失败的样子像是服务没起来。
+    // 给一个真能打开的（回环），同时如实说明实际监听在哪。
+    let reachable = reachable_address(addr);
+    let bind_note = if reachable == addr.to_string() {
+        String::new()
+    } else {
+        format!("（实际监听 {addr}，同网段的其它机器用本机 IP 访问）")
+    };
+
+    let mut lines = vec![
+        format!("服务已就绪: http://{reachable} {bind_note}"),
+        format!("  管理界面  http://{reachable}/admin"),
+        format!("  API 端点  http://{reachable}/v1/messages"),
         format!("数据目录: {}", data_dir.display()),
         "  配置与密钥在该目录的 config.json 内。".to_string(),
         // 不在这里打密钥明文：日志常被采集。取回方式两端各有一个入口。
         "  要取回密钥: 命令行 `kiro-rs --show-keys`；桌面版见「系统设置 → 安全」。".to_string(),
-    ]
+    ];
+
+    // 未初始化：把 setup token 摆到最显眼的位置。
+    //
+    // 分隔线不是装饰。这行夹在一串 INFO 日志里，用户扫一眼就得能认出
+    // 「这是要我抄走的」——`token = xxx` 混在端点列表中间会被整个略过。
+    //
+    // **每次启动都打**，不是只打第一次：token 只存内存，错过了就重启再看。
+    if let Some(token) = setup_token {
+        let rule = "━".repeat(64);
+        lines.extend([
+            rule.clone(),
+            "  尚未设置管理密码。用下面这串一次性口令去初始化：".to_string(),
+            String::new(),
+            format!("      {token}"),
+            String::new(),
+                format!("  打开 http://{reachable}/admin ，粘贴它并设置你自己的密码。"),
+            "  口令只存在于内存，重启即换；设置完成后立即失效。".to_string(),
+            rule,
+        ]);
+    }
+
+    lines
+}
+
+/// 把监听地址翻译成一个**真能打开**的地址。
+///
+/// `0.0.0.0` / `[::]` 是监听通配符：它表示「所有接口」，本身不是可访问
+/// 地址。原样打给用户，第一眼看到的就是一个点不开的链接，而点不开的样子
+/// 像是服务没起来。
+fn reachable_address(addr: SocketAddr) -> String {
+    if addr.ip().is_unspecified() {
+        let host = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+        format!("{host}:{}", addr.port())
+    } else {
+        addr.to_string()
+    }
 }
 
 /// 启动后把横幅打到日志里。
-pub fn log_startup_banner(addr: SocketAddr, data_dir: &std::path::Path) {
-    for line in startup_banner_lines(addr, data_dir) {
+pub fn log_startup_banner(
+    addr: SocketAddr,
+    data_dir: &std::path::Path,
+    setup_token: Option<&str>,
+) {
+    for line in startup_banner_lines(addr, data_dir, setup_token) {
         tracing::info!("{line}");
     }
 }

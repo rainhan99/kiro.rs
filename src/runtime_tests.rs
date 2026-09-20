@@ -554,6 +554,7 @@ fn the_startup_banner_gives_the_data_directory_and_never_leaks_a_key() {
     let lines = crate::runtime::startup_banner_lines(
         "127.0.0.1:8990".parse().unwrap(),
         std::path::Path::new("/tmp/kiro-data"),
+        None,
     );
     let joined = lines.join("\n");
 
@@ -577,6 +578,7 @@ fn the_startup_banner_reports_the_actual_address() {
     let lines = crate::runtime::startup_banner_lines(
         "127.0.0.1:49152".parse().unwrap(),
         std::path::Path::new("/data"),
+        None,
     );
     assert!(lines.join("\n").contains("49152"));
 }
@@ -678,4 +680,86 @@ async fn the_setup_token_never_touches_the_disk() {
             path.display()
         );
     }
+}
+
+/// 未初始化时，横幅必须把 setup token 醒目地摆出来。
+///
+/// 「醒目」是有意义的要求：它夹在一串 INFO 日志里，用户扫一眼就得能认出
+/// 「这行是要我抄走的」。所以要有分隔线和一句明确的指示，而不是
+/// `token = xxx` 混在端点列表中间。
+#[test]
+fn an_uninitialized_instance_shows_the_setup_token_prominently() {
+    let lines = crate::runtime::startup_banner_lines(
+        "127.0.0.1:8990".parse().unwrap(),
+        std::path::Path::new("/data"),
+        Some("TOKENTOKENTOKENTOKENTOKENTOKENTOKENTOKEN"),
+    );
+    let joined = lines.join("\n");
+
+    assert!(joined.contains("TOKENTOKEN"), "token 要打出来，实际:\n{joined}");
+    assert!(
+        joined.contains("初始化"),
+        "要说清这串东西是干什么用的，实际:\n{joined}"
+    );
+    assert!(
+        joined.contains("/admin"),
+        "要说清拿它去哪儿用，实际:\n{joined}"
+    );
+    assert!(
+        joined.lines().any(|l| l.contains("━") || l.contains("=====")),
+        "要有分隔线，否则夹在 INFO 流里扫不出来，实际:\n{joined}"
+    );
+}
+
+/// 已初始化就一个字都不提 setup——那只会让人以为自己还没设好。
+#[test]
+fn an_initialized_instance_says_nothing_about_setup() {
+    let joined = crate::runtime::startup_banner_lines(
+        "127.0.0.1:8990".parse().unwrap(),
+        std::path::Path::new("/data"),
+        None,
+    )
+    .join("\n");
+    assert!(!joined.contains("初始化"), "实际:\n{joined}");
+    assert!(!joined.contains("token"), "实际:\n{joined}");
+}
+
+/// 绑 `0.0.0.0` 时横幅不能把 `http://0.0.0.0:8990/admin` 当成可点的地址——
+/// 那是监听通配符，不是能访问的地址，照着点必然失败。
+///
+/// 这条是真机跑出来的：默认配置绑 0.0.0.0，横幅原样打印，
+/// 用户第一眼看到的就是一个打不开的链接。
+#[test]
+fn a_wildcard_bind_is_shown_as_a_reachable_address() {
+    let joined = crate::runtime::startup_banner_lines(
+        "0.0.0.0:8990".parse().unwrap(),
+        std::path::Path::new("/data"),
+        Some("TOKEN"),
+    )
+    .join("\n");
+
+    assert!(
+        !joined.contains("http://0.0.0.0"),
+        "0.0.0.0 不是可访问地址，实际:\n{joined}"
+    );
+    assert!(
+        joined.contains("127.0.0.1:8990"),
+        "要给一个真能打开的地址，实际:\n{joined}"
+    );
+    assert!(
+        joined.contains("0.0.0.0:8990"),
+        "同时也要如实说明实际监听在哪，实际:\n{joined}"
+    );
+}
+
+/// IPv6 的通配符同理。
+#[test]
+fn an_ipv6_wildcard_bind_is_also_translated() {
+    let joined = crate::runtime::startup_banner_lines(
+        "[::]:8990".parse().unwrap(),
+        std::path::Path::new("/data"),
+        None,
+    )
+    .join("\n");
+    assert!(!joined.contains("http://[::]:"), "实际:\n{joined}");
 }

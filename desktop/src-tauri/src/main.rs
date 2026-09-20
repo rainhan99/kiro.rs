@@ -40,7 +40,11 @@ fn main() {
                     Ok(server) => {
                         // 与命令行同一份横幅：形态不同不该让「服务在哪、
                         // 数据在哪」这两件事的说法也不同。
-                        kiro_rs::runtime::log_startup_banner(server.addr(), server.data_dir());
+                        kiro_rs::runtime::log_startup_banner(
+                            server.addr(),
+                            server.data_dir(),
+                            server.setup_token(),
+                        );
 
                         let url = admin_url(server.addr());
                         let state = handle.state::<AppState>();
