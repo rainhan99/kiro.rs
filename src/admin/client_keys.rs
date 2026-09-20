@@ -140,7 +140,9 @@ impl ClientKeyManager {
         list.sort_by_key(|k| k.id);
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                // write_private：这个文件装的是明文 `sk-…`，世界可读等于
+                // 把所有客户端 Key 送给同机任何进程。
+                if let Err(e) = crate::common::fs::write_private(path, json.as_bytes()) {
                     tracing::warn!("写入客户端 Key 文件失败: {}", e);
                 }
             }

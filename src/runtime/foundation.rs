@@ -228,7 +228,7 @@ pub fn ensure_config_files_with_host(config_path: &str, credentials_path: &str, 
         });
         match serde_json::to_string_pretty(&default)
             .map_err(anyhow::Error::from)
-            .and_then(|s| write_private(config_p, s.as_bytes()))
+            .and_then(|s| crate::common::fs::write_private(config_p, s.as_bytes()).map_err(anyhow::Error::from))
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
@@ -249,7 +249,7 @@ pub fn ensure_config_files_with_host(config_path: &str, credentials_path: &str, 
                 }
             }
         }
-        if let Err(e) = write_private(cred_p, b"[]\n") {
+        if let Err(e) = crate::common::fs::write_private(cred_p, b"[]\n") {
             tracing::warn!("写入空凭证文件失败 {}: {}", cred_p.display(), e);
         } else {
             tracing::info!(
@@ -257,35 +257,6 @@ pub fn ensure_config_files_with_host(config_path: &str, credentials_path: &str, 
                 cred_p.display()
             );
         }
-    }
-}
-
-/// 写一个只有属主可读写的文件。
-///
-/// `config.json` 里有 `apiKey` 与 `adminApiKey`，`credentials.json` 里有刷新
-/// 令牌。世界可读的话，同机任何进程都能拿走它们——桌面端尤其容易中招，
-/// 因为用户不会想到去看权限。
-///
-/// 非 Unix 平台没有 mode 概念，退化成普通写入（Windows 上用户目录默认
-/// 就不是世界可读的）。
-fn write_private(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents)?;
-        return Ok(());
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)?;
-        Ok(())
     }
 }
 

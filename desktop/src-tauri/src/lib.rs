@@ -4,3 +4,6 @@
 //! 界面只有一份实现——桌面端与浏览器端看到的是同一个东西。
 
 pub mod paths;
+pub mod window;
+
+pub use window::{admin_url, start_proxy};

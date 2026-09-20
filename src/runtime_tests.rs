@@ -23,12 +23,14 @@ fn library_root_exports_the_entry_points() {
 fn minimal_files(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let config = dir.join("config.json");
     let creds = dir.join("credentials.json");
-    std::fs::write(
+    // 用生产路径的写入方式：夹具若用裸 fs::write，权限测试测的就是夹具
+    // 而不是产品。
+    crate::common::fs::write_private(
         &config,
-        r#"{"host":"127.0.0.1","port":0,"adminApiKey":"sk-admin-test"}"#,
+        br#"{"host":"127.0.0.1","port":0,"adminApiKey":"sk-admin-test"}"#,
     )
     .unwrap();
-    std::fs::write(&creds, "[]").unwrap();
+    crate::common::fs::write_private(&creds, b"[]").unwrap();
     (config, creds)
 }
 
@@ -486,5 +488,66 @@ async fn absolute_paths_keep_every_runtime_file_out_of_the_working_directory() {
     assert!(
         landed.contains("traces.db"),
         "运行期文件应当落在凭据文件所在目录，实际只有: {landed:?}"
+    );
+}
+
+/// 会落在 `cache_dir` 下、且内容足以让人冒充或花钱的文件。
+///
+/// - `config.json`：apiKey 与 adminApiKey
+/// - `credentials.json`：Kiro 刷新令牌
+/// - `client_api_keys.json`：明文 `sk-…` 客户端 Key
+/// - `gateway.json`：上游 API Key
+/// - `billing.db`：账本
+const SECRET_BEARING_FILES: &[&str] = &[
+    "config.json",
+    "credentials.json",
+    "client_api_keys.json",
+    "gateway.json",
+    "billing.db",
+    "traces.db",
+];
+
+/// 这些文件一个都不能是世界可读的。
+///
+/// 这条测试是**面**而不是点：任何将来新增的、落在 cache_dir 下的秘密文件
+/// 只要加进上面那张表就自动受保护，而漏加会在这里被抓到——加文件的人
+/// 通常只想着功能，不会想起权限。
+///
+/// 发现方式值得记一笔：B2 只修了 config.json 与 credentials.json，
+/// 真正双击跑起来才看到 client_api_keys.json 还是 644——里面是明文客户端 Key。
+#[cfg(unix)]
+#[tokio::test]
+async fn no_secret_bearing_runtime_file_is_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    // 让网关也立起来，这样 gateway.json 与 billing.db 都会被创建
+    write_gateway_config_with_one_upstream(dir.path());
+    // 配一个 apiKey，client_api_keys.json 才会落盘（没有 key 时它是惰性的）
+    crate::common::fs::write_private(
+        &config,
+        br#"{"host":"127.0.0.1","port":0,"apiKey":"sk-kiro-rs-test","adminApiKey":"sk-admin-test"}"#,
+    )
+    .unwrap();
+
+    let server = serve(Options::new(config, creds)).await.unwrap();
+    server.shutdown().await.unwrap();
+
+    let mut offenders = Vec::new();
+    for name in SECRET_BEARING_FILES {
+        let path = dir.path().join(name);
+        if !path.exists() {
+            continue;
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o077;
+        if mode != 0 {
+            let full = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            offenders.push(format!("{name} = {full:o}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "这些文件组外可读/可写，里面是密钥或账本：{offenders:?}"
     );
 }

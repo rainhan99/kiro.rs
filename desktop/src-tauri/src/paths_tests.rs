@@ -1,11 +1,23 @@
 use super::*;
 
+/// `KIRO_DATA_DIR` 是进程级环境变量，动它的测试必须串行——否则一个测试
+/// 设上、另一个并发读到，结果随运行顺序变。这种 flake 最难查，因为重跑
+/// 常常就好了。
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 拿到锁并保证退出时清掉覆盖值。锁中毒（前一个测试 panic）不影响后续，
+/// 环境变量该清还是要清。
+fn with_clean_env<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("KIRO_DATA_DIR") };
+    let out = f();
+    unsafe { std::env::remove_var("KIRO_DATA_DIR") };
+    out
+}
+
 #[test]
 fn the_data_directory_is_absolute_and_outside_the_bundle() {
-    // 不受测试环境里可能存在的覆盖影响
-    unsafe { std::env::remove_var("KIRO_DATA_DIR") };
-
-    let dir = data_dir_for("kiro-rs").expect("必须解析得出");
+    let dir = with_clean_env(|| data_dir_for("kiro-rs")).expect("必须解析得出");
     assert!(
         dir.is_absolute(),
         "相对路径会跟着 CWD 跑，而桌面端双击启动时 CWD 是 /：{dir:?}"
@@ -97,4 +109,20 @@ fn the_generated_config_is_not_world_readable() {
             path.display()
         );
     }
+}
+
+/// KIRO_DATA_DIR 只给测试与离线冒烟用，但既然它存在，就不能接受相对路径——
+/// 相对路径会跟着 CWD 跑，而桌面端双击启动时 CWD 是 /。
+#[test]
+fn a_relative_data_dir_override_is_rejected_rather_than_silently_used() {
+    let result = with_clean_env(|| {
+        unsafe { std::env::set_var("KIRO_DATA_DIR", "some/relative/path") };
+        data_dir_for("kiro-rs")
+    });
+
+    let err = result.expect_err("相对路径必须被拒绝");
+    assert!(
+        format!("{err:#}").contains("绝对路径"),
+        "实际: {err:#}"
+    );
 }

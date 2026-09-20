@@ -43,3 +43,7 @@
 # Tauri 生成物（schema、capabilities 的派生文件）。构建产物本身走 workspace
 # 根的 /target，已在上面忽略。
 /desktop/src-tauri/gen/
+# 一期只做 macOS 与 Windows。Android/iOS 图标由 `tauri icon` 顺带生成，
+# 用不上就不入库（3MB 里的大半）。
+/desktop/src-tauri/icons/android/
+/desktop/src-tauri/icons/ios/

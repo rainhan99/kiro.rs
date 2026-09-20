@@ -83,7 +83,9 @@ impl GroupManager {
         list.sort_by(|a, b| a.name.cmp(&b.name));
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                // 分组名本身不是秘密，但运行期文件统一走同一套权限规矩，
+                // 省得将来有人往里加字段时又漏一处。
+                if let Err(e) = crate::common::fs::write_private(path, json.as_bytes()) {
                     tracing::warn!("写入分组文件失败: {}", e);
                 }
             }

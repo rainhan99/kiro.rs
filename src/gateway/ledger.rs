@@ -1,6 +1,6 @@
 //! Financial state is independent of traces. Every operation uses a SQLite
 //! IMMEDIATE transaction, including admission arithmetic performed in Rust.
-use std::{path::Path, time::Duration};
+use std::{path::{Path, PathBuf}, time::Duration};
 use anyhow::{Context, ensure};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -152,7 +152,20 @@ impl Ledger {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         ensure!(!path.as_os_str().is_empty() && path != Path::new(":memory:") && !path.to_string_lossy().starts_with("file:"), "persistent ledger requires ordinary file path");
-        Self::initialize(Connection::open(path)?)
+        let ledger = Self::initialize(Connection::open(path)?)?;
+        // SQLite 自己建文件，建完才收得紧。账本是钱的记录，不该世界可读。
+        // -wal / -shm 同理：WAL 里有还没落主库的事务数据。
+        for suffix in ["", "-wal", "-shm"] {
+            let sidecar = if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                PathBuf::from(format!("{}{suffix}", path.display()))
+            };
+            if let Err(error) = crate::common::fs::harden(&sidecar) {
+                tracing::warn!("收紧账本文件权限失败 {}: {error}", sidecar.display());
+            }
+        }
+        Ok(ledger)
     }
     pub fn open_in_memory() -> anyhow::Result<Self> { Self::initialize(Connection::open_in_memory()?) }
     fn initialize(mut connection: Connection) -> anyhow::Result<Self> {

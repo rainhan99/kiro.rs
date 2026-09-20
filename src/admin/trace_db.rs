@@ -331,6 +331,18 @@ impl TraceStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
+        // SQLite 自己建文件，建完才收得紧。trace 里有请求的形状与元数据，
+        // 不该世界可读。-wal / -shm 同理：WAL 里有还没落主库的数据。
+        for suffix in ["", "-wal", "-shm"] {
+            let sidecar = if suffix.is_empty() {
+                path.clone()
+            } else {
+                PathBuf::from(format!("{}{suffix}", path.display()))
+            };
+            if let Err(error) = crate::common::fs::harden(&sidecar) {
+                tracing::warn!("收紧 trace 文件权限失败 {}: {error}", sidecar.display());
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(enabled),

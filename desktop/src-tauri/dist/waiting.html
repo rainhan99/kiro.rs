@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>kiro.rs</title>
+<style>
+  /* 全部内联，不引外部字体或脚本——这样 Tauri 的默认 CSP 可以保持严格。 */
+  :root { color-scheme: light dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 1.25rem;
+    font: 14px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: #fafafa; color: #18181b;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #09090b; color: #e4e4e7; }
+  }
+  .spinner {
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 2.5px solid currentColor; border-top-color: transparent;
+    opacity: .45; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  #status { opacity: .65; }
+  #error {
+    display: none; max-width: 32rem; padding: .875rem 1rem;
+    border-radius: 8px; white-space: pre-wrap; text-align: left;
+    background: #fef2f2; color: #991b1b; border: 1px solid #fecaca;
+  }
+  @media (prefers-color-scheme: dark) {
+    #error { background: #2a1215; color: #fca5a5; border-color: #7f1d1d; }
+  }
+  body.failed .spinner, body.failed #status { display: none; }
+  body.failed #error { display: block; }
+</style>
+</head>
+<body>
+  <div class="spinner"></div>
+  <div id="status">正在启动本地服务…</div>
+  <div id="error"></div>
+  <script>
+    // 启动失败时由 Rust 侧调用，把原因摆在用户面前而不是留一个空窗口。
+    window.__kiroStartupFailed = (message) => {
+      document.body.classList.add('failed');
+      document.getElementById('error').textContent = message;
+    };
+  </script>
+</body>
+</html>
