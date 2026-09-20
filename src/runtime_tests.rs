@@ -111,3 +111,43 @@ async fn a_non_addr_in_use_bind_error_is_reported_instead_of_silently_retried() 
         "不能把「地址不可用」误报成「端口被占用」，实际: {text}"
     );
 }
+
+/// 注：配置加载在 A2 就已经用 `?` 写进 assemble()（拿端口必须先读配置），
+/// 所以这条一写出来就是绿的。留着是回归钉——将来谁把它改回 exit(1)，
+/// 整个测试二进制会被杀掉，这里会立刻红。
+#[tokio::test]
+async fn a_broken_config_returns_an_error_instead_of_killing_the_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.json");
+    let creds = dir.path().join("credentials.json");
+    std::fs::write(&config, "{ this is not json").unwrap();
+    std::fs::write(&creds, "[]").unwrap();
+
+    let err = serve(Options::new(config, creds))
+        .await
+        .expect_err("必须返回错误");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("加载配置失败"),
+        "错误要说清是哪一步崩的，实际: {text}"
+    );
+}
+
+#[tokio::test]
+async fn broken_credentials_return_an_error_instead_of_killing_the_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.json");
+    let creds = dir.path().join("credentials.json");
+    std::fs::write(
+        &config,
+        r#"{"host":"127.0.0.1","port":0,"adminApiKey":"sk-admin-test"}"#,
+    )
+    .unwrap();
+    std::fs::write(&creds, "{ not json either").unwrap();
+
+    let err = serve(Options::new(config, creds))
+        .await
+        .expect_err("必须返回错误");
+    let text = format!("{err:#}");
+    assert!(text.contains("加载凭证失败"), "实际: {text}");
+}
