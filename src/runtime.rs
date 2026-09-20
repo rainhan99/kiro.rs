@@ -144,5 +144,5 @@ async fn assemble(options: &Options) -> anyhow::Result<(Router, SocketAddr)> {
             )
         })?;
 
-    Ok((wiring(&base, books), addr))
+    Ok((wiring(&base, books, options), addr))
 }

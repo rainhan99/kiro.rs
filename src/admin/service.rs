@@ -289,6 +289,8 @@ impl RuntimeUpdateConfig {
                 .unwrap_or(false),
             auto_apply: self.auto_apply,
             auto_apply_time: self.auto_apply_time.clone(),
+            // RuntimeUpdateConfig 不知道形态，由 AdminService::get_update_config 覆盖。
+            self_update_available: true,
         }
     }
 }
@@ -315,6 +317,11 @@ pub struct AdminService {
     idc_sessions: Arc<Mutex<HashMap<String, IdcAuthSession>>>,
     /// 进行中的 Social 登录会话
     social_sessions: Arc<Mutex<HashMap<String, SocialAuthSession>>>,
+    /// 是否允许二进制自更新。
+    ///
+    /// 桌面端置 `false`：应用包内的可执行文件由安装包管理，让代理去替换它
+    /// 会破坏代码签名。手动端点与自动调度器都查这一处，不要在别处再判一次。
+    allow_self_update: bool,
     /// 请求链路追踪存储（用于日志治理：开关 + 保留天数运行时可改）
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
@@ -679,6 +686,7 @@ impl AdminService {
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
+            allow_self_update: true,
             trace_store: None,
             usage_recorder: None,
             cache_meter: None,
@@ -1308,7 +1316,16 @@ impl AdminService {
     /// - `update_auto_apply` 关闭时只是记录"未到点"，不做任何远端调用。
     /// - 开启时，比较当前本地时间与 `update_auto_apply_time`，命中目标分钟
     ///   就触发一次 `apply_image_update`。同一目标版本只会被自动应用一次。
-    pub fn start_auto_update_scheduler(self: &Arc<Self>) {
+    /// 启动无人值守自动更新调度器。返回是否真的启动了。
+    ///
+    /// 桌面端必须拿到 `false`：比手动端点更危险的是这个——它到点就自己动手，
+    /// 没人按按钮。只堵手动端点而放任它，`.app` 会在某个凌晨自己把可执行文件
+    /// 换掉、签名作废、下次打不开，而且没有任何人操作过。
+    pub fn start_auto_update_scheduler(self: &Arc<Self>) -> bool {
+        if !self.allow_self_update {
+            tracing::info!("自更新已禁用（桌面版通过应用更新），不启动自动更新调度器");
+            return false;
+        }
         let svc = Arc::clone(self);
         tokio::spawn(async move {
             // 给 Docker socket / compose 元数据探测留点准备时间
@@ -1378,6 +1395,7 @@ impl AdminService {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
         });
+        true
     }
 
     /// 添加新凭据
@@ -1829,8 +1847,32 @@ impl AdminService {
     }
 
     /// 获取在线更新配置（GitHub Token 只返回是否已配置）
+    /// 关闭二进制自更新。桌面端用。
+    ///
+    /// 关掉的是**替换可执行文件**那条路：手动的 pull/apply/rollback，
+    /// 以及无人值守的自动更新调度器。「检查更新」不受影响——知道有新版本
+    /// 是有用的，用户去下载新的安装包即可。
+    pub fn with_self_update(mut self, allowed: bool) -> Self {
+        self.allow_self_update = allowed;
+        self
+    }
+
+    /// 本形态下是否允许二进制自更新。
+    pub fn self_update_allowed(&self) -> bool {
+        self.allow_self_update
+    }
+
+    /// 自更新被禁用时的统一拒绝。措辞一处，三个端点共用。
+    pub fn self_update_refusal(&self) -> AdminServiceError {
+        AdminServiceError::Unavailable(
+            "桌面版通过应用更新，代理不自行替换可执行文件".to_string(),
+        )
+    }
+
     pub fn get_update_config(&self) -> UpdateConfigResponse {
-        self.update_config.lock().response()
+        let mut response = self.update_config.lock().response();
+        response.self_update_available = self.allow_self_update;
+        response
     }
 
     /// 更新在线更新配置。

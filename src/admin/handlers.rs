@@ -805,6 +805,10 @@ pub async fn set_update_config(
 /// POST /api/admin/system/update/pull
 /// 下载新版二进制并校验（不替换当前进程）
 pub async fn pull_update_image(State(state): State<AdminState>) -> impl IntoResponse {
+    // 自更新是否可用只有一处真相：AdminService。三个端点与自动调度器都查它。
+    if !state.service.self_update_allowed() {
+        return state.service.self_update_refusal().into_http_response();
+    }
     match state.service.pull_update_image().await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -814,6 +818,10 @@ pub async fn pull_update_image(State(state): State<AdminState>) -> impl IntoResp
 /// POST /api/admin/system/update/apply
 /// 下载新版二进制、替换 exe，进程退出由容器重启策略接管
 pub async fn apply_image_update(State(state): State<AdminState>) -> impl IntoResponse {
+    // 自更新是否可用只有一处真相：AdminService。三个端点与自动调度器都查它。
+    if !state.service.self_update_allowed() {
+        return state.service.self_update_refusal().into_http_response();
+    }
     match state.service.apply_image_update().await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -823,6 +831,10 @@ pub async fn apply_image_update(State(state): State<AdminState>) -> impl IntoRes
 /// POST /api/admin/system/update/rollback
 /// 用 `<exe>.backup` 还原可执行文件并退出进程
 pub async fn rollback_image_update(State(state): State<AdminState>) -> impl IntoResponse {
+    // 自更新是否可用只有一处真相：AdminService。三个端点与自动调度器都查它。
+    if !state.service.self_update_allowed() {
+        return state.service.self_update_refusal().into_http_response();
+    }
     match state.service.rollback_image_update().await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),

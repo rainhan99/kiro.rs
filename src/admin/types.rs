@@ -806,6 +806,13 @@ pub struct UpdateConfigResponse {
     pub auto_apply: bool,
     /// 自动更新触发时间（本地时区，HH:MM 24 小时制）
     pub auto_apply_time: String,
+    /// 本形态下是否提供二进制自更新。
+    ///
+    /// 桌面版为 `false`：应用包内的可执行文件由安装包管理。前端据此把
+    /// 更新按钮换成说明文字，而不是让人点了才知道不行。
+    /// `#[serde(default)]` 让旧前端与旧测试不受影响。
+    #[serde(default)]
+    pub self_update_available: bool,
 }
 
 /// 更新在线更新配置

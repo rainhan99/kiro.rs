@@ -27,6 +27,12 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 这个形态下不提供该能力。
+    ///
+    /// 与 404 的区别：404 会让人以为「这个版本没有这个功能」，而真相是
+    /// 「有，但这个形态下不该用」。桌面端的自更新就是这一类。
+    Unavailable(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -39,6 +45,7 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::Unavailable(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -54,6 +61,7 @@ impl AdminServiceError {
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::Unavailable(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -69,6 +77,9 @@ impl AdminServiceError {
                 AdminErrorResponse::internal_error(self.to_string())
             }
             AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::Unavailable(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }

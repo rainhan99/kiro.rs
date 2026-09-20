@@ -313,3 +313,115 @@ async fn an_unconfigured_gateway_never_touches_the_ledger() {
         .expect("网关未配置时应当完全惰性，不碰账本");
     server.shutdown().await.unwrap();
 }
+
+/// 桌面端禁用自更新后，替换可执行文件的那三个端点必须明确拒绝。
+///
+/// 为什么是 409 而不是 404：404 会让人以为「这个版本没有更新功能」，
+/// 而真相是「有，但这个形态下不该用」。前者会让人去翻文档，后者一眼就懂。
+#[tokio::test]
+async fn self_update_is_refused_with_an_explanation_when_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let mut options = Options::new(config, creds);
+    options.allow_self_update = false;
+
+    let server = serve(options).await.unwrap();
+    let client = reqwest::Client::new();
+
+    for path in ["apply", "pull", "rollback"] {
+        let url = format!("http://{}/api/admin/system/update/{path}", server.addr());
+        let resp = client
+            .post(&url)
+            .header("x-api-key", "sk-admin-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "{path} 在禁用时要明确拒绝，不能静默成功或 500"
+        );
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("桌面版"), "{path} 要说清为什么被拒，实际: {text}");
+    }
+
+    server.shutdown().await.unwrap();
+}
+
+/// 界面要能如实说明「桌面版通过应用更新」（SC-4 的后半句）。
+/// 没有这个字段，前端只能把按钮摆在那儿让人点了才知道不行。
+#[tokio::test]
+async fn the_update_config_reports_whether_self_update_is_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let mut options = Options::new(config, creds);
+    options.allow_self_update = false;
+
+    let server = serve(options).await.unwrap();
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{}/api/admin/config/update", server.addr()))
+        .header("x-api-key", "sk-admin-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body["selfUpdateAvailable"],
+        serde_json::json!(false),
+        "禁用时必须如实上报，实际: {body}"
+    );
+    server.shutdown().await.unwrap();
+}
+
+/// 二进制形态下一切照旧——这条防的是「为了桌面端方便，把所有人的自更新关了」。
+#[tokio::test]
+async fn self_update_stays_available_for_the_plain_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let options = Options::new(config, creds); // allow_self_update 默认 true
+
+    let server = serve(options).await.unwrap();
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{}/api/admin/config/update", server.addr()))
+        .header("x-api-key", "sk-admin-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["selfUpdateAvailable"], serde_json::json!(true));
+    server.shutdown().await.unwrap();
+}
+
+/// 比手动端点更危险的是**自动**更新调度器：它到点就自己动手，没人按按钮。
+///
+/// 只堵手动端点而放任调度器，桌面端会在某个凌晨三点自己把 `.app` 里的
+/// 可执行文件换掉、签名作废、下次打不开——而且没有任何人操作过。
+#[tokio::test]
+async fn the_auto_update_scheduler_does_not_start_when_self_update_is_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let mut options = Options::new(config, creds);
+    options.allow_self_update = false;
+
+    let base = crate::runtime::foundation(&options).unwrap();
+
+    // 开关只有一处，手动端点与调度器都查它。这里直接问那一处。
+    let service = crate::admin::AdminService::new(base.token_manager.clone(), vec![])
+        .with_self_update(false);
+    assert!(
+        !std::sync::Arc::new(service).start_auto_update_scheduler(),
+        "禁用自更新时调度器不得启动"
+    );
+
+    let service = crate::admin::AdminService::new(base.token_manager.clone(), vec![]);
+    assert!(
+        std::sync::Arc::new(service).start_auto_update_scheduler(),
+        "二进制形态下调度器照常启动"
+    );
+}

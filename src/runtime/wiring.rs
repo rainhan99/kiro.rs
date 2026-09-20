@@ -6,9 +6,9 @@ use axum::Router;
 
 use crate::{admin, admin_ui, anthropic};
 
-use super::{Accounting, Foundation};
+use super::{Accounting, Foundation, Options};
 
-pub(super) fn wiring(base: &Foundation, books: Accounting) -> Router {
+pub(super) fn wiring(base: &Foundation, books: Accounting, options: &Options) -> Router {
     let config = &base.config;
     let token_manager = &base.token_manager;
     let kiro_provider = &base.kiro_provider;
@@ -56,7 +56,8 @@ pub(super) fn wiring(base: &Foundation, books: Accounting) -> Router {
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
                     )
-                    .with_cache_meter(cache_meter.clone());
+                    .with_cache_meter(cache_meter.clone())
+                    .with_self_update(options.allow_self_update);
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
