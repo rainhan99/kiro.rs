@@ -1750,6 +1750,37 @@ fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::
     }
 }
 
+/// GET /api/admin/request-capture
+///
+/// 抓到的入站请求形状。默认配置下其中**不含任何提示词内容**——字符串已换成
+/// `<str:N>`，只留结构。关掉脱敏才会有原文，界面上会写明那意味着什么。
+pub async fn get_request_capture(State(state): State<AdminState>) -> Response {
+    let Some(provider) = state.service.kiro_provider() else {
+        return Json(serde_json::json!({
+            "enabled": false,
+            "entries": [],
+            "unavailable": "未配置 Kiro provider，没有可抓取的入站请求"
+        }))
+        .into_response();
+    };
+    let config = provider.pipeline().config.capture.clone();
+    Json(serde_json::json!({
+        "enabled": config.enabled,
+        "redactText": config.redact_text,
+        "maxRequests": config.max_requests,
+        "entries": provider.pipeline().capture().recent(),
+    }))
+    .into_response()
+}
+
+/// DELETE /api/admin/request-capture
+pub async fn clear_request_capture(State(state): State<AdminState>) -> Response {
+    if let Some(provider) = state.service.kiro_provider() {
+        provider.pipeline().capture().clear();
+    }
+    Json(serde_json::json!({"cleared": true})).into_response()
+}
+
 /// GET /api/admin/groups
 pub async fn list_groups(State(state): State<AdminState>) -> impl IntoResponse {
     let groups = state.groups.list();

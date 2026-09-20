@@ -130,6 +130,42 @@ fn legacy_exhausted(request: &axum::extract::Request) -> Option<(f64, f64)> {
         .and_then(|c| c.legacy_credit_exhausted)
 }
 
+/// 入站请求抓取中间件。
+///
+/// 必须拿**原始 JSON**：`MessagesRequest` 在反序列化时会丢掉它不认识的字段，
+/// 而排查"客户端到底发了什么"时，恰恰是那些字段最要紧。
+///
+/// 默认关，关着时**一个字节都不缓冲**——它是排查工具，不该让每个请求为它付代价。
+pub async fn capture_middleware(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(provider) = state.kiro_provider.as_ref() else {
+        return next.run(request).await;
+    };
+    let config = provider.pipeline().config.capture.clone();
+    if !config.enabled {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "request body could not be read"}
+            })),
+        )
+            .into_response();
+    };
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        provider.pipeline().capture().record(&config, None, &value);
+    }
+    next.run(axum::extract::Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
 /// 网关入口中间件。
 ///
 /// 只有被网关接管的别名会在这里被截走；其余请求**原样**继续走既有路径，
@@ -187,7 +223,12 @@ pub async fn gateway_middleware(
     // 未被网关接管的别名仍走既有 Kiro 路径，那条路的额度由遗留计数器管着。
     // 只有网关接管的别名才由账本按路判定。
     if let Some((used, limit)) = key_ctx.legacy_credit_exhausted
-        && !entry.manages(value.get("model").and_then(serde_json::Value::as_str).unwrap_or(""))
+        && !entry.manages(
+            value
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        )
     {
         return over_limit_response(used, limit);
     }
@@ -196,10 +237,7 @@ pub async fn gateway_middleware(
     // 备路要用的那份请求体：克隆 `Bytes` 是 O(1) 的引用计数，克隆解析后的 `Value`
     // 则要把整棵树复制一遍——解析后的结构比原始字节还大，而回退是少数情况。
     let retained = bytes.clone();
-    match entry
-        .handle(protocol, value, key_id, request_id, &[])
-        .await
-    {
+    match entry.handle(protocol, value, key_id, request_id, &[]).await {
         crate::gateway::entry::Handled::Response(response) => response,
         // Kiro 路：预留已经记在账上，交既有通道执行。覆盖与结算句柄放进扩展，
         // 由 handler 取用——请求级传递，不碰任何全局开关。

@@ -8,6 +8,8 @@ export interface PipelineEditor {
   safetyAdjusted: boolean
 }
 export const numericFields = [
+  { key: 'capture.maxRequests', label: '抓包保留条数', min: 1, max: 200, unit: '条', fallback: 20 },
+  { key: 'capture.maxBytes', label: '抓包单条上限', min: 1024, max: 4194304, unit: '字节', fallback: 262144 },
   { key: 'ingressMaxBytes', label: '入口请求上限', min: 1024, max: 104857600, unit: '字节' },
   { key: 'limits.bodyBytes', label: '最终请求体本地上限', min: 1, max: 104857600, unit: '字节', optional: true },
   { key: 'limits.textFieldBytes', label: '单个文本字段上限', min: 1, max: 104857600, unit: '字节', optional: true },
@@ -56,6 +58,9 @@ export function validateDraft(draft: PipelineDraft): { config?: PipelineConfig; 
   for (const field of numericFields) {
     const raw = String(draft[field.key] ?? '').trim()
     if (!raw && 'optional' in field) { numbers[field.key] = null; continue }
+    // 服务端新增了配置项而这份草稿来自更早的读取时，键会缺。用字段自己的默认值
+    // 顶上，而不是让整份配置因为一个缺失的键而保存不了——那会让人以为表单坏了。
+    if (!raw && 'fallback' in field) { numbers[field.key] = field.fallback as number; continue }
     const value = Number(raw)
     if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < field.min || value > field.max) {
       errors[field.key] = `请输入 ${field.min.toLocaleString()}–${field.max.toLocaleString()} 的整数${'optional' in field ? '；留空停用，0 无效' : ''}`
@@ -77,7 +82,13 @@ export function validateDraft(draft: PipelineDraft): { config?: PipelineConfig; 
   if (Object.keys(errors).length) return { errors }
   return { errors, config: {
     mode: draft.mode as PipelineConfig['mode'],
-    prefill: (draft.prefill as PipelineConfig['prefill']) || 'drop',
+    unexpressible: (draft.unexpressible as PipelineConfig['unexpressible']) || 'drop',
+    capture: {
+      enabled: draft['capture.enabled'] === true,
+      maxRequests: n('capture.maxRequests'),
+      maxBytes: n('capture.maxBytes'),
+      redactText: draft['capture.redactText'] !== false,
+    },
     stripBillingHeader: draft.stripBillingHeader === true,
     cacheStrategy: draft.cacheStrategy as PipelineConfig['cacheStrategy'], agentMode: draft.agentMode as PipelineConfig['agentMode'],
     ingressMaxBytes: n('ingressMaxBytes'),

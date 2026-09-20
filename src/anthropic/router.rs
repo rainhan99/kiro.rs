@@ -114,6 +114,11 @@ pub fn create_router_with_shared_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
+        ))
+        // 抓包在最外层：被鉴权拒掉的请求同样值得看形状。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::anthropic::middleware::capture_middleware,
         ));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
@@ -130,6 +135,10 @@ pub fn create_router_with_shared_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::anthropic::middleware::capture_middleware,
         ));
 
     Router::new()

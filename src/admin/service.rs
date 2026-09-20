@@ -702,6 +702,11 @@ impl AdminService {
         svc
     }
 
+    /// 共享的 KiroProvider。未配置时为 `None`——管理端据此如实回答"没有可读的东西"。
+    pub fn kiro_provider(&self) -> Option<&Arc<KiroProvider>> {
+        self.kiro_provider.as_ref()
+    }
+
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self

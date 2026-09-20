@@ -105,3 +105,26 @@ describe('pipeline configuration editor', () => {
     expect(replaced.revision).toBe('two')
   })
 })
+
+describe('新增配置项不得让旧草稿保存不了', () => {
+  test('草稿里缺 capture.* 时用默认值顶上，而不是整份配置校验不过', () => {
+    const { draft } = createEditor(snapshot())
+    // 模拟一份更早读取、还没有 capture 的草稿
+    delete draft['capture.maxRequests']
+    delete draft['capture.maxBytes']
+    const { config, errors } = validateDraft(draft)
+    expect(errors['capture.maxRequests']).toBeUndefined()
+    expect(config).toBeDefined()
+    expect(config.capture.maxRequests).toBe(20)
+    expect(config.capture.maxBytes).toBe(262144)
+  })
+
+  test('抓包默认关、默认脱敏——缺键时也是这两个值', () => {
+    const { draft } = createEditor(snapshot())
+    delete draft['capture.enabled']
+    delete draft['capture.redactText']
+    const { config } = validateDraft(draft)
+    expect(config.capture.enabled).toBe(false)
+    expect(config.capture.redactText).toBe(true)
+  })
+})

@@ -3,13 +3,15 @@ pub mod artifacts;
 pub mod calibration;
 pub mod chunked_map;
 pub mod config;
+pub mod capture;
+pub mod expressible;
 pub mod images;
 pub mod inspect;
 pub mod tool_catalog;
 
 use crate::anthropic::types::MessagesRequest;
 use crate::kiro::model::requests::kiro::KiroRequest;
-use config::{CacheStrategy, PipelineConfig, PipelineMode, PrefillStrategy};
+use config::{CacheStrategy, PipelineConfig, PipelineMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -20,6 +22,8 @@ pub struct RequestPipeline {
     artifacts: Arc<artifacts::ArtifactStore>,
     fingerprint_key: [u8; 32],
     epoch: String,
+    /// 入站请求抓取（默认关）。排查"这个请求为什么被改/被拒"时打开。
+    capture: capture::CaptureStore,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,7 +74,13 @@ impl RequestPipeline {
             config,
             fingerprint_key,
             epoch: uuid::Uuid::new_v4().to_string(),
+            capture: capture::CaptureStore::new(),
         }
+    }
+
+    /// 抓包缓冲，供管理端读取与清空。
+    pub fn capture(&self) -> &capture::CaptureStore {
+        &self.capture
     }
 
     pub fn prepare(
@@ -80,21 +90,6 @@ impl RequestPipeline {
     ) -> anyhow::Result<Option<artifacts::ContextSession>> {
         anyhow::ensure!(payload.max_tokens > 0, "max_tokens must be greater than 0");
         crate::anthropic::handlers::override_thinking_from_model_name(payload);
-        // prefill 的处理与 `mode` 正交：关掉预算强制不等于同意悄悄丢内容，
-        // 所以这条判定在 mode 的早退之前。
-        if self.config.prefill == PrefillStrategy::Refuse
-            && payload.messages.last().is_some_and(|m| m.role != "user")
-        {
-            // 把**角色序列**附在错误里（只有 role，不含任何内容）：光说"不支持 prefill"
-            // 无法分辨这是客户端刻意的开头续写，还是某种被误判的形状。
-            anyhow::bail!(
-                "Kiro does not support assistant prefill; supply a final user turn \
-                 (no messages have been dropped). Roles received: [{}]. \
-                 Set requestPipeline.prefill to \"drop\" to restore the pre-0.9.1 behaviour \
-                 of truncating to the last user turn.",
-                role_sequence(&payload.messages)
-            );
-        }
         if self.config.mode != PipelineMode::Enforce {
             return Ok(None);
         }
@@ -113,7 +108,26 @@ impl RequestPipeline {
             payload.system = None;
         }
         normalize_server_history(payload)?;
-        validate_supported_content(payload)?;
+        // Kiro 表达不了的东西统一在这里取舍：prefill、未知角色、未知内容块、
+        // URL 图片……都是同一件事的实例，不该各配一个开关。
+        //
+        // 位置必须在 `normalize_server_history` **之后**：网关自己产生的搜索与
+        // 思考块要先被归一成适配器认识的形状，否则会被误判成"表达不了"而丢掉。
+        // prefill 那一支由转换器按同一个设置处理，因此不受 `mode` 影响。
+        let removed = expressible::make_expressible(payload, self.config.unexpressible)?;
+        if !removed.is_empty() {
+            tracing::warn!(
+                count = removed.len(),
+                roles = %expressible::role_sequence(payload),
+                "请求中有 Kiro 表达不了的内容，已丢弃并记录: {}",
+                removed
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        validate_tool_pairing(payload)?;
         images::prepare_images(payload, &self.config.images)?;
         if !self.config.artifacts.enabled {
             return Ok(None);
@@ -361,7 +375,11 @@ fn normalize_server_history(payload: &mut MessagesRequest) -> anyhow::Result<()>
     Ok(())
 }
 
-fn validate_supported_content(payload: &MessagesRequest) -> anyhow::Result<()> {
+/// 工具调用的配对：`tool_use` 必须有对应的 `tool_result`，反之亦然。
+///
+/// 这一条与「表达不了」不同——配对断裂不是 Kiro 的表达能力问题，而是这段历史
+/// 本身自相矛盾。丢掉其中一半会让模型看到一次没有结果的调用，所以这里如实报错。
+fn validate_tool_pairing(payload: &MessagesRequest) -> anyhow::Result<()> {
     fn visit(value: &Value, role: &str, in_tool_result: bool) -> anyhow::Result<()> {
         if value.is_string() {
             return Ok(());
@@ -833,17 +851,3 @@ pub fn measure_wire(body: &str) -> anyhow::Result<WireMetrics> {
 #[cfg(test)]
 mod tests;
 
-/// 角色序列，长序列中段折叠。绝不包含消息内容。
-fn role_sequence(messages: &[crate::anthropic::types::Message]) -> String {
-    const EDGE: usize = 4;
-    let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
-    if roles.len() <= EDGE * 2 + 1 {
-        return roles.join(", ");
-    }
-    format!(
-        "{}, …{} more…, {}",
-        roles[..EDGE].join(", "),
-        roles.len() - EDGE * 2,
-        roles[roles.len() - EDGE..].join(", ")
-    )
-}

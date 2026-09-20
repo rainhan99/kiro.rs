@@ -216,6 +216,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/request-pipeline",
             get(get_request_pipeline).put(super::handlers::set_request_pipeline),
         )
+        .route(
+            "/request-capture",
+            get(super::handlers::get_request_capture)
+                .delete(super::handlers::clear_request_capture),
+        )
         // 多上游网关。未配置时这些端点一律 404，而不是回一个空壳让人以为配好了。
         .route(
             "/gateway/config",

@@ -261,14 +261,38 @@ fn offline_and_live_share_normalization_and_reject_unsupported_inputs() {
     request.model = "claude-sonnet-4-thinking".into();
     p.prepare(&mut request, 1).unwrap();
     assert!(request.thinking.is_some());
+
+    // max_tokens 为 0 与「表达不了」无关：它是一个无效请求，两种策略下都报错。
     request.max_tokens = 0;
     assert!(p.prepare(&mut request, 1).is_err());
     request.max_tokens = 1000;
-    request.messages[0].content =
-        json!([{"type":"image","source":{"type":"url","url":"https://invalid.example/image.png"}}]);
-    assert!(p.prepare(&mut request, 1).is_err());
-    request.messages[0].content = json!([{"type":"document","source":{"data":"must not vanish"}}]);
-    assert!(p.prepare(&mut request, 1).is_err());
+
+    // URL 图片与未知内容块属于「Kiro 表达不了」：默认丢弃并记录，
+    // 选了 refuse 才拒绝。拒绝并不能把它们保住——转换器无论如何都不会送出去。
+    let refusing = RequestPipeline::new(config::PipelineConfig {
+        unexpressible: expressible::UnexpressibleStrategy::Refuse,
+        ..config::PipelineConfig::default()
+    });
+    for content in [
+        json!([{"type":"image","source":{"type":"url","url":"https://invalid.example/image.png"}}]),
+        json!([{"type":"document","source":{"data":"must not vanish"}}]),
+    ] {
+        let mut dropping = request_fixture();
+        dropping.max_tokens = 1000;
+        dropping.messages[0].content = content.clone();
+        assert!(
+            p.prepare(&mut dropping, 1).is_ok(),
+            "默认应丢弃并继续：{content}"
+        );
+
+        let mut refusing_request = request_fixture();
+        refusing_request.max_tokens = 1000;
+        refusing_request.messages[0].content = content.clone();
+        assert!(
+            refusing.prepare(&mut refusing_request, 1).is_err(),
+            "选了 refuse 应拒绝：{content}"
+        );
+    }
 }
 
 #[test]
@@ -726,7 +750,7 @@ fn recovery_body_is_inert_while_disabled() {
 
 fn refusing_config() -> config::PipelineConfig {
     config::PipelineConfig {
-        prefill: config::PrefillStrategy::Refuse,
+        unexpressible: expressible::UnexpressibleStrategy::Refuse,
         ..config::PipelineConfig::default()
     }
 }
@@ -743,145 +767,3 @@ fn prefill_request() -> MessagesRequest {
     .unwrap()
 }
 
-/// 显式选了 `refuse` 就必须拒绝，且请求原样不动。
-#[test]
-fn choosing_refuse_rejects_without_touching_the_request() {
-    let mut payload = prefill_request();
-    let before = payload.messages.len();
-    let pipeline = RequestPipeline::new(refusing_config());
-
-    // `ContextSession` 刻意不实现 Debug——它持有转存的原文，实现 Debug 等于
-    // 给内容开一条进日志的路。所以这里用 let-else 而不是 unwrap_err。
-    let Err(error) = pipeline.prepare(&mut payload, 1) else {
-        panic!("末尾 assistant 必须被拒绝");
-    };
-    let rendered = format!("{error:#}");
-    assert!(rendered.contains("assistant prefill"), "{rendered}");
-    assert!(
-        rendered.contains("no messages have been dropped"),
-        "要说清什么都没丢：{rendered}"
-    );
-    assert_eq!(payload.messages.len(), before, "拒绝的请求不得被改动");
-}
-
-/// 错误里要带**角色序列**，否则分不清这是刻意的开头续写还是别的形状被误判。
-/// 序列里只有 role，内容一个字都不出现。
-#[test]
-fn the_refusal_names_the_role_sequence_without_any_content() {
-    let mut payload = prefill_request();
-    let pipeline = RequestPipeline::new(refusing_config());
-    let Err(error) = pipeline.prepare(&mut payload, 1) else {
-        panic!("末尾 assistant 必须被拒绝");
-    };
-    let rendered = format!("{error:#}");
-
-    assert!(
-        rendered.contains("Roles received: [user, assistant]"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("Question one") && !rendered.contains("I'll start by"),
-        "错误里不得出现任何消息内容：{rendered}"
-    );
-    // 并且要告诉运维怎么改回旧行为。
-    assert!(rendered.contains("requestPipeline.prefill"), "{rendered}");
-}
-
-/// 长会话的角色序列要折叠，不能把整段历史铺开。
-#[test]
-fn a_long_conversation_folds_its_role_sequence() {
-    let mut messages = Vec::new();
-    for _ in 0..10 {
-        messages.push(json!({"role": "user", "content": "q"}));
-        messages.push(json!({"role": "assistant", "content": "a"}));
-    }
-    let mut payload: MessagesRequest = serde_json::from_value(json!({
-        "model": "claude-sonnet-4", "max_tokens": 100, "messages": messages
-    }))
-    .unwrap();
-    let pipeline = RequestPipeline::new(refusing_config());
-    let Err(error) = pipeline.prepare(&mut payload, 1) else {
-        panic!("末尾 assistant 必须被拒绝");
-    };
-    let rendered = format!("{error:#}");
-    assert!(rendered.contains("…12 more…"), "中段应折叠：{rendered}");
-}
-
-/// 默认（`drop`）保持 0.9.0 的行为：截断到最后一条 user 继续。
-#[test]
-fn the_default_keeps_the_pre_0_9_1_truncation() {
-    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
-    let mut payload = prefill_request();
-
-    assert!(
-        pipeline.prepare(&mut payload, 1).is_ok(),
-        "默认就是 drop，不该报错"
-    );
-    let converted = crate::anthropic::converter::convert_request_with_pipeline(
-        &payload,
-        crate::model::config::ToolCompatibilityMode::Raw,
-        &pipeline.config,
-    )
-    .expect("转换应当成功");
-    // 转换器截断到最后一条 user；payload 本身没有被就地改写。
-    assert_eq!(payload.messages.len(), 2, "prepare 不该就地删消息");
-    assert!(
-        !serde_json::to_string(&converted.conversation_state)
-            .unwrap()
-            .contains("I'll start by"),
-        "被丢弃的 prefill 不该出现在送出的请求里"
-    );
-}
-
-/// prefill 的处理与 `mode` **正交**：把预算强制关掉，不等于同意悄悄丢内容。
-///
-/// 这两件事此前是绑在一起的——`mode` 一旦不是 enforce，`prepare` 就提前返回，
-/// 转换器那条静默丢弃路径接管，同一份配置在两条路径上表现不同。
-#[test]
-fn turning_off_enforcement_does_not_silently_re_enable_dropping() {
-    for mode in [
-        config::PipelineMode::Off,
-        config::PipelineMode::Audit,
-        config::PipelineMode::Enforce,
-    ] {
-        let mut cfg = refusing_config();
-        cfg.mode = mode;
-        let pipeline = RequestPipeline::new(cfg);
-        let mut payload = prefill_request();
-        assert!(
-            pipeline.prepare(&mut payload, 1).is_err(),
-            "{mode:?}：选了 refuse 就该拒绝，与 mode 无关"
-        );
-    }
-}
-
-/// 转换器是最后一道：`prepare()` 不在调用路径上时（内部轮次、compaction 通道）
-/// 由它兜住，免得同一份配置在两条路径上表现不同。
-#[test]
-fn the_converter_refuses_too_when_prepare_is_not_in_the_path() {
-    let cfg = refusing_config();
-    let payload = prefill_request();
-    let error = crate::anthropic::converter::convert_request_with_pipeline(
-        &payload,
-        crate::model::config::ToolCompatibilityMode::Raw,
-        &cfg,
-    )
-    .unwrap_err();
-    assert!(
-        format!("{error}").contains("assistant prefill"),
-        "实得：{error}"
-    );
-}
-
-/// 默认必须是 `drop`。
-///
-/// 拒绝并**没有**把 prefill 保住——Kiro 两种情况下都用不上它。默认拒绝换不来
-/// "内容被保住"，只会让拿 prefill 约束小工具调用输出格式的客户端陷进重试循环。
-#[test]
-fn the_default_is_drop_because_refusing_saves_nothing() {
-    assert_eq!(
-        config::PipelineConfig::default().prefill,
-        config::PrefillStrategy::Drop
-    );
-    assert_eq!(config::PrefillStrategy::default(), config::PrefillStrategy::Drop);
-}

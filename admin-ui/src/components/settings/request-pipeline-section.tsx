@@ -45,7 +45,7 @@ import type { PipelineEditor } from './request-pipeline-form'
 
 const choices: Record<string, { value: string; label: string }[]> = {
   mode: [{ value: 'off', label: '关闭' }, { value: 'audit', label: '审计' }, { value: 'enforce', label: '强制执行' }],
-  prefill: [{ value: 'drop', label: '丢弃 prefill 继续（默认）' }, { value: 'refuse', label: '拒绝请求' }],
+  unexpressible: [{ value: 'drop', label: '丢弃那一部分并记录（默认）' }, { value: 'refuse', label: '拒绝整个请求' }],
   cacheStrategy: [{ value: 'off', label: '关闭' }, { value: 'static-prefix', label: '静态前缀（实验性）' }],
   agentMode: [{ value: 'vibe', label: 'Vibe' }, { value: 'spec', label: 'Spec' }],
   'images.strategy': [{ value: 'preserve', label: '保留原图' }, { value: 'lossless-tiles', label: '无损切片' }],
@@ -56,7 +56,8 @@ const choices: Record<string, { value: string; label: string }[]> = {
   recovery: [{ value: 'off', label: '不重试（默认）' }, { value: 'lossless-retry', label: '无损修正后重发一次' }],
 }
 const labels: Record<string, string> = {
-  mode: '执行模式', prefill: '末尾 assistant 消息', stripBillingHeader: '移除计费标记头', cacheStrategy: '缓存策略', agentMode: '代理模式',
+  mode: '执行模式', unexpressible: 'Kiro 表达不了的内容', stripBillingHeader: '移除计费标记头',
+  'capture.enabled': '抓取入站请求', 'capture.redactText': '抓包时脱敏', cacheStrategy: '缓存策略', agentMode: '代理模式',
   'artifacts.enabled': '启用原文分页读取', 'images.strategy': '图片策略',
   'toolResults.strategy': '工具结果线上形状', 'toolCatalog.strategy': '工具声明发送方式',
   'chunkedMap.strategy': '分块处理（非无损）', admission: '发送前 token 准入',
@@ -202,7 +203,9 @@ export function RequestPipelineSection() {
           <legend className="mb-3 text-sm font-semibold">{editable ? '编辑下次启动配置' : '配置只读预览'}</legend>
           <SettingGroup title="执行与审计" description="各开关只修改草稿，统一通过下方保存按钮提交。">
             {select('mode', '强制执行会执行管线转换并拒绝超出已配置预算的请求。审计 / 关闭保留原有请求转换，不执行计费标记清理、原文转存、图片切片或 cachePoint 标记，也不强制拒绝这些预算违规。入口上限始终适用，审计记录由独立开关控制。')}
-            {select('prefill', 'Kiro 不支持 assistant prefill，两种处理下它都用不上——拒绝并不能把它保住，只是让请求失败。默认「丢弃」：截断到最后一条 user 继续，日志与 trace 都会留痕，不是静默的。主流客户端会拿 prefill 约束小工具调用的输出格式，选「拒绝」会让这类客户端陷进重试循环。这一项与执行模式无关。')}
+            {select('unexpressible', 'Kiro 表达不了的东西——末尾 assistant（prefill）、非 user/assistant 角色、未知内容块、URL 图片——统一按这一项处理。注意：拒绝**并不能把它们保住**，Kiro 两种情况下都用不上，转换器无论如何都不会送出去。所以默认「丢弃并记录」：请求照常跑通，丢了什么会写进日志与 trace，逐项指明位置和实际看到的类型。选「拒绝」则整个请求失败。与执行模式无关。')}
+            {toggle('capture.enabled', '把入站请求的形状抓下来，用于排查「这个请求为什么被改/被拒」。默认关。开着时保留最近若干条，进程重启即清空。')}
+            {toggle('capture.redactText', '抓包时把所有字符串换成 <str:N>（N 是字符数），只留结构。**默认开**——排查形状问题需要的是结构，提示词原文帮不上忙却最敏感。关掉它意味着抓下来的东西含有完整的提示词原文。')}
             {select('agentMode', '上游请求使用的代理模式。')}
             {toggle('stripBillingHeader', '仅移除首个 system 文本块开头的 x-anthropic-billing-header: 行；不是任意 HTTP 请求头清理。')}
             {toggle('auditEnabled', '记录管线处理证据；原生缓存 usage 与本地估算分别展示。')}
