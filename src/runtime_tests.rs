@@ -616,3 +616,66 @@ async fn pre_existing_world_readable_files_are_tightened_at_startup() {
         );
     }
 }
+
+/// 新生成的配置**不带** adminApiKey——管理权要由用户自己认领。
+///
+/// apiKey 照旧生成：它是客户端凭据不是管理凭据，客户端要能立刻用起来。
+/// 两者的区别就在这里显出来：一个是「给机器的」，一个是「代表你的」。
+#[test]
+fn a_freshly_generated_config_has_no_admin_key_to_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.json");
+    let creds = dir.path().join("credentials.json");
+    crate::runtime::ensure_config_files_with_host(
+        &config.to_string_lossy(),
+        &creds.to_string_lossy(),
+        "127.0.0.1",
+    );
+
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert!(
+        raw.get("adminApiKey").is_none_or(|v| v.as_str().is_none_or(str::is_empty)),
+        "新配置不该自带管理密钥，实际: {raw}"
+    );
+    assert!(
+        raw["apiKey"].as_str().is_some_and(|k| k.starts_with("sk-")),
+        "客户端 Key 照旧生成，实际: {raw}"
+    );
+}
+
+/// setup token 绝不落盘。
+///
+/// 落盘就多一个会被备份、被打包、被 scp 走的秘密；而它换的是管理权。
+#[tokio::test]
+async fn the_setup_token_never_touches_the_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.json");
+    let creds = dir.path().join("credentials.json");
+    crate::runtime::ensure_config_files_with_host(
+        &config.to_string_lossy(),
+        &creds.to_string_lossy(),
+        "127.0.0.1",
+    );
+    // 端口改 0，避免和别的测试抢
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    raw["port"] = serde_json::json!(0);
+    std::fs::write(&config, raw.to_string()).unwrap();
+
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let token = server.setup_token().expect("未初始化时必须有 token").to_string();
+    server.shutdown().await.unwrap();
+
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue; // 二进制文件（SQLite）跳过
+        };
+        assert!(
+            !text.contains(&token),
+            "setup token 出现在 {} 里",
+            path.display()
+        );
+    }
+}

@@ -52,6 +52,7 @@ pub struct RunningServer {
     addr: SocketAddr,
     data_dir: PathBuf,
     admin_api_key: Option<String>,
+    setup_token: Option<String>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     joined: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -77,6 +78,13 @@ impl RunningServer {
     /// 路径，直接读文件同样拿得到。
     pub fn admin_api_key(&self) -> Option<&str> {
         self.admin_api_key.as_deref()
+    }
+
+    /// 未初始化时的一次性 setup token，已初始化则为 `None`。
+    ///
+    /// 桌面端用它免去让用户手抄——应用自己就是打印它的那个进程。
+    pub fn setup_token(&self) -> Option<&str> {
+        self.setup_token.as_deref()
     }
 
     /// 优雅关停：停止收新连接，等在飞请求走完。
@@ -105,7 +113,7 @@ impl RunningServer {
 /// **不自建运行时**：Tauri 自带一个，同进程两个运行时会让 `Handle::current()`
 /// 拿到错误的那个，表现是随机的 "no reactor running" panic。
 pub async fn serve(options: Options) -> anyhow::Result<RunningServer> {
-    let (app, addr_spec, data_dir, admin_api_key) = assemble(&options).await?;
+    let (app, addr_spec, data_dir, admin_api_key, setup_token) = assemble(&options).await?;
     let listener = bind_with_fallback(addr_spec).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -125,6 +133,7 @@ pub async fn serve(options: Options) -> anyhow::Result<RunningServer> {
         addr,
         data_dir,
         admin_api_key,
+        setup_token,
         shutdown: tx,
         joined,
     })
@@ -157,7 +166,7 @@ async fn bind_with_fallback(spec: SocketAddr) -> anyhow::Result<tokio::net::TcpL
 /// 装配失败返回 `Err`——调用方决定怎么死。库不替它做这个决定。
 async fn assemble(
     options: &Options,
-) -> anyhow::Result<(Router, SocketAddr, PathBuf, Option<String>)> {
+) -> anyhow::Result<(Router, SocketAddr, PathBuf, Option<String>, Option<String>)> {
     let base = foundation(options)?;
     let books = accounting(&base).await?;
 
@@ -177,5 +186,12 @@ async fn assemble(
         .admin_api_key
         .clone()
         .filter(|k| !k.trim().is_empty());
-    Ok((wiring(&base, books, options), addr, data_dir, admin_api_key))
+    let setup_token = base.setup.token();
+    Ok((
+        wiring(&base, books, options),
+        addr,
+        data_dir,
+        admin_api_key,
+        setup_token,
+    ))
 }

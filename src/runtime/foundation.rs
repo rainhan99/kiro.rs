@@ -25,6 +25,8 @@ pub(crate) struct Foundation {
     pub kiro_provider: Arc<KiroProvider>,
     pub endpoint_names: Vec<String>,
     pub configured_api_key: Option<String>,
+    /// 首次初始化状态。未初始化时持有一次性 setup token。
+    pub setup: Arc<crate::admin::setup::SetupState>,
     /// 所有运行期文件的落脚点：客户端 Key、用量日志、分组、账本、trace、缓存计量。
     /// 取的是凭据文件的父目录——只要调用方传绝对路径，这些文件就不会落到 CWD。
     pub cache_dir: PathBuf,
@@ -182,8 +184,13 @@ pub(crate) fn foundation(options: &Options) -> anyhow::Result<Foundation> {
         .cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+    let setup = Arc::new(crate::admin::setup::SetupState::from_configured_key(
+        config.admin_api_key.as_deref(),
+    ));
+
     Ok(Foundation {
         config,
+        setup,
         token_manager,
         kiro_provider,
         endpoint_names,
@@ -215,13 +222,16 @@ pub fn ensure_config_files_with_host(config_path: &str, credentials_path: &str, 
                 }
             }
         }
+        // apiKey 照旧生成：它是**客户端**凭据，客户端要能立刻用起来。
+        //
+        // adminApiKey 刻意不生成：管理权要由用户自己认领（设自己的密码），
+        // 凭控制台打印的一次性 setup token。一个用户既没设过也记不住的
+        // 随机串，最后的下场是被翻出来抄一遍、或者干脆一直不换。
         let api_key = format!("sk-kiro-rs-{}", random_token(24));
-        let admin_api_key = format!("sk-admin-{}", random_token(24));
         let default = serde_json::json!({
             "host": host,
             "port": 8990,
             "apiKey": api_key,
-            "adminApiKey": admin_api_key,
             "region": "us-east-1",
             "tlsBackend": "rustls",
             "defaultEndpoint": "ide"
@@ -232,9 +242,9 @@ pub fn ensure_config_files_with_host(config_path: &str, credentials_path: &str, 
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
-                tracing::info!("  apiKey      = {}（每次启动时同步为系统 Key）", api_key);
-                tracing::info!("  adminApiKey = {}（管理面板登录密钥）", admin_api_key);
-                tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
+                tracing::info!("  apiKey = {}（客户端用，同时同步为系统 Key）", api_key);
+                // 管理密码不在这里给——它由用户在初始化页自己设，
+                // 凭启动横幅里的 setup token。
             }
             Err(e) => tracing::warn!("写入默认配置失败 {}: {}", config_p.display(), e),
         }
