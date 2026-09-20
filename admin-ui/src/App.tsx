@@ -8,6 +8,9 @@ import {
   type ThemeSelection,
 } from "@/lib/theme";
 import { LoginPage } from "@/components/login-page";
+import { SetupPage } from "@/components/setup-page";
+import { decideEntryScreen } from "@/components/setup-logic";
+import { fetchSetupStatus } from "@/api/setup";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -73,7 +76,14 @@ interface AppHeaderProps {
 function App() {
   const app = useAppShell();
 
-  if (!app.isLoggedIn) {
+  // 状态还没探到时先不画任何一屏：闪一下登录页再跳走，看起来像是掉线了。
+  if (app.screen === null) return null;
+
+  if (app.screen === "setup") {
+    return <SetupApp providedToken={app.providedSetupToken} onDone={app.handleLogin} />;
+  }
+
+  if (app.screen === "login") {
     return <LoggedOutApp onLogin={app.handleLogin} />;
   }
 
@@ -90,14 +100,45 @@ function App() {
   );
 }
 
+/**
+ * 宿主（桌面端）注入的一次性口令。
+ *
+ * 桌面端自己就是打印这串口令的那个进程，没理由让用户再手抄一遍。
+ * 浏览器里这个值不存在，初始化页会照常要求粘贴。
+ */
+function readProvidedSetupToken(): string | null {
+  try {
+    return localStorage.getItem("kiroSetupToken");
+  } catch {
+    return null;
+  }
+}
+
 function useAppShell() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [initialized, setInitialized] = useState<boolean | null>(null);
+  const [probed, setProbed] = useState(false);
+  const providedSetupToken = readProvidedSetupToken();
   const [tab, setTab] = useState<Tab>(readTabFromHash);
   const [theme, setTheme] = useState<ThemeSelection>(() => storage.getThemeSelection());
   const [isDarkMode, setIsDarkMode] = useState(() => resolveDarkMode(theme));
 
   useEffect(() => {
     if (storage.getApiKey()) setIsLoggedIn(true);
+  }, []);
+
+  // 先问一句「这个实例被认领过没有」。未初始化时要显示的是初始化页，
+  // 而不是一个没有密码可填的登录页。
+  useEffect(() => {
+    let alive = true;
+    fetchSetupStatus().then((value) => {
+      if (!alive) return;
+      setInitialized(value);
+      setProbed(true);
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -148,6 +189,13 @@ function useAppShell() {
     handleLogin,
     handleLogout,
     isLoggedIn,
+    providedSetupToken,
+    // 探测没回来之前是 null——此时什么都不画，免得闪一下登录页再跳走。
+    screen: probed
+      ? isLoggedIn && initialized !== false
+        ? "console"
+        : decideEntryScreen({ initialized, storedKey: storage.getApiKey() })
+      : null,
     isDarkMode,
     selectMode,
     selectPalette,
@@ -155,6 +203,21 @@ function useAppShell() {
     tab,
     theme,
   };
+}
+
+function SetupApp({
+  providedToken,
+  onDone,
+}: {
+  providedToken: string | null;
+  onDone: () => void;
+}) {
+  return (
+    <>
+      <SetupPage providedToken={providedToken} onDone={onDone} />
+      <Toaster position="top-center" />
+    </>
+  );
 }
 
 function LoggedOutApp({ onLogin }: { onLogin: () => void }) {
