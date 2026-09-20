@@ -38,11 +38,24 @@ pub(super) fn wiring(base: &Foundation, books: Accounting, options: &Options) ->
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
-    let app = if let Some(admin_key) = &config.admin_api_key {
-        if admin_key.trim().is_empty() {
-            tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
-            anthropic_app
-        } else {
+    // 挂载条件：**有密钥** 或 **还没初始化**。
+    //
+    // 从前只看「有没有非空 adminApiKey」。首次初始化之后，「没有密钥」
+    // 恰恰是需要挂载的那种情况——初始化页就住在 /admin 上。没有它，
+    // 全新实例会得到一个 404，用户完全不知道下一步该做什么。
+    //
+    // 未初始化时被挂上来的 authenticated 路由一律 401（中间件里那道
+    // 「空密钥不放行」的守卫），只有 /setup 与 /setup/status 可用。
+    let admin_key_configured = config
+        .admin_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let should_mount_admin = admin_key_configured.is_some() || !base.setup.initialized();
+
+    let app = if should_mount_admin {
+        {
+            let admin_key = admin_key_configured.unwrap_or("");
             // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
             let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
                 std::sync::Arc::new(
@@ -66,7 +79,8 @@ pub(super) fn wiring(base: &Foundation, books: Accounting, options: &Options) ->
                 admin_trace_store,
                 group_manager.clone(),
             )
-            .with_gateway(Some(gateway.clone()));
+            .with_gateway(Some(gateway.clone()))
+            .with_setup(base.setup.clone());
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

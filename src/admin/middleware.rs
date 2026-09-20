@@ -37,6 +37,8 @@ pub struct AdminState {
     pub groups: SharedGroupManager,
     /// 多上游网关（可选）。`None` 表示未配置，网关相关端点一律回 404。
     pub gateway: Option<Arc<crate::gateway::service::GatewayService>>,
+    /// 首次初始化状态。未初始化时持有一次性 setup token。
+    pub setup: Arc<super::setup::SetupState>,
 }
 
 impl AdminState {
@@ -46,6 +48,12 @@ impl AdminState {
         gateway: Option<Arc<crate::gateway::service::GatewayService>>,
     ) -> Self {
         self.gateway = gateway;
+        self
+    }
+
+    /// 注入首次初始化状态。
+    pub fn with_setup(mut self, setup: Arc<super::setup::SetupState>) -> Self {
+        self.setup = setup;
         self
     }
 
@@ -64,8 +72,13 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
-                    gateway: None,
-}
+            gateway: None,
+            // 默认「已初始化」：这个构造器的调用方都已经给出了 admin_api_key。
+            // 真正的状态由 wiring 用 with_setup 注入。
+            setup: Arc::new(super::setup::SetupState::from_configured_key(Some(
+                "configured",
+            ))),
+        }
     }
 }
 
@@ -78,6 +91,19 @@ pub async fn admin_auth_middleware(
     let api_key = auth::extract_api_key(&request);
 
     let current_key = state.admin_api_key.read().clone();
+
+    // 空密钥的意思是「还没配」，永远不是「谁都行」。
+    //
+    // 不加这道守卫会有个安静的洞：`extract_api_key` 对空 header 返回
+    // `Some("")`，而 `constant_time_eq("", "")` 为真——空密钥 + 空 header
+    // 就通过了。从前够不到，是因为密钥为空时整个 admin 路由不挂载；
+    // 首次初始化把那层保护拆了（未初始化的实例必须挂上 /admin 才能显示
+    // 初始化页），所以这里必须自己守住。
+    if current_key.trim().is_empty() {
+        let error = AdminErrorResponse::authentication_error();
+        return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+    }
+
     match api_key {
         Some(key) if auth::constant_time_eq(&key, &current_key) => next.run(request).await,
         _ => {

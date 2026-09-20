@@ -1336,3 +1336,13 @@ pub struct CustomModelItem {
 pub struct SetCustomModelsRequest {
     pub models: Vec<CustomModelItem>,
 }
+
+/// 首次初始化请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupRequest {
+    /// 控制台打印的一次性口令。
+    pub setup_token: String,
+    /// 用户自己设的管理密码。
+    pub admin_key: String,
+}

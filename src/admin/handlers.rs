@@ -1982,3 +1982,66 @@ pub async fn delete_group(
     )))
     .into_response()
 }
+
+// ============ 首次初始化 ============
+
+/// GET /api/admin/setup/status —— **无需鉴权**
+///
+/// 只回一个布尔。任何多余的字段都是在给未认证的人送情报：实例有没有被
+/// 认领、版本是多少、数据目录在哪，都是攻击者想先知道的东西。
+pub async fn get_setup_status(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(serde_json::json!({ "initialized": state.setup.initialized() }))
+}
+
+/// POST /api/admin/setup —— **无需鉴权，但要出示 setup token**
+///
+/// 这是整个管理面上唯一不要密钥的写端点，所以每一条约束都要成立：
+/// - 仅未初始化时可用，已初始化一律 409（即使 token 正确——那时根本没有 token）
+/// - token 常量时间比对（`SetupState::consume`）
+/// - 密码校验**先于** token 消费：打错一次密码不该作废 token，
+///   否则用户得重启服务才能再试一次
+pub async fn perform_setup(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetupRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+
+    if state.setup.initialized() {
+        return (
+            StatusCode::CONFLICT,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "已经初始化过了。要改密码请登录后到「系统设置 → 安全」。",
+            )),
+        )
+            .into_response();
+    }
+
+    // 先校验密码：token 是一次性的，不能被一次手滑的密码烧掉。
+    let admin_key = match super::setup::validate_admin_key(&payload.admin_key) {
+        Ok(key) => key,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(message)),
+            )
+                .into_response();
+        }
+    };
+
+    if !state.setup.consume(&payload.setup_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "口令不对。它印在服务启动时的控制台输出里，重启会换一个新的。",
+            )),
+        )
+            .into_response();
+    }
+
+    // 顺序要紧：先落盘再改内存。反过来的话，写盘失败会留下一个
+    // 「这次能登录、重启就进不去」的实例。
+    state.service.persist_admin_key(&admin_key);
+    *state.admin_api_key.write() = admin_key;
+
+    Json(super::types::SuccessResponse::new("管理密码已设置")).into_response()
+}

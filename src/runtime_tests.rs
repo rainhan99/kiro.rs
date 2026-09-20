@@ -763,3 +763,256 @@ fn an_ipv6_wildcard_bind_is_also_translated() {
     .join("\n");
     assert!(!joined.contains("http://[::]:"), "实际:\n{joined}");
 }
+
+// ---------------- 首次初始化端点 ----------------
+
+/// 起一个未初始化的实例：配置里不写 adminApiKey。
+async fn uninitialized_server(dir: &std::path::Path) -> RunningServer {
+    let config = dir.join("config.json");
+    let creds = dir.join("credentials.json");
+    crate::common::fs::write_private(
+        &config,
+        br#"{"host":"127.0.0.1","port":0,"apiKey":"sk-kiro-rs-test"}"#,
+    )
+    .unwrap();
+    crate::common::fs::write_private(&creds, b"[]").unwrap();
+    serve(Options::new(&config, &creds)).await.unwrap()
+}
+
+/// **这条是整个 F3 最重要的测试。**
+///
+/// 初始化端点要挂在鉴权层**之外**——挂错一层就等于把整个管理面开放了，
+/// 而那种错误在功能上完全看不出来：初始化能用，管理界面也能用，
+/// 只是任何人都能用。
+#[tokio::test]
+async fn opening_the_setup_endpoints_does_not_open_the_rest_of_the_admin_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = uninitialized_server(dir.path()).await;
+    let base = format!("http://{}", server.addr());
+    let client = reqwest::Client::new();
+
+    // 取几条有代表性的：读的、写的、网关的、危险的。
+    for (method, path) in [
+        ("GET", "/api/admin/credentials"),
+        ("GET", "/api/admin/client-keys"),
+        ("GET", "/api/admin/config/update"),
+        ("POST", "/api/admin/client-keys"),
+        ("POST", "/api/admin/system/update/apply"),
+        ("PUT", "/api/admin/config/admin-key"),
+    ] {
+        let url = format!("{base}{path}");
+        let request = match method {
+            "GET" => client.get(&url),
+            "POST" => client.post(&url).json(&serde_json::json!({})),
+            _ => client.put(&url).json(&serde_json::json!({})),
+        };
+        let status = request.send().await.unwrap().status();
+        assert_eq!(
+            status, 401,
+            "{method} {path} 没有鉴权就放行了——初始化端点挂错层了"
+        );
+    }
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_setup_status_is_readable_without_a_key_and_says_only_that() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = uninitialized_server(dir.path()).await;
+
+    let body: serde_json::Value = reqwest::get(format!(
+        "http://{}/api/admin/setup/status",
+        server.addr()
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    assert_eq!(body["initialized"], serde_json::json!(false));
+    // 只回一个布尔。任何多余的字段都是在给未认证的人送情报。
+    let text = body.to_string();
+    assert!(!text.contains("sk-"), "泄露了密钥material: {text}");
+    assert!(!text.contains("token"), "泄露了 token: {text}");
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        1,
+        "只该有 initialized 一个字段，实际: {body}"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn setup_with_the_right_token_claims_the_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = uninitialized_server(dir.path()).await;
+    let base = format!("http://{}", server.addr());
+    let token = server.setup_token().unwrap().to_string();
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/admin/setup"))
+        .json(&serde_json::json!({ "setupToken": token, "adminKey": "my-own-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    // 新密码立刻可用
+    let status = client
+        .get(format!("{base}/api/admin/credentials"))
+        .header("x-api-key", "my-own-password")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200, "设完的密码必须立刻能登录");
+
+    // 状态翻转，且门关上了
+    let body: serde_json::Value = reqwest::get(format!("{base}/api/admin/setup/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["initialized"], serde_json::json!(true));
+
+    let again = client
+        .post(format!("{base}/api/admin/setup"))
+        .json(&serde_json::json!({ "setupToken": token, "adminKey": "another-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 409, "设完即关，同一个 token 不能再用");
+
+    // 落盘了：重启后还在
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["adminApiKey"], serde_json::json!("my-own-password"));
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn setup_rejects_a_wrong_token_and_a_weak_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = uninitialized_server(dir.path()).await;
+    let base = format!("http://{}", server.addr());
+    let token = server.setup_token().unwrap().to_string();
+    let client = reqwest::Client::new();
+
+    let wrong = client
+        .post(format!("{base}/api/admin/setup"))
+        .json(&serde_json::json!({ "setupToken": "nope", "adminKey": "my-own-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+
+    // 试错不该烧掉真 token
+    let short = client
+        .post(format!("{base}/api/admin/setup"))
+        .json(&serde_json::json!({ "setupToken": token.clone(), "adminKey": "abc" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(short.status(), 400, "密码太短要拒");
+
+    // 密码被拒时 token 也不该被烧掉——否则用户打错一次密码就得重启服务
+    let ok = client
+        .post(format!("{base}/api/admin/setup"))
+        .json(&serde_json::json!({ "setupToken": token, "adminKey": "good-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        200,
+        "密码校验失败不该作废 token，否则打错一次就得重启服务"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+/// 已初始化的实例上，初始化端点必须彻底关死。
+#[tokio::test]
+async fn an_initialized_instance_refuses_setup_entirely() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path()); // 这个夹具带 adminApiKey
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let base = format!("http://{}", server.addr());
+
+    assert!(server.setup_token().is_none(), "已初始化不该有 token");
+
+    let body: serde_json::Value = reqwest::get(format!("{base}/api/admin/setup/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["initialized"], serde_json::json!(true));
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/setup"))
+        .json(&serde_json::json!({ "setupToken": "whatever", "adminKey": "new-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // 原密钥仍然有效——没被覆盖
+    let status = reqwest::Client::new()
+        .get(format!("{base}/api/admin/credentials"))
+        .header("x-api-key", "sk-admin-test")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200, "原有密钥被动过了");
+
+    server.shutdown().await.unwrap();
+}
+
+/// 管理密钥为空时，**任何**凭证都不该通过——包括空凭证本身。
+///
+/// 这条原本是潜在的：`extract_api_key` 对空 header 返回 `Some("")`，
+/// 而 `constant_time_eq("", "")` 为真，所以空密钥 + 空 header = 放行。
+/// 它够不到只是因为「密钥为空时整个 admin 路由不挂载」。
+///
+/// 首次初始化把那层保护拆了——未初始化的实例必须挂上 /admin 才能显示
+/// 初始化页。所以这条必须在中间件里自己守住：
+/// **空密钥的意思是「还没配」，永远不是「谁都行」。**
+#[tokio::test]
+async fn an_unset_admin_key_authenticates_nobody_not_even_an_empty_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = uninitialized_server(dir.path()).await;
+    let url = format!("http://{}/api/admin/credentials", server.addr());
+    let client = reqwest::Client::new();
+
+    for presented in ["", " ", "anything"] {
+        let status = client
+            .get(&url)
+            .header("x-api-key", presented)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401, "空密钥状态下 x-api-key: {presented:?} 被放行了");
+    }
+
+    // Bearer 那条路同理
+    let status = client
+        .get(&url)
+        .header("authorization", "Bearer ")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 401, "空 Bearer 被放行了");
+
+    server.shutdown().await.unwrap();
+}

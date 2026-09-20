@@ -19,7 +19,8 @@ use super::{
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
         get_current_models, get_custom_models, get_global_proxy, get_load_balancing_mode,
         get_log_governance_config, get_proxy_pool, get_request_pipeline, get_self_heal_config,
-        get_session_affinity_config, get_update_config, list_client_keys, list_groups, list_traces,
+        get_session_affinity_config, get_setup_status, get_update_config, list_client_keys,
+        list_groups, list_traces,
         poll_idc_login, poll_idc_relogin, poll_social_login, poll_social_relogin,
         pull_update_image, reset_all_success_count, reset_client_key_stats, reset_failure_count,
         reset_success_count, rollback_image_update, rotate_client_key,
@@ -27,7 +28,8 @@ use super::{
         set_client_key_disabled, set_client_key_max_credits, set_credential_disabled,
         set_credential_metadata_schema, set_credential_overage, set_credential_priority,
         set_custom_models, set_global_proxy, set_load_balancing_mode, set_log_governance_config,
-        set_proxy_enabled, set_self_heal_config, set_session_affinity_config, set_update_config,
+        perform_setup, set_proxy_enabled, set_self_heal_config, set_session_affinity_config,
+        set_update_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
         stats_by_credential, stats_by_key, stats_by_model, stats_overview, stats_timeseries,
         test_model, context_calibration, trace_failure_stats, trace_pipeline_evidence,
@@ -246,8 +248,23 @@ pub fn create_admin_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ));
 
+    // 首次初始化的两个端点**不经过** admin_auth_middleware——未初始化的
+    // 实例还没有密钥可验，这是鸡生蛋的唯一出口。
+    //
+    // 因此它们各自守好自己的门：status 只回一个布尔；setup 要出示控制台
+    // 打印的一次性口令，且仅在未初始化时可用。
+    //
+    // **挂错一层就等于把整个管理面开放了**，而那种错误在功能上完全看不出来：
+    // 初始化能用，管理界面也能用，只是任何人都能用。
+    // `opening_the_setup_endpoints_does_not_open_the_rest_of_the_admin_api`
+    // 逐个访问有代表性的既有端点，确认它们仍然 401。
+    let public = Router::new()
+        .route("/setup/status", get(get_setup_status))
+        .route("/setup", post(perform_setup));
+
     Router::new()
         .merge(authenticated)
+        .merge(public)
         .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE))
         .with_state(state)
 }
