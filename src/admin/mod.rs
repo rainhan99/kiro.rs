@@ -40,4 +40,5 @@ pub use router::create_admin_router;
 pub use service::AdminService;
 pub use usage_stats::{UsageAggregator, UsageRecorder};
 pub use trace_db::{SharedTraceStore, TraceStore};
+pub mod session;
 pub mod setup;
