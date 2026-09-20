@@ -203,23 +203,26 @@ pub fn foundation(options: &Options) -> anyhow::Result<Foundation> {
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
     }
 
-    // 校验默认端点存在
+    // 校验默认端点存在。
+    //
+    // 防御性：`Config::validate()` 已经把 default_endpoint 限死在 ide|cli，
+    // 从配置文件走不到这里。留着是因为注册表将来可能变（加端点、按 feature
+    // 裁剪），那时这条就是唯一的守卫。
     if !endpoints.contains_key(&config.default_endpoint) {
-        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
-        std::process::exit(1);
+        anyhow::bail!("默认端点 \"{}\" 未注册", config.default_endpoint);
     }
 
-    // 校验所有凭据声明的端点都已注册
+    // 校验所有凭据声明的端点都已注册。
+    // 凭据的 endpoint 字段没有反序列化期校验，这里是唯一的守卫。
     for cred in &credentials_list {
         let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
-            tracing::error!(
+            anyhow::bail!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
                 cred.id,
                 name,
                 endpoints.keys().collect::<Vec<_>>()
             );
-            std::process::exit(1);
         }
     }
 

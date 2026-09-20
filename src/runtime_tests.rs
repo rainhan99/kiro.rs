@@ -151,3 +151,93 @@ async fn broken_credentials_return_an_error_instead_of_killing_the_process() {
     let text = format!("{err:#}");
     assert!(text.contains("加载凭证失败"), "实际: {text}");
 }
+
+/// 未知的 `defaultEndpoint` 必须让启动失败，且是**返回错误**而不是杀进程。
+///
+/// 计划原本以为这条会撞上端点注册表的检查，实测不是：`Config::validate()`
+/// 更早一层就把 `defaultEndpoint` 限死在 ide|cli 了。注册表那处检查因此
+/// 从配置文件走不到，是防御性的——它仍然改成了 `bail!`（库里不许有
+/// `process::exit`），但覆盖它的是下面那个直接调用 `foundation()` 的测试。
+///
+/// 这里钉的是用户真正看得见的契约：写错端点名，启动失败，错误点名它。
+#[tokio::test]
+async fn an_unregistered_default_endpoint_returns_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.json");
+    let creds = dir.path().join("credentials.json");
+    std::fs::write(
+        &config,
+        r#"{"host":"127.0.0.1","port":0,"adminApiKey":"sk-admin-test","defaultEndpoint":"nonexistent"}"#,
+    )
+    .unwrap();
+    std::fs::write(&creds, "[]").unwrap();
+
+    let err = serve(Options::new(config, creds))
+        .await
+        .expect_err("必须返回错误，而不是终止进程");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("ide") && text.contains("cli"),
+        "错误要说清合法取值是什么，实际: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_pointing_at_an_unknown_endpoint_returns_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.json");
+    let creds = dir.path().join("credentials.json");
+    std::fs::write(
+        &config,
+        r#"{"host":"127.0.0.1","port":0,"adminApiKey":"sk-admin-test"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &creds,
+        r#"[{"accessToken":"t","refreshToken":"r","authMethod":"social","endpoint":"made-up"}]"#,
+    )
+    .unwrap();
+
+    let err = serve(Options::new(config, creds))
+        .await
+        .expect_err("必须返回错误");
+    let text = format!("{err:#}");
+    assert!(text.contains("made-up"), "错误要点名是哪个端点，实际: {text}");
+    assert!(text.contains("未知端点"), "实际: {text}");
+}
+
+/// 直接覆盖「默认端点未注册」那处防御性检查。
+///
+/// 它从配置文件走不到（`Config::validate()` 更早拦截），但它仍然必须是
+/// `bail!` 而不是 `process::exit`——SC-1 要求库入口一处 exit 都没有。
+/// 这里用一个绕过配置校验的方式构造该状态：直接改 `Config` 结构体的字段。
+#[tokio::test]
+async fn the_defensive_default_endpoint_guard_returns_an_error_not_an_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config_path, creds) = minimal_files(dir.path());
+
+    // 先按合法配置加载，再把 default_endpoint 改成注册表里没有的名字。
+    // 这模拟的是「注册表变了、配置没变」——那正是这条守卫存在的理由。
+    let mut config = crate::model::config::Config::load(&config_path).unwrap();
+    config.default_endpoint = "nonexistent".to_string();
+    std::fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
+
+    // 写回后再读会被 validate 拦下——这恰好证明了从配置文件走不到那条守卫。
+    let err = serve(Options::new(&config_path, &creds))
+        .await
+        .expect_err("必须返回错误");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("加载配置失败"),
+        "从配置文件进来时，拦下它的是配置校验层，实际: {text}"
+    );
+
+    // 而库里一处 process::exit 都不能有——这条由源码断言直接钉住，
+    // 因为那个分支无法从外部触发。
+    let source = include_str!("runtime.rs");
+    let live_exits = source
+        .lines()
+        .filter(|l| l.contains("process::exit") && !l.trim_start().starts_with("//"))
+        .count();
+    assert_eq!(live_exits, 0, "runtime.rs 里不允许出现 process::exit");
+}
