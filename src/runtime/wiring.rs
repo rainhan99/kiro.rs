@@ -104,20 +104,29 @@ pub(super) fn wiring(base: &Foundation, books: Accounting, options: &Options) ->
     app
 }
 
-/// 启动后把可用端点打到日志里。地址是**实际**监听到的那个，不是配置里写的——
-/// 端口回退时两者会不一样，打配置值等于骗人。
-pub fn log_startup_banner(addr: SocketAddr) {
-    tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("可用 API:");
-    tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages");
-    tracing::info!("  POST /v1/messages/count_tokens");
-    tracing::info!("Admin API:");
-    tracing::info!("  GET  /api/admin/credentials");
-    tracing::info!("  POST /api/admin/credentials/:index/disabled");
-    tracing::info!("  POST /api/admin/credentials/:index/priority");
-    tracing::info!("  POST /api/admin/credentials/:index/reset");
-    tracing::info!("  GET  /api/admin/credentials/:index/balance");
-    tracing::info!("Admin UI:");
-    tracing::info!("  GET  /admin");
+/// 启动横幅的内容。
+///
+/// 抽成纯函数是为了能测「不打密钥明文」这条——那是一条容易被后来者无意
+/// 破坏的约束（加一行 `apiKey = {}` 很顺手），而日志一旦被 systemd /
+/// Docker / CI 采集走就收不回来了。
+///
+/// 地址取**实际**监听到的那个，不是配置里写的：端口被占用时会回退，
+/// 打配置值等于骗人。
+pub fn startup_banner_lines(addr: SocketAddr, data_dir: &std::path::Path) -> Vec<String> {
+    vec![
+        format!("服务已就绪: http://{addr}"),
+        format!("  管理界面  http://{addr}/admin"),
+        format!("  API 端点  http://{addr}/v1/messages"),
+        format!("数据目录: {}", data_dir.display()),
+        "  配置与密钥在该目录的 config.json 内。".to_string(),
+        // 不在这里打密钥明文：日志常被采集。取回方式两端各有一个入口。
+        "  要取回密钥: 命令行 `kiro-rs --show-keys`；桌面版见「系统设置 → 安全」。".to_string(),
+    ]
+}
+
+/// 启动后把横幅打到日志里。
+pub fn log_startup_banner(addr: SocketAddr, data_dir: &std::path::Path) {
+    for line in startup_banner_lines(addr, data_dir) {
+        tracing::info!("{line}");
+    }
 }

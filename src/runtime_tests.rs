@@ -551,3 +551,44 @@ async fn no_secret_bearing_runtime_file_is_world_readable() {
         "这些文件组外可读/可写，里面是密钥或账本：{offenders:?}"
     );
 }
+
+/// 启动横幅必须说清「数据在哪」，且**绝不**打密钥明文。
+///
+/// 两件事各有理由：
+/// - 数据目录：桌面端双击启动，用户根本不知道配置文件在哪。CLI 用相对路径
+///   启动时也一样——`./kiro-rs` 的数据落在 CWD，换个目录启动就是另一套。
+/// - 不打密钥：systemd、Docker、CI 都会把 stdout/stderr 收走。密钥进日志
+///   就等于进了日志归档、进了工单附件。
+///   首次生成那一次仍然打印（在 ensure_config_files 里），那一刻不打就永远
+///   没人知道；但那是一次性事件，不是每次启动。
+#[test]
+fn the_startup_banner_gives_the_data_directory_and_never_leaks_a_key() {
+    let lines = crate::runtime::startup_banner_lines(
+        "127.0.0.1:8990".parse().unwrap(),
+        std::path::Path::new("/tmp/kiro-data"),
+    );
+    let joined = lines.join("\n");
+
+    assert!(
+        joined.contains("/tmp/kiro-data"),
+        "横幅要说清数据目录在哪，实际:\n{joined}"
+    );
+    assert!(
+        joined.contains("127.0.0.1:8990"),
+        "横幅要给出实际监听地址，实际:\n{joined}"
+    );
+    assert!(
+        !joined.contains("sk-"),
+        "横幅不得出现任何密钥明文，实际:\n{joined}"
+    );
+}
+
+/// 地址来自实际 listener，不是配置——端口回退时两者会不一样。
+#[test]
+fn the_startup_banner_reports_the_actual_address() {
+    let lines = crate::runtime::startup_banner_lines(
+        "127.0.0.1:49152".parse().unwrap(),
+        std::path::Path::new("/data"),
+    );
+    assert!(lines.join("\n").contains("49152"));
+}

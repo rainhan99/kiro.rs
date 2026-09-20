@@ -140,3 +140,76 @@ fn inspection_rejects_invalid_request_and_outputs_configured_budget_failure() {
     assert_eq!(result["localBudgetAccepted"], false);
     assert_eq!(result["networkRequests"], 0);
 }
+
+/// `--show-keys`：离线取回密钥。
+///
+/// 存在的理由：密钥只在首次生成时打印过一次，之后被日志刷走；桌面端则
+/// 根本没有日志出口。没有这个入口，用户唯一的办法是自己去翻一个他不知道
+/// 在哪的 JSON 文件。
+#[test]
+fn show_keys_prints_both_keys_and_the_data_directory_offline() {
+    let dir = std::env::temp_dir().join(format!("kiro-show-keys-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let config = dir.join("config.json");
+    fs::write(
+        &config,
+        r#"{"host":"127.0.0.1","port":8990,"apiKey":"sk-kiro-rs-forshow","adminApiKey":"sk-admin-forshow"}"#,
+    )
+    .unwrap();
+
+    let before: std::collections::BTreeSet<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kiro-rs"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--credentials")
+        .arg(dir.join("credentials.json"))
+        .arg("--show-keys")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("sk-kiro-rs-forshow"), "要给出客户端 Key，实际: {stdout}");
+    assert!(stdout.contains("sk-admin-forshow"), "要给出管理密钥，实际: {stdout}");
+    assert!(
+        stdout.contains(&dir.display().to_string()),
+        "要说清数据目录在哪，实际: {stdout}"
+    );
+
+    // 离线：不加载凭据、不建任何运行期文件、不连网。与 --check-config 同一层。
+    let after: std::collections::BTreeSet<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after, "--show-keys 不该创建任何文件");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 配置里没有密钥时要说清楚，而不是打印空行让人以为坏了。
+#[test]
+fn show_keys_says_so_when_no_key_is_configured() {
+    let dir = std::env::temp_dir().join(format!("kiro-show-keys-none-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let config = dir.join("config.json");
+    fs::write(&config, r#"{"host":"127.0.0.1","port":8990}"#).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kiro-rs"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--credentials")
+        .arg(dir.join("credentials.json"))
+        .arg("--show-keys")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(stdout.contains("未配置"), "实际: {stdout}");
+
+    let _ = fs::remove_dir_all(&dir);
+}

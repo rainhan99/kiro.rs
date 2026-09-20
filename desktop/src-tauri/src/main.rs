@@ -22,8 +22,10 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 match start_proxy().await {
                     Ok(server) => {
+                        // 与命令行同一份横幅：形态不同不该让「服务在哪、
+                        // 数据在哪」这两件事的说法也不同。
+                        kiro_rs::runtime::log_startup_banner(server.addr(), server.data_dir());
                         let url = admin_url(server.addr());
-                        tracing::info!("服务就绪: {url}");
                         if let Some(window) = handle.get_webview_window("main") {
                             match url.parse() {
                                 Ok(parsed) => {

@@ -39,13 +39,21 @@ async fn main() {
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
 
+    // 与 --check-config 同一层的离线命令：读配置、打印、退出。
+    if args.show_keys {
+        std::process::exit(kiro_rs::runtime::run_show_keys(
+            &config_path,
+            &credentials_path,
+        ));
+    }
+
     let options = kiro_rs::Options::new(&config_path, &credentials_path);
     let server = match kiro_rs::serve(options).await {
         Ok(server) => server,
         Err(error) => fail(error),
     };
 
-    kiro_rs::runtime::log_startup_banner(server.addr());
+    kiro_rs::runtime::log_startup_banner(server.addr(), server.data_dir());
 
     if let Err(error) = server.wait_for_signal().await {
         fail(error);
