@@ -31,6 +31,10 @@ impl Options {
 }
 
 /// 正在运行的服务。持有实际监听地址与关停手柄。
+///
+/// 丢弃它会关掉 oneshot 发送端，优雅关停信号随之触发——但不等在飞请求走完。
+/// 要等就调 [`RunningServer::shutdown`]。
+#[derive(Debug)]
 pub struct RunningServer {
     addr: SocketAddr,
     shutdown: tokio::sync::oneshot::Sender<()>,
@@ -60,7 +64,7 @@ impl RunningServer {
 /// 拿到错误的那个，表现是随机的 "no reactor running" panic。
 pub async fn serve(options: Options) -> anyhow::Result<RunningServer> {
     let (app, addr_spec) = assemble(&options).await?;
-    let listener = tokio::net::TcpListener::bind(addr_spec).await?;
+    let listener = bind_with_fallback(addr_spec).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let joined = tokio::spawn(async move {
@@ -80,6 +84,28 @@ pub async fn serve(options: Options) -> anyhow::Result<RunningServer> {
         shutdown: tx,
         joined,
     })
+}
+
+/// 配置端口被占用时换一个。
+///
+/// 桌面端尤其需要：用户可能同时开着一个命令行实例。回退是**明确记录**的，
+/// 不是悄悄换掉——调用方拿 `addr()` 得到真实地址，日志里也如实写出来。
+///
+/// 只对 `AddrInUse` 回退。权限不足、地址不存在这类错误原样上抛，
+/// 换个端口并不能解决它们，掩盖只会让人查错方向。
+async fn bind_with_fallback(spec: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(spec).await {
+        Ok(listener) => Ok(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let fallback = SocketAddr::new(spec.ip(), 0);
+            let listener = tokio::net::TcpListener::bind(fallback)
+                .await
+                .map_err(|e2| anyhow::anyhow!("端口 {} 被占用，回退也失败: {e2}", spec.port()))?;
+            tracing::warn!("端口 {} 已被占用，改用 {}", spec.port(), listener.local_addr()?);
+            Ok(listener)
+        }
+        Err(e) => Err(anyhow::anyhow!("监听 {spec} 失败: {e}")),
+    }
 }
 
 /// 装配整个应用。装配失败返回 `Err`——调用方决定怎么死。
