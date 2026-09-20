@@ -1346,3 +1346,11 @@ pub struct SetupRequest {
     /// 用户自己设的管理密码。
     pub admin_key: String,
 }
+
+/// 安全相关的配置。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityConfigRequest {
+    /// 桌面端每次启动都要重新输入管理密码。
+    pub require_auth_on_launch: bool,
+}

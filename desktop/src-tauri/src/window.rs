@@ -61,6 +61,33 @@ pub fn setup_token_script_for(token: Option<&str>) -> Option<String> {
         .map(setup_token_script)
 }
 
+/// 「每次启动都要验证」时，清掉上次记住的登录密钥。
+///
+/// 只清登录密钥这一个键。`localStorage.clear()` 会把主题、折叠状态之类
+/// 一起清掉，用户每次开应用都会觉得「我的设置怎么没了」。
+pub fn forget_key_script_for(require_auth: bool) -> Option<String> {
+    require_auth.then(|| {
+        "try { localStorage.removeItem(\"adminApiKey\"); } catch (e) {}".to_string()
+    })
+}
+
+/// 把这一次要注入的东西拼在一起。
+///
+/// 两件事可能同时发生：首次启动要给 setup token，而「每次启动都要验证」
+/// 开着要清掉记住的密钥。它们互不冲突，但必须一次注完——`on_page_load`
+/// 只拿一次脚本。
+pub fn injection_script(setup_token: Option<&str>, require_auth: bool) -> Option<String> {
+    let parts: Vec<String> = [
+        forget_key_script_for(require_auth),
+        setup_token_script_for(setup_token),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 /// 这个 URL 该不该收到注入脚本。
 ///
 /// 两条限制，各有理由：

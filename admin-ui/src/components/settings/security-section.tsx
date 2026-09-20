@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import { Eye, EyeOff, Copy, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -8,6 +8,8 @@ import { storage } from '@/lib/storage'
 import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { maskAdminKey, currentKeyRow } from './admin-key-display'
+import { fetchSecurityConfig, setSecurityConfig } from '@/api/setup'
+import { Switch } from '@/components/ui/switch'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
 /**
@@ -23,10 +25,35 @@ export function SecuritySection() {
   const confirm = useConfirm()
   const current = currentKeyRow()
   const [revealed, setRevealed] = useState(false)
+  const [requireAuth, setRequireAuth] = useState<boolean | null>(null)
   const [draft, setDraft] = useState('')
   const [plain, setPlain] = useState(false)
   const [copied, setCopied] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    fetchSecurityConfig()
+      .then((c) => alive && setRequireAuth(c.requireAuthOnLaunch))
+      .catch(() => alive && setRequireAuth(false))
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const toggleRequireAuth = async (next: boolean) => {
+    const previous = requireAuth
+    setRequireAuth(next) // 先动，失败再回滚——开关滞后一拍比什么都不动更糟
+    try {
+      await setSecurityConfig(next)
+      toast.success(
+        next ? '下次启动桌面版时需要重新输入密码' : '桌面版将记住登录状态',
+      )
+    } catch (err) {
+      setRequireAuth(previous)
+      toast.error('保存失败：' + extractErrorMessage(err))
+    }
+  }
 
   const copyCurrent = async () => {
     const key = storage.getApiKey()
@@ -118,6 +145,17 @@ export function SecuritySection() {
             复制
           </Button>
         </div>
+      </SettingRow>
+
+      <SettingRow
+        label="每次启动都要验证"
+        hint="仅影响桌面版。打开后关掉窗口重开需要重新输入密码——有人走到没锁屏的电脑前也进不去。下次启动生效。"
+      >
+        <Switch
+          checked={requireAuth ?? false}
+          disabled={requireAuth === null}
+          onCheckedChange={toggleRequireAuth}
+        />
       </SettingRow>
 
       <SettingRow label="替换密钥" hint={current.rotateHint}>

@@ -1840,6 +1840,35 @@ impl AdminService {
         self.update_config_file(move |c| c.admin_api_key = Some(key));
     }
 
+    /// 桌面端是否每次启动都要重新输入管理密码。
+    ///
+    /// **从磁盘读**，不读内存里那份。`update_config_file` 是只写盘的
+    /// （它重新加载、改、存，不动进程内的 Config），所以内存那份改完就
+    /// 过期了。
+    ///
+    /// 而且读盘在这里恰好是更准确的答案：这个开关的语义就是「下次启动
+    /// 生效」，磁盘上的值才是下次启动会读到的那个。
+    ///
+    /// 路径未知（内存配置）时回落到内存值。
+    pub fn require_auth_on_launch(&self) -> bool {
+        let in_memory = self.token_manager.config();
+        let from_disk = in_memory
+            .config_path()
+            .and_then(|path| Config::load(path).ok())
+            .and_then(|c| c.require_auth_on_launch);
+        from_disk
+            .or(in_memory.require_auth_on_launch)
+            .unwrap_or(false)
+    }
+
+    /// 设置「每次启动都要验证」。
+    ///
+    /// 落盘才算数——这个开关的整个意义就在**下次启动**时兑现，
+    /// 只改内存等于什么都没做。
+    pub fn set_require_auth_on_launch(&self, value: bool) {
+        self.update_config_file(move |c| c.require_auth_on_launch = Some(value));
+    }
+
     /// 将系统密钥写回 `config.json`。
     pub fn persist_api_key(&self, new_key: &str) {
         let key = new_key.to_string();

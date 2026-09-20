@@ -1016,3 +1016,63 @@ async fn an_unset_admin_key_authenticates_nobody_not_even_an_empty_one() {
 
     server.shutdown().await.unwrap();
 }
+
+/// 「每次启动都要验证」开关：读得到、写得进、落盘、要鉴权。
+#[tokio::test]
+async fn the_require_auth_setting_round_trips_and_needs_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, creds) = minimal_files(dir.path());
+    let server = serve(Options::new(&config, &creds)).await.unwrap();
+    let base = format!("http://{}", server.addr());
+    let client = reqwest::Client::new();
+
+    // 它能改变桌面端的进门方式，所以必须要鉴权。
+    let anonymous = client
+        .put(format!("{base}/api/admin/config/security"))
+        .json(&serde_json::json!({ "requireAuthOnLaunch": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401, "这个开关不能匿名改");
+
+    let read = |c: &reqwest::Client| {
+        let url = format!("{base}/api/admin/config/security");
+        let c = c.clone();
+        async move {
+            c.get(url)
+                .header("x-api-key", "sk-admin-test")
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(
+        read(&client).await["requireAuthOnLaunch"],
+        serde_json::json!(false),
+        "默认关"
+    );
+
+    let wrote = client
+        .put(format!("{base}/api/admin/config/security"))
+        .header("x-api-key", "sk-admin-test")
+        .json(&serde_json::json!({ "requireAuthOnLaunch": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrote.status(), 200);
+    assert_eq!(
+        read(&client).await["requireAuthOnLaunch"],
+        serde_json::json!(true)
+    );
+
+    // 落盘了才算数——这个开关的整个意义就在下次启动时兑现。
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(saved["requireAuthOnLaunch"], serde_json::json!(true));
+
+    server.shutdown().await.unwrap();
+}

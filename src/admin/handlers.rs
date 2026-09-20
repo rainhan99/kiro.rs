@@ -2045,3 +2045,26 @@ pub async fn perform_setup(
 
     Json(super::types::SuccessResponse::new("管理密码已设置")).into_response()
 }
+
+/// GET /api/admin/config/security
+pub async fn get_security_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "requireAuthOnLaunch": state.service.require_auth_on_launch(),
+    }))
+}
+
+/// PUT /api/admin/config/security
+///
+/// 这个开关能改变桌面端的进门方式，所以和其它配置一样要鉴权——
+/// 它挂在 authenticated 路由里，不在 setup 那两个公开端点旁边。
+pub async fn set_security_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SecurityConfigRequest>,
+) -> impl IntoResponse {
+    state
+        .service
+        .set_require_auth_on_launch(payload.require_auth_on_launch);
+    Json(serde_json::json!({
+        "requireAuthOnLaunch": payload.require_auth_on_launch,
+    }))
+}

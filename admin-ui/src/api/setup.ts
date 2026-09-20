@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { storage } from '@/lib/storage'
 
 /**
  * 首次初始化的两个端点。
@@ -34,4 +35,30 @@ export async function performSetup(req: {
   adminKey: string
 }): Promise<void> {
   await api.post('/setup', req)
+}
+
+/**
+ * 安全相关的配置。
+ *
+ * 与上面两个不同，**这个要鉴权**——它能改变桌面端的进门方式。
+ * 所以另起一个带 x-api-key 的实例，与项目里其它 admin API 同一个范式。
+ */
+const authed = axios.create({
+  baseURL: '/api/admin',
+  timeout: 15000,
+  headers: { 'Content-Type': 'application/json' },
+})
+authed.interceptors.request.use((config) => {
+  const key = storage.getApiKey()
+  if (key) config.headers['x-api-key'] = key
+  return config
+})
+
+export async function fetchSecurityConfig(): Promise<{ requireAuthOnLaunch: boolean }> {
+  const { data } = await authed.get('/config/security')
+  return data
+}
+
+export async function setSecurityConfig(requireAuthOnLaunch: boolean): Promise<void> {
+  await authed.put('/config/security', { requireAuthOnLaunch })
 }

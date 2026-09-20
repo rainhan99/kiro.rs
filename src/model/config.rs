@@ -271,6 +271,17 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metering_enabled: Option<bool>,
 
+    /// 桌面端：每次启动都要重新输入管理密码。
+    ///
+    /// 默认关（`None` 等同 false）：日常不碍事，关掉窗口重开不用再输一遍。
+    /// 打开后桌面端启动时清掉记住的密钥——那才是真的门，有人走到你没锁屏
+    /// 的电脑前也进不去。
+    ///
+    /// 只影响桌面端。浏览器的「记住」是浏览器自己的事，代理管不着，
+    /// 假装管得着只会给人错误的安全感。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_auth_on_launch: Option<bool>,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -461,6 +472,7 @@ impl Default for Config {
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             cache_metering_enabled: None,
+            require_auth_on_launch: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
