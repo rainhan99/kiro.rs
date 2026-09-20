@@ -2,6 +2,58 @@
 use serde_json::{Value, json};
 use std::{fs, process::Command};
 
+/// 薄壳的可观察契约：装配失败时，二进制仍然以 1 退出并把原因打到 stderr。
+///
+/// 抽库不能让命令行用户的体验变差。库返回 `Err` 之后，如果薄壳只是
+/// `tracing::error!` 而忘了退出码，脚本与 systemd 都会以为启动成功了。
+#[test]
+fn the_binary_still_exits_one_and_explains_itself_on_a_broken_config() {
+    let dir = std::env::temp_dir().join(format!("kiro-shell-exit-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let config = dir.join("config.json");
+    fs::write(&config, "{ not json").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kiro-rs"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--credentials")
+        .arg(dir.join("credentials.json"))
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "退出码必须仍是 1；stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("加载配置失败").count(),
+        1,
+        "原因要说一遍，不多不少。说两遍是 eprintln 与 tracing 重复了，\
+         一遍都没有则脚本与 systemd 会以为启动成功。实际: {stderr}"
+    );
+
+    // 启动致命错误不能被日志过滤器吃掉。RUST_LOG=off 是运维会真用的设置，
+    // 那时如果原因只走 tracing，用户就只剩一个退出码 1，什么都看不到。
+    let silenced = Command::new(env!("CARGO_BIN_EXE_kiro-rs"))
+        .env("RUST_LOG", "off")
+        .arg("--config")
+        .arg(&config)
+        .arg("--credentials")
+        .arg(dir.join("credentials.json"))
+        .output()
+        .unwrap();
+    let silenced_stderr = String::from_utf8_lossy(&silenced.stderr);
+    assert_eq!(silenced.status.code(), Some(1));
+    assert!(
+        silenced_stderr.contains("加载配置失败"),
+        "RUST_LOG=off 时仍须给出原因，实际: {silenced_stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
