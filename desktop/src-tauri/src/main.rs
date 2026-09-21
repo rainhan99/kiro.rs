@@ -29,6 +29,15 @@ fn main() {
         )
         .init();
 
+    // KIRO_HEADLESS：只起代理，不开窗口。
+    //
+    // 离线冒烟（SC-12）需要它：要验的是「安装后的应用能启动、服务就绪、
+    // 对话走完一轮」，而 CI 上没有图形界面可开。不给这条路的话，冒烟
+    // 只能去跑 target/ 里的裸二进制——那验的就不是「安装后的应用」了。
+    if std::env::var_os("KIRO_HEADLESS").is_some() {
+        return run_headless();
+    }
+
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
@@ -135,4 +144,37 @@ fn shutdown_proxy(app: &AppHandle) {
             }
         });
     }
+}
+
+/// 无窗口模式：起代理，打横幅，等 Ctrl-C。
+///
+/// 走的是与窗口模式**完全相同**的 `start_proxy()`——否则冒烟验的就是
+/// 另一条代码路径，那种绿灯没有意义。
+fn run_headless() {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("无法创建运行时: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    runtime.block_on(async {
+        let server = match start_proxy().await {
+            Ok(server) => server,
+            Err(error) => {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+        };
+        kiro_rs::runtime::log_startup_banner(
+            server.addr(),
+            server.data_dir(),
+            server.setup_token(),
+        );
+        if let Err(error) = server.wait_for_signal().await {
+            eprintln!("服务异常退出: {error:#}");
+            std::process::exit(1);
+        }
+    });
 }
