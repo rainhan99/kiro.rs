@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { SECTIONS } from './settings-page'
 import { TABS } from './layout/app-layout'
+import { AppMain } from '../App'
 
 /** 桌面端侧边栏里「系统设置」下的子项。 */
 const sidebarChildren = () =>
@@ -23,5 +24,21 @@ describe('设置分区的两份列表必须一致', () => {
   test('多上游网关确实在列——这是它漏掉过的那一项', () => {
     expect(SECTIONS.map((s) => s.key)).toContain('gateway')
     expect(sidebarChildren()).toContain('gateway')
+  })
+})
+
+describe('顶层导航的三份列表必须一致', () => {
+  /// TabKey 类型、TABS 数组、AppMain 的分发是三处。漏一处的表现是
+  /// 「侧边栏有入口，点进去一片空白」——比编译错误难发现得多，
+  /// 因为它编译得过。
+  test('TABS 里的每个顶层 key，AppMain 都有对应分支', () => {
+    const source = AppMain.toString()
+    for (const tab of TABS) {
+      expect(source).toContain(`"${tab.key}"`)
+    }
+  })
+
+  test('对话页确实在顶层导航里', () => {
+    expect(TABS.map((t) => t.key)).toContain('chat')
   })
 })

@@ -28,6 +28,9 @@ import { AppLayout, type TabKey as Tab } from "@/components/layout/app-layout";
 const Dashboard = lazy(() =>
   import("@/components/dashboard").then((m) => ({ default: m.Dashboard })),
 );
+const ChatPage = lazy(() =>
+  import("@/components/chat-page").then((m) => ({ default: m.ChatPage })),
+);
 const OverviewPage = lazy(() =>
   import("@/components/overview-page").then((m) => ({
     default: m.OverviewPage,
@@ -289,7 +292,10 @@ function LoggedInApp({
   );
 }
 
-function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
+/// 导出仅为了让 settings-sections.test.js 能断言「TABS 里的每个 key
+/// 在这里都有分支」。漏一处的表现是「侧边栏有入口，点进去一片空白」——
+/// 它编译得过，所以只能靠断言抓。
+export function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
   return (
     <Suspense
       fallback={
@@ -298,6 +304,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         </div>
       }
     >
+      {tab === "chat" && <ChatPage />}
       {tab === "overview" && <OverviewPage />}
       {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
       {tab === "keys" && <ClientKeysPage />}

@@ -20,6 +20,7 @@ import {
   ShieldCheck,
   GitBranch,
   Waypoints,
+  MessageSquare,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -33,6 +34,7 @@ import {
 import type { ThemeId, ThemeMode, ThemeSelection } from "@/lib/theme";
 
 export type TabKey =
+  | "chat"
   | "overview"
   | "credentials"
   | "keys"
@@ -55,6 +57,12 @@ export interface TabItem {
 }
 
 export const TABS: readonly TabItem[] = [
+  {
+    key: "chat",
+    label: "对话",
+    description: "直接在这里对话，走 /v1/messages",
+    icon: MessageSquare,
+  },
   {
     key: "overview",
     label: "仪表概览",
