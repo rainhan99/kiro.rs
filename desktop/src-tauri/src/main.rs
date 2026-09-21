@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use kiro_rs_desktop_lib::{
     admin_url, start_proxy,
-    window::{injection_script, on_exit_requested, should_inject_login},
+    window::{on_exit_requested, setup_token_script_for, should_inject_login},
 };
 use tauri::{AppHandle, Manager};
 
@@ -52,8 +52,11 @@ fn main() {
                         // 桌面版没有控制台，用户无从抄那串口令；但密码仍然
                         // 要他自己设。要在**导航之后**注入：等待页跑在
                         // tauri://，管理界面跑在 http://127.0.0.1，不同源。
+                        // 只注入 setup token。「记不记住登录」现在由服务端
+                        // 会话的 TTL 决定，桌面端不再插手——两处各管一半
+                        // 只会让「为什么它记住了/为什么它忘了」无从解释。
                         *state.pending_inject.lock().unwrap() =
-                            injection_script(server.setup_token(), false);
+                            setup_token_script_for(server.setup_token());
 
                         if let Some(window) = handle.get_webview_window("main") {
                             match url.parse() {
