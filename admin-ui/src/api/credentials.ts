@@ -1,4 +1,4 @@
-import axios from 'axios'
+import { createAdminClient, notifyAuthFailure } from './admin-client'
 import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
@@ -41,22 +41,7 @@ import type {
 } from '@/types/api'
 
 // 创建 axios 实例
-const api = axios.create({
-  baseURL: '/api/admin',
-  timeout: 15000,
-  headers: {
-    'Content-Type': 'application/json',
-  },
-})
-
-// 请求拦截器添加 API Key
-api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) {
-    config.headers['x-api-key'] = apiKey
-  }
-  return config
-})
+const api = createAdminClient()
 
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
@@ -253,6 +238,9 @@ export async function batchImportCredentials(
   onSummary: (s: BatchImportSummary) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  // 这里是裸 fetch 而不是 axios（要流式读 NDJSON），所以 401 处理不会
+  // 自动生效——必须手动接上，否则会话在批量导入中途过期时，用户看到的
+  // 是一个没头没尾的失败，而不是「请重新登录」。
   const apiKey = storage.getApiKey()
   const resp = await fetch('/api/admin/credentials/batch-import', {
     method: 'POST',
@@ -263,6 +251,10 @@ export async function batchImportCredentials(
     body: JSON.stringify(req),
     signal,
   })
+  if (resp.status === 401) {
+    storage.removeApiKey()
+    notifyAuthFailure()
+  }
 
   if (!resp.ok) {
     let msg = `HTTP ${resp.status}`

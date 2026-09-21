@@ -6,72 +6,56 @@ import { Input } from '@/components/ui/input'
 import { SettingGroup, SettingRow } from '@/components/console/setting-row'
 import { storage } from '@/lib/storage'
 import { updateAdminKey } from '@/api/credentials'
+import { createSession, fetchSessionTtl, setSessionTtl } from '@/api/setup'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
-import { maskAdminKey, currentKeyRow } from './admin-key-display'
-import { fetchSecurityConfig, setSecurityConfig } from '@/api/setup'
-import { Switch } from '@/components/ui/switch'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { TTL_OPTIONS, describeTtl } from './session-ttl'
 
 /**
- * 安全分区：管理面板的登录密钥。
+ * 安全分区：管理密码与会话。
  *
- * 这里刻意**不用**即时保存。轮换登录密钥不是调参数，是一次性的凭据替换：旧密钥
- * 立即失效，正在用它调用 /v1/messages 的下游会全部 401。所以流程反过来 ——
- * 先生成、先复制、二次确认，最后才提交。
+ * 替换密钥刻意**不用**即时保存。轮换密码不是调参数，是一次性的凭据替换：
+ * 旧密码立即失效。所以流程反过来 —— 先生成、先复制、二次确认，最后才提交。
  *
- * 提交成功后本地存储自动换成新密钥，当前会话不会被踢出登录。
+ * 这里**不显示当前密码**：登录后本地存的是会话 token，根本拿不到密码。
+ * 那反而更好——密码不进 localStorage。而密码是用户自己在初始化页设的，
+ * 本来就知道。
  */
 export function SecuritySection() {
   const confirm = useConfirm()
-  const current = currentKeyRow()
-  const [revealed, setRevealed] = useState(false)
-  const [requireAuth, setRequireAuth] = useState<boolean | null>(null)
   const [draft, setDraft] = useState('')
   const [plain, setPlain] = useState(false)
   const [copied, setCopied] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [ttl, setTtl] = useState<number | null>(null)
 
   useEffect(() => {
     let alive = true
-    fetchSecurityConfig()
-      .then((c) => alive && setRequireAuth(c.requireAuthOnLaunch))
-      .catch(() => alive && setRequireAuth(false))
+    fetchSessionTtl()
+      .then((hours) => alive && setTtl(hours))
+      .catch(() => alive && setTtl(0))
     return () => {
       alive = false
     }
   }, [])
 
-  const toggleRequireAuth = async (next: boolean) => {
-    const previous = requireAuth
-    setRequireAuth(next) // 先动，失败再回滚——开关滞后一拍比什么都不动更糟
+  const changeTtl = async (hours: number) => {
+    const previous = ttl
+    setTtl(hours) // 先动，失败再回滚——控件滞后一拍比什么都不动更糟
     try {
-      await setSecurityConfig(next)
+      await setSessionTtl(hours)
       toast.success(
-        next ? '下次启动桌面版时需要重新输入密码' : '桌面版将记住登录状态',
+        hours === 0 ? '会话不再过期' : `会话 ${describeTtl(hours)}无操作后过期`,
       )
     } catch (err) {
-      setRequireAuth(previous)
+      setTtl(previous)
       toast.error('保存失败：' + extractErrorMessage(err))
-    }
-  }
-
-  const copyCurrent = async () => {
-    const key = storage.getApiKey()
-    if (!key) {
-      toast.error('本地没有登录密钥')
-      return
-    }
-    try {
-      await navigator.clipboard.writeText(key)
-      toast.success('当前密钥已复制到剪贴板')
-    } catch {
-      toast.error('复制失败，请点「显示」后手动选中')
     }
   }
 
   const copy = async () => {
     if (!draft.trim()) {
-      toast.error('先生成或输入密钥再复制')
+      toast.error('先生成或输入密码再复制')
       return
     }
     try {
@@ -88,17 +72,16 @@ export function SecuritySection() {
     if (!key) return
     if (!copied) {
       const ok = await confirm({
-        title: '还没复制新密钥',
-        description:
-          '旧密钥提交后立即失效。新密钥只在这里显示一次，建议先复制保存再继续。',
+        title: '还没复制新密码',
+        description: '旧密码提交后立即失效。建议先复制保存再继续。',
         confirmText: '仍然继续',
       })
       if (!ok) return
     }
     const ok = await confirm({
-      title: '替换登录密钥？',
+      title: '替换管理密码？',
       description:
-        '旧密钥立即失效，其它已登录的浏览器需要重新登录。当前浏览器会自动切到新密钥，不会掉线。'
+        '旧密码立即失效，其它已登录的浏览器会在会话过期后无法重新登录。'
         + '客户端 API Key 是另一个密钥，下游调用不受影响。',
       confirmText: '替换',
       destructive: true,
@@ -108,8 +91,10 @@ export function SecuritySection() {
     setSubmitting(true)
     try {
       await updateAdminKey({ newKey: key })
-      storage.setApiKey(key)
-      toast.success('登录密钥已替换，本地已切到新密钥')
+      // 换一个用新密码签发的会话，当前标签页不会掉线。
+      const session = await createSession(key)
+      storage.setApiKey(session.token)
+      toast.success('管理密码已替换')
       setDraft('')
       setPlain(false)
       setCopied(false)
@@ -122,43 +107,31 @@ export function SecuritySection() {
 
   return (
     <SettingGroup
-      title="登录密钥"
-      description={current.description}
+      title="管理密码与会话"
+      description="登录管理面板用的密码（config.json 的 adminApiKey）。客户端调用 API 用的是另一个 Key。"
     >
-      <SettingRow label={current.label} hint="桌面版自动登录，这里是查看与复制的地方">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <code className="console-num rounded bg-muted px-2 py-1 text-[12.5px]">
-            {revealed ? (storage.getApiKey() ?? '（未登录）') : maskAdminKey(storage.getApiKey())}
-          </code>
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            onClick={() => setRevealed((v) => !v)}
-            title={revealed ? '隐藏' : '显示'}
-            className="h-7 w-7"
-          >
-            {revealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-          </Button>
-          <Button size="sm" variant="outline" onClick={copyCurrent}>
-            <Copy className="h-3.5 w-3.5" />
-            复制
-          </Button>
-        </div>
+      <SettingRow
+        label="会话有效期"
+        hint="超过这段时间无操作，浏览器需要重新登录。注意：config.json 里的密码始终有效，脚本与既有自动化不受影响——能读到那个文件的人始终进得来。"
+      >
+        <select
+          value={ttl ?? 0}
+          disabled={ttl === null || submitting}
+          onChange={(e) => changeTtl(Number(e.target.value))}
+          className="h-8 rounded-md border bg-background px-2 text-[12.5px]"
+        >
+          {TTL_OPTIONS.map((o) => (
+            <option key={o.hours} value={o.hours}>
+              {o.label}
+            </option>
+          ))}
+        </select>
       </SettingRow>
 
       <SettingRow
-        label="每次启动都要验证"
-        hint="仅影响桌面版。打开后关掉窗口重开需要重新输入密码——有人走到没锁屏的电脑前也进不去。下次启动生效。"
+        label="替换密码"
+        hint="旧密码立即失效。不影响客户端 API Key——那是另一个密钥，下游调用照常。"
       >
-        <Switch
-          checked={requireAuth ?? false}
-          disabled={requireAuth === null}
-          onCheckedChange={toggleRequireAuth}
-        />
-      </SettingRow>
-
-      <SettingRow label="替换密钥" hint={current.rotateHint}>
         <div className="flex flex-wrap items-center gap-1.5">
           <div className="relative">
             <Input
@@ -168,7 +141,7 @@ export function SecuritySection() {
                 setDraft(e.target.value)
                 setCopied(false)
               }}
-              placeholder="输入或生成新密钥"
+              placeholder="输入或生成新密码"
               disabled={submitting}
               spellCheck={false}
               autoComplete="new-password"
@@ -194,25 +167,16 @@ export function SecuritySection() {
               setPlain(true)
               setCopied(false)
             }}
-            title="生成一个 32 位随机密钥"
+            title="生成一个随机密码"
           >
             <Wand2 className="h-3.5 w-3.5" />
             生成
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={copy}
-            disabled={submitting || !draft.trim()}
-          >
+          <Button size="sm" variant="outline" onClick={copy} disabled={submitting || !draft.trim()}>
             <Copy className="h-3.5 w-3.5" />
             {copied ? '已复制' : '复制'}
           </Button>
-          <Button
-            size="sm"
-            onClick={submit}
-            disabled={submitting || !draft.trim()}
-          >
+          <Button size="sm" onClick={submit} disabled={submitting || !draft.trim()}>
             {submitting ? '替换中…' : '替换'}
           </Button>
         </div>

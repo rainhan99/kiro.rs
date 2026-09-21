@@ -1,7 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Lock } from "lucide-react";
 import { storage } from "@/lib/storage";
-import { getCredentials } from "@/api/credentials";
+import { createSession } from "@/api/setup";
 import { extractErrorMessage } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -15,20 +15,17 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const savedKey = storage.getApiKey();
-    if (savedKey) setApiKey(savedKey);
-  }, []);
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const key = apiKey.trim();
     if (!key || isSubmitting) return;
     setIsSubmitting(true);
     setError(null);
-    storage.setApiKey(key);
     try {
-      await getCredentials();
+      // 用密码换 token，之后请求带的是 token——密码不会长期躺在
+      // localStorage 里。密码错时后端直接 401，不会留下任何凭证。
+      const { token } = await createSession(key);
+      storage.setApiKey(token);
       onLogin(key);
     } catch (err) {
       storage.removeApiKey();

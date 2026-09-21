@@ -1,5 +1,4 @@
-import axios from 'axios'
-import { storage } from '@/lib/storage'
+import { createAdminClient } from './admin-client'
 import type {
   BudgetUpdate,
   BudgetsView,
@@ -9,12 +8,7 @@ import type {
   SaveGatewayConfig,
 } from '@/types/gateway'
 
-const api = axios.create({ baseURL: '/api/admin', timeout: 15000, headers: { 'Content-Type': 'application/json' } })
-api.interceptors.request.use((config) => {
-  const key = storage.getApiKey()
-  if (key) config.headers['x-api-key'] = key
-  return config
-})
+const api = createAdminClient()
 
 export async function getGatewayConfig(): Promise<GatewayConfigView> {
   return (await api.get<GatewayConfigView>('/gateway/config')).data

@@ -16,8 +16,10 @@ import {
   applyLoggedOut,
   type ShellState,
 } from "@/components/setup-logic";
-import { fetchSetupStatus } from "@/api/setup";
+import { fetchSetupStatus, deleteSession } from "@/api/setup";
+import { onAuthFailure, rearmAuthFailure } from "@/api/admin-client";
 import { Toaster } from "@/components/ui/sonner";
+import { toast } from "sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { tabFromHash } from "@/hooks/use-url-state";
@@ -184,11 +186,31 @@ function useAppShell() {
     setTab(next);
   };
 
-  const handleLogin = () => setShell(applyLoggedIn);
+  // 会话过期时退回登录页。
+  //
+  // 有了 TTL，会话**一定**会在使用中失效。没有这一条，用户看到的是
+  // 一堆「请求失败」，不知道自己只是该重新登录了。
+  useEffect(() => {
+    onAuthFailure(() => {
+      setShell(applyLoggedOut);
+      toast.error("登录已过期，请重新登录");
+    });
+  }, []);
+
+  const handleLogin = () => {
+    rearmAuthFailure();
+    setShell(applyLoggedIn);
+  };
   /// 初始化完成 ≠ 登录成功。两件事同时发生：实例被认领了，而且认领它
   /// 的人现在也登录了。只更新后者会卡在初始化页。
-  const handleSetupDone = () => setShell(applySetupCompleted);
+  const handleSetupDone = () => {
+    rearmAuthFailure();
+    setShell(applySetupCompleted);
+  };
   const handleLogout = () => {
+    // 先告诉服务端作废这个 token，再清本地。反过来的话本地清了、
+    // 服务端那条还活着，token 若已泄露就白登出了。
+    void deleteSession();
     storage.removeApiKey();
     setShell(applyLoggedOut);
   };

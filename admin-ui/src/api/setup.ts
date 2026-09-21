@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { storage } from '@/lib/storage'
+import { createAdminClient } from './admin-client'
 
 /**
  * 首次初始化的两个端点。
@@ -38,27 +38,39 @@ export async function performSetup(req: {
 }
 
 /**
- * 安全相关的配置。
+ * 用管理密码换一个会话 token。
  *
- * 与上面两个不同，**这个要鉴权**——它能改变桌面端的进门方式。
- * 所以另起一个带 x-api-key 的实例，与项目里其它 admin API 同一个范式。
+ * 这是登录。之后所有请求带的是 token 而不是密码——密码因此不会长期
+ * 躺在 localStorage 里。
  */
-const authed = axios.create({
-  baseURL: '/api/admin',
-  timeout: 15000,
-  headers: { 'Content-Type': 'application/json' },
-})
-authed.interceptors.request.use((config) => {
-  const key = storage.getApiKey()
-  if (key) config.headers['x-api-key'] = key
-  return config
-})
-
-export async function fetchSecurityConfig(): Promise<{ requireAuthOnLaunch: boolean }> {
-  const { data } = await authed.get('/config/security')
+export async function createSession(key: string): Promise<{
+  token: string
+  expiresAt: number | null
+}> {
+  const { data } = await api.post('/session', { key })
   return data
 }
 
-export async function setSecurityConfig(requireAuthOnLaunch: boolean): Promise<void> {
-  await authed.put('/config/security', { requireAuthOnLaunch })
+/** 登出：作废当前这一个 token。别的设备与密码本身都不受影响。 */
+export async function deleteSession(): Promise<void> {
+  await authed.delete('/session').catch(() => {
+    // 登出失败不该挡着人登出。本地凭证无论如何都要清掉——
+    // 服务端那条记录最多留到过期。
+  })
+}
+
+/**
+ * 会话有效期（小时）。0 表示不过期。
+ *
+ * 要鉴权：它能改变谁进得来。
+ */
+const authed = createAdminClient()
+
+export async function fetchSessionTtl(): Promise<number> {
+  const { data } = await authed.get('/config/security')
+  return typeof data?.adminSessionTtlHours === 'number' ? data.adminSessionTtlHours : 0
+}
+
+export async function setSessionTtl(hours: number): Promise<void> {
+  await authed.put('/config/security', { adminSessionTtlHours: hours })
 }

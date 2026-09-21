@@ -4,7 +4,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
-import { performSetup } from '@/api/setup'
+import { performSetup, createSession } from '@/api/setup'
 import {
   validateSetupForm,
   type SetupErrors,
@@ -49,8 +49,10 @@ export function SetupPage({ providedToken, onDone }: SetupPageProps) {
         setupToken: tokenProvided ? providedToken!.trim() : token.trim(),
         adminKey,
       })
-      // 设完立刻用它登录，用户不必再输一遍自己刚设的密码。
-      storage.setApiKey(adminKey)
+      // 设完立刻换一个会话 token 登录，用户不必再输一遍自己刚设的密码。
+      // 存 token 而不是密码——密码只在这一瞬间存在于内存里。
+      const session = await createSession(adminKey)
+      storage.setApiKey(session.token)
       onDone(adminKey)
     } catch (err) {
       setFailure(extractErrorMessage(err))

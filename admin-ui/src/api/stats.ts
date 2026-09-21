@@ -1,5 +1,4 @@
-import axios from 'axios'
-import { storage } from '@/lib/storage'
+import { createAdminClient } from './admin-client'
 import type {
   CredentialDistribution,
   KeyDistribution,
@@ -10,17 +9,7 @@ import type {
   TimeSeriesPoint,
 } from '@/types/api'
 
-const api = axios.create({
-  baseURL: '/api/admin',
-  timeout: 15000,
-  headers: { 'Content-Type': 'application/json' },
-})
-
-api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) config.headers['x-api-key'] = apiKey
-  return config
-})
+const api = createAdminClient()
 
 export async function getOverview(): Promise<OverviewStats> {
   const { data } = await api.get<OverviewStats>('/stats/overview')
