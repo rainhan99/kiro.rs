@@ -7,6 +7,7 @@ pub mod config;
 pub mod expressible;
 pub mod images;
 pub mod inspect;
+pub mod portable_history;
 pub mod tool_catalog;
 
 use crate::anthropic::types::MessagesRequest;
