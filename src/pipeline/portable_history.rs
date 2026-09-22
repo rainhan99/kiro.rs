@@ -25,12 +25,27 @@ pub enum NormalizationAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizationEvent {
-    pub path: String,
-    pub original_type: String,
+    pub original_type: NormalizationBlockCategory,
     pub action: NormalizationAction,
     pub input_bytes: usize,
     pub output_bytes: usize,
-    pub fingerprint: String,
+}
+
+/// A closed report category. Unrecognized provider block type strings deliberately
+/// collapse to `Unknown` so reports cannot become a request-content side channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizationBlockCategory {
+    Text,
+    Image,
+    ToolUse,
+    ToolResult,
+    Thinking,
+    RedactedThinking,
+    Document,
+    ServerToolUse,
+    WebSearchToolResult,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -41,7 +56,7 @@ pub struct NormalizationReport {
     pub transformed_blocks: usize,
     pub opaque_bytes: usize,
     pub by_action: BTreeMap<String, usize>,
-    pub by_original_type: BTreeMap<String, usize>,
+    pub by_original_type: BTreeMap<NormalizationBlockCategory, usize>,
     pub events: Vec<NormalizationEvent>,
     pub events_truncated: bool,
 }
@@ -79,21 +94,13 @@ impl PortableHistoryError {
 
     pub fn safe_message(&self) -> String {
         match self {
-            Self::Malformed { path, reason }
-            | Self::ToolPairing { path, reason }
-            | Self::CurrentUnexpressible { path, reason }
-            | Self::InvariantViolation { path, reason } => {
-                if matches!(self, Self::InvariantViolation { .. }) {
-                    "portable history invariant failed".into()
-                } else {
-                    format!("{path}: {reason}")
-                }
+            Self::Malformed { .. } => "malformed portable history".into(),
+            Self::ToolPairing { .. } => "tool history pairing failed".into(),
+            Self::CurrentUnexpressible { .. } => "current input is not expressible by Kiro".into(),
+            Self::BudgetExceeded { .. } => {
+                "portable history normalized size exceeds configured ingressMaxBytes".into()
             }
-            Self::BudgetExceeded { actual, limit } => {
-                format!(
-                    "normalized request size {actual} exceeds configured ingressMaxBytes {limit}"
-                )
-            }
+            Self::InvariantViolation { .. } => "portable history invariant failed".into(),
         }
     }
 }
@@ -107,7 +114,7 @@ enum Scope {
 pub fn normalize(
     payload: &MessagesRequest,
     strategy: UnexpressibleStrategy,
-    fingerprint: &dyn SensitiveFingerprint,
+    _fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<NormalizationOutcome, PortableHistoryError> {
     let frontier = current_frontier(&payload.messages)?;
     let mut normalized = payload.clone();
@@ -121,7 +128,7 @@ pub fn normalize(
         } else {
             Scope::Current
         };
-        normalize_message(message, scope, index, &mut report, fingerprint)?;
+        normalize_message(message, scope, index, &mut report)?;
     }
     Ok(NormalizationOutcome {
         payload: normalized,
@@ -170,18 +177,9 @@ fn normalize_message(
     scope: Scope,
     index: usize,
     report: &mut NormalizationReport,
-    fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<(), PortableHistoryError> {
     let path = format!("messages[{index}].content");
-    normalize_content(
-        &mut message.content,
-        &message.role,
-        scope,
-        &path,
-        0,
-        report,
-        fingerprint,
-    )
+    normalize_content(&mut message.content, &message.role, scope, &path, 0, report)
 }
 
 fn normalize_content(
@@ -191,7 +189,6 @@ fn normalize_content(
     path: &str,
     depth: usize,
     report: &mut NormalizationReport,
-    fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<(), PortableHistoryError> {
     if depth > MAX_CONTENT_DEPTH {
         return Err(PortableHistoryError::Malformed {
@@ -210,7 +207,7 @@ fn normalize_content(
         })?;
     for (index, block) in blocks.iter_mut().enumerate() {
         let block_path = format!("{path}[{index}]");
-        normalize_block(block, role, scope, &block_path, depth, report, fingerprint)?;
+        normalize_block(block, role, scope, &block_path, depth, report)?;
     }
     Ok(())
 }
@@ -222,10 +219,9 @@ fn normalize_block(
     path: &str,
     depth: usize,
     report: &mut NormalizationReport,
-    fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<(), PortableHistoryError> {
     let original = block.clone();
-    let original_type = block
+    let block_type = block
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| PortableHistoryError::Malformed {
@@ -233,14 +229,12 @@ fn normalize_block(
             reason: "content block requires a type string".into(),
         })?
         .to_string();
+    let category = block_category(&block_type);
     report.scanned_blocks += 1;
-    *report
-        .by_original_type
-        .entry(original_type.clone())
-        .or_default() += 1;
+    *report.by_original_type.entry(category).or_default() += 1;
 
     let mut action = NormalizationAction::Preserved;
-    match original_type.as_str() {
+    match block_type.as_str() {
         "text" => {
             require_string(block, "text", path, "text block requires a text string")?;
         }
@@ -274,7 +268,6 @@ fn normalize_block(
                     &format!("{path}.content"),
                     depth + 1,
                     report,
-                    fingerprint,
                 )?;
             }
         }
@@ -299,15 +292,7 @@ fn normalize_block(
         _ => return unsupported_current(scope, path),
     }
 
-    record_block(
-        report,
-        &original_type,
-        action,
-        path,
-        &original,
-        block,
-        fingerprint,
-    );
+    record_block(report, category, action, &original, block);
     Ok(())
 }
 
@@ -354,12 +339,10 @@ fn unsupported_current(scope: Scope, path: &str) -> Result<(), PortableHistoryEr
 
 fn record_block(
     report: &mut NormalizationReport,
-    original_type: &str,
+    original_type: NormalizationBlockCategory,
     action: NormalizationAction,
-    path: &str,
     input: &Value,
     output: &Value,
-    fingerprint: &dyn SensitiveFingerprint,
 ) {
     *report
         .by_action
@@ -375,15 +358,27 @@ fn record_block(
     }
     let input_bytes = serde_json::to_vec(input).map_or(0, |bytes| bytes.len());
     let output_bytes = serde_json::to_vec(output).map_or(0, |bytes| bytes.len());
-    let input_wire = serde_json::to_vec(input).unwrap_or_default();
     report.events.push(NormalizationEvent {
-        path: path.into(),
-        original_type: original_type.into(),
+        original_type,
         action,
         input_bytes,
         output_bytes,
-        fingerprint: fingerprint.fingerprint(b"portable-history-block", &input_wire),
     });
+}
+
+fn block_category(block_type: &str) -> NormalizationBlockCategory {
+    match block_type {
+        "text" => NormalizationBlockCategory::Text,
+        "image" => NormalizationBlockCategory::Image,
+        "tool_use" => NormalizationBlockCategory::ToolUse,
+        "tool_result" => NormalizationBlockCategory::ToolResult,
+        "thinking" => NormalizationBlockCategory::Thinking,
+        "redacted_thinking" => NormalizationBlockCategory::RedactedThinking,
+        "document" => NormalizationBlockCategory::Document,
+        "server_tool_use" => NormalizationBlockCategory::ServerToolUse,
+        "web_search_tool_result" => NormalizationBlockCategory::WebSearchToolResult,
+        _ => NormalizationBlockCategory::Unknown,
+    }
 }
 
 fn strategy_name(strategy: UnexpressibleStrategy) -> &'static str {
@@ -512,5 +507,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(serde_json::to_value(&outcome.payload).unwrap(), expected);
+    }
+
+    #[test]
+    fn serialized_report_contains_only_closed_categories_and_counts() {
+        let input = request(json!([
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"REPORT_CONTENT_SENTINEL","signature":"PRIVATE_SIGNATURE"},
+                {"type":"FUTURE_TYPE_SENTINEL","text":"unknown historical content"}
+            ]},
+            {"role":"user","content":"continue"}
+        ]));
+
+        let outcome = normalize(
+            &input,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&outcome.report).unwrap();
+
+        for forbidden in [
+            "REPORT_CONTENT_SENTINEL",
+            "PRIVATE_SIGNATURE",
+            "messages[0].content[0]",
+            "portable-history-block",
+            "FUTURE_TYPE_SENTINEL",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "report leaked {forbidden}: {serialized}"
+            );
+        }
+        assert!(serialized.contains("opaque_redacted"));
+        assert!(serialized.contains("unknown"));
+    }
+
+    #[test]
+    fn safe_messages_hide_internal_paths_and_reasons() {
+        let errors = [
+            PortableHistoryError::Malformed {
+                path: "messages[PRIVATE_PATH]".into(),
+                reason: "PRIVATE_REASON".into(),
+            },
+            PortableHistoryError::ToolPairing {
+                path: "messages[PRIVATE_PATH]".into(),
+                reason: "PRIVATE_REASON".into(),
+            },
+            PortableHistoryError::CurrentUnexpressible {
+                path: "messages[PRIVATE_PATH]".into(),
+                reason: "PRIVATE_REASON".into(),
+            },
+            PortableHistoryError::InvariantViolation {
+                path: "messages[PRIVATE_PATH]".into(),
+                reason: "PRIVATE_REASON".into(),
+            },
+        ];
+
+        for error in errors {
+            let message = error.safe_message();
+            assert!(!message.contains("PRIVATE_PATH"));
+            assert!(!message.contains("PRIVATE_REASON"));
+        }
     }
 }
