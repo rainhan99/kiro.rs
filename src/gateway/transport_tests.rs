@@ -50,8 +50,8 @@ fn a_base_url_with_credentials_query_or_fragment_is_refused() {
         ("https://api.example.test?token=abc", "query or fragment"),
         ("https://api.example.test#frag", "query or fragment"),
     ] {
-        let error = resolve_endpoint(&upstream(Some(base), false), WireProtocol::Anthropic)
-            .unwrap_err();
+        let error =
+            resolve_endpoint(&upstream(Some(base), false), WireProtocol::Anthropic).unwrap_err();
         assert!(
             format!("{error:#}").contains(expect),
             "{base} 应被拒绝：{error:#}"
@@ -105,8 +105,8 @@ fn private_loopback_and_metadata_addresses_are_blocked() {
         "[::ffff:127.0.0.1]",
     ] {
         let base = format!("https://{host}");
-        let error = resolve_endpoint(&upstream(Some(&base), false), WireProtocol::Anthropic)
-            .unwrap_err();
+        let error =
+            resolve_endpoint(&upstream(Some(&base), false), WireProtocol::Anthropic).unwrap_err();
         assert!(
             format!("{error:#}").contains("non-public address"),
             "{host} 必须被挡住：{error:#}"
@@ -156,7 +156,8 @@ fn auth_headers_come_only_from_the_configured_secret() {
 #[test]
 fn classification_uses_status_and_structured_fields_not_free_text() {
     // 正文里出现 quota 但状态是 200 段之外的一般错误 → 不得判成配额。
-    let body = r#"{"error":{"type":"invalid_request_error","message":"your quota example is wrong"}}"#;
+    let body =
+        r#"{"error":{"type":"invalid_request_error","message":"your quota example is wrong"}}"#;
     assert_eq!(
         classify(400, body, None),
         UpstreamFailure::InvalidRequest {
@@ -201,7 +202,10 @@ fn status_classes_map_to_the_right_failure_and_retryability() {
     ));
     for status in [500_u16, 502, 503, 504, 408] {
         assert!(
-            matches!(classify(status, "{}", None), UpstreamFailure::Transient { .. }),
+            matches!(
+                classify(status, "{}", None),
+                UpstreamFailure::Transient { .. }
+            ),
             "{status} 应判为瞬态"
         );
     }

@@ -73,7 +73,10 @@ fn a_too_short_or_empty_admin_key_is_rejected() {
     assert!(validate_admin_key("").is_err());
     assert!(validate_admin_key("   ").is_err());
     assert!(validate_admin_key("short").is_err());
-    assert_eq!(validate_admin_key("  goodpassword  ").unwrap(), "goodpassword");
+    assert_eq!(
+        validate_admin_key("  goodpassword  ").unwrap(),
+        "goodpassword"
+    );
 }
 
 /// 长度按**字符**算不按字节算：中文密码「密码密码」是 4 个字符 12 个字节，
@@ -84,5 +87,8 @@ fn the_length_check_counts_characters_not_bytes() {
         validate_admin_key("密码密码").is_err(),
         "4 个汉字是 12 字节，但只有 4 个字符"
     );
-    assert!(validate_admin_key("密码密码密码密码").is_ok(), "8 个字符应当通过");
+    assert!(
+        validate_admin_key("密码密码密码密码").is_ok(),
+        "8 个字符应当通过"
+    );
 }

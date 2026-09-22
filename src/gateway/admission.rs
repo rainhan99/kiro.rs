@@ -21,10 +21,10 @@
 use anyhow::{Result, ensure};
 
 use super::ledger::{AccountView, Ledger};
+use super::ledger_types::BoundKind;
 use super::routing::Candidate;
 use super::service::RequestPlan;
 use super::{Amount, BillingUnit, BudgetEnforcement, ModelBinding, TokenPrices};
-use super::ledger_types::BoundKind;
 
 /// 单个候选的准入判定。
 #[derive(Debug, Clone, PartialEq)]
@@ -82,7 +82,11 @@ pub fn evaluate(
         .collect()
 }
 
-fn verdict(accounts: &[AccountView], binding: &ModelBinding, plan: &RequestPlan) -> CandidateVerdict {
+fn verdict(
+    accounts: &[AccountView],
+    binding: &ModelBinding,
+    plan: &RequestPlan,
+) -> CandidateVerdict {
     let unit = binding.billing_unit;
     // 粒度是 (Key, 币种)：只有积分账户的 Key 够不到按钱计费的备路，反之亦然。
     let Some(account) = accounts.iter().find(|a| a.policy.unit == unit) else {
@@ -152,7 +156,8 @@ pub fn guaranteed_bound(binding: &ModelBinding, max_attempts: u32) -> Result<Amo
          so no guaranteed upper bound exists",
         binding.id
     );
-    let per_attempt = worst_case_per_attempt(prices, binding.context_window, binding.max_output_tokens)?;
+    let per_attempt =
+        worst_case_per_attempt(prices, binding.context_window, binding.max_output_tokens)?;
     // 内部可能发生多轮（重试、内部工具轮次）；上界必须覆盖配置允许的全部轮次。
     let attempts = u64::from(max_attempts.max(1));
     per_attempt
@@ -162,17 +167,16 @@ pub fn guaranteed_bound(binding: &ModelBinding, max_attempts: u32) -> Result<Amo
         .map_err(|e| anyhow::anyhow!("binding `{}` bound overflow: {e:#}", binding.id))
 }
 
-fn worst_case_per_attempt(
-    prices: &TokenPrices,
-    input_max: u64,
-    output_max: u64,
-) -> Result<Amount> {
+fn worst_case_per_attempt(prices: &TokenPrices, input_max: u64, output_max: u64) -> Result<Amount> {
     // 输入侧取最贵的单价：无法预知这次的输入落在普通输入还是缓存读写，
     // 取最大值才是"保证不被突破"。
     let dearest_input = [prices.input, prices.cache_read, prices.cache_write]
         .into_iter()
         .chain(prices.cache_write_1h)
-        .fold(Amount::ZERO, |acc, price| if price > acc { price } else { acc });
+        .fold(
+            Amount::ZERO,
+            |acc, price| if price > acc { price } else { acc },
+        );
     let input = dearest_input.checked_mul_tokens(input_max)?;
     let output = prices.output.checked_mul_tokens(output_max)?;
     input.checked_add(output)

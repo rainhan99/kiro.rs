@@ -119,10 +119,8 @@ pub struct RequestContext<'a> {
 ///
 /// 两类语义都是「该凭据当前计费周期内不能再用」，处理方式一致：
 /// 立刻禁用凭据并故障转移到下一个可用凭据。
-const QUOTA_EXHAUSTED_REASONS: &[&str] = &[
-    "MONTHLY_REQUEST_COUNT",
-    "OVERAGE_REQUEST_LIMIT_EXCEEDED",
-];
+const QUOTA_EXHAUSTED_REASONS: &[&str] =
+    &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
 
 /// 默认的"请求额度耗尽"判断逻辑
 ///
@@ -160,8 +158,7 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 /// 与普通 429（high traffic / rate limit exceeded）的关键差异是
 /// 提到 "suspicious activity" 与具体账号 ID。
 pub fn default_is_account_throttled(body: &str) -> bool {
-    body.contains("suspicious activity")
-        && body.contains("temporary limits")
+    body.contains("suspicious activity") && body.contains("temporary limits")
 }
 
 /// 默认的"账号被封禁/停用"判断逻辑
@@ -350,8 +347,7 @@ mod tests {
     fn test_default_quota_exhausted_substring_does_not_false_match() {
         // 关键字出现在普通字段而非 reason 字段：仍然命中（向后兼容旧行为）
         // 但 reason 字段是其他值时应严格不命中
-        let body =
-            r#"{"message":"some text MONTHLY_REQUEST_COUNT-like phrase","reason":"OTHER"}"#;
+        let body = r#"{"message":"some text MONTHLY_REQUEST_COUNT-like phrase","reason":"OTHER"}"#;
         assert!(!default_is_monthly_request_limit(body));
     }
 
@@ -393,7 +389,9 @@ mod tests {
             "{\"message\":\"Too many requests\"}"
         ));
         // 仅有一半关键词时也不命中
-        assert!(!default_is_account_throttled("suspicious activity detected"));
+        assert!(!default_is_account_throttled(
+            "suspicious activity detected"
+        ));
     }
 
     #[test]
@@ -435,7 +433,9 @@ mod tests {
         assert!(!default_is_client_validation_error(
             r#"{"message":"Internal server error"}"#
         ));
-        assert!(!default_is_client_validation_error("connection reset by peer"));
+        assert!(!default_is_client_validation_error(
+            "connection reset by peer"
+        ));
         // 关键回归：reason 关键词偶然出现在普通字段，但真实 reason 是别的值 —— 不应命中
         // （否则会把一个本可重试恢复的真实上游故障误杀）
         assert!(!default_is_client_validation_error(

@@ -51,15 +51,18 @@ fn the_generated_config_is_usable_by_the_proxy() {
 
     // 生成的配置必须能被 kiro-rs 自己读回去。手写一份 JSON 很容易漏字段
     // 或拼错大小写，而那要等到双击应用才发现。
-    let config = kiro_rs::model::config::Config::load(&paths.config)
-        .expect("生成的配置必须能被代理加载");
+    let config =
+        kiro_rs::model::config::Config::load(&paths.config).expect("生成的配置必须能被代理加载");
 
     assert_eq!(
         config.host, "127.0.0.1",
         "桌面端必须绑回环。绑 0.0.0.0 会把带凭据的代理暴露到局域网"
     );
     assert!(
-        config.api_key.as_deref().is_some_and(|k| k.starts_with("sk-")),
+        config
+            .api_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("sk-")),
         "要生成可用的客户端 Key"
     );
     // 管理密钥**刻意不生成**：管理权由用户在初始化页自己认领，凭应用
@@ -118,8 +121,5 @@ fn a_relative_data_dir_override_is_rejected_rather_than_silently_used() {
     });
 
     let err = result.expect_err("相对路径必须被拒绝");
-    assert!(
-        format!("{err:#}").contains("绝对路径"),
-        "实际: {err:#}"
-    );
+    assert!(format!("{err:#}").contains("绝对路径"), "实际: {err:#}");
 }

@@ -121,7 +121,11 @@ impl ConfigStore {
     ///
     /// `incoming` 里省略某个上游的 `apiKey` 表示沿用原值；要清除必须显式给空字符串。
     /// 校验 → 落盘 → 换快照，顺序不可颠倒：落盘失败时运行期必须保持原样。
-    pub fn update(&self, expected_revision: u64, mut incoming: GatewayConfig) -> Result<UpdateOutcome> {
+    pub fn update(
+        &self,
+        expected_revision: u64,
+        mut incoming: GatewayConfig,
+    ) -> Result<UpdateOutcome> {
         // 整个「比对版本 → 写文件 → 换快照」必须在同一把锁内，否则两个并发更新会各自
         // 基于同一个旧版本通过校验，后写者悄悄覆盖前写者。
         let mut state = self.state.lock();

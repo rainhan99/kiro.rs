@@ -88,7 +88,11 @@ pub struct CalibrationAggregate {
 mod tests {
     use super::*;
 
-    fn sample(percentage: Option<f64>, native: Option<u64>, completed: bool) -> Option<CalibrationSample> {
+    fn sample(
+        percentage: Option<f64>,
+        native: Option<u64>,
+        completed: bool,
+    ) -> Option<CalibrationSample> {
         derive_sample("claude-sonnet-4", "ide", percentage, native, completed)
     }
 

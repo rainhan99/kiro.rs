@@ -138,7 +138,11 @@ fn anthropic_request_to_chat(body: &Value, actual_model: &str) -> Result<Value> 
     }
     for field in ["temperature", "top_p", "stop_sequences", "stream"] {
         if let Some(value) = body.get(field) {
-            let key = if field == "stop_sequences" { "stop" } else { field };
+            let key = if field == "stop_sequences" {
+                "stop"
+            } else {
+                field
+            };
             out.insert(key.into(), value.clone());
         }
     }
@@ -308,9 +312,7 @@ fn anthropic_request_to_responses(body: &Value, actual_model: &str) -> Result<Va
         let mut parts = Vec::new();
         for block in blocks {
             match block.get("type").and_then(Value::as_str).unwrap_or("") {
-                "text" => {
-                    parts.push(json!({"type": text_type, "text": str_field(block, "text")?}))
-                }
+                "text" => parts.push(json!({"type": text_type, "text": str_field(block, "text")?})),
                 "image" => {
                     let converted = anthropic_image_to_chat(block)?;
                     parts.push(json!({
@@ -446,7 +448,10 @@ fn responses_response_to_anthropic(body: &Value, public_model: &str) -> Result<V
                 }
             }
             "function_call" => {
-                let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
                 content.push(json!({
                     "type": "tool_use",
                     "id": item.get("call_id").cloned().unwrap_or(json!("")),

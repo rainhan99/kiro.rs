@@ -53,11 +53,7 @@ async fn main() {
         Err(error) => fail(error),
     };
 
-    kiro_rs::runtime::log_startup_banner(
-        server.addr(),
-        server.data_dir(),
-        server.setup_token(),
-    );
+    kiro_rs::runtime::log_startup_banner(server.addr(), server.data_dir(), server.setup_token());
 
     if let Err(error) = server.wait_for_signal().await {
         fail(error);

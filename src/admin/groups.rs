@@ -137,7 +137,9 @@ impl GroupManager {
         }
         let group = Group {
             name: trimmed.to_string(),
-            description: description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
+            description: description
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty()),
             created_at: Utc::now().to_rfc3339(),
         };
         inner.entries.insert(group.name.clone(), group.clone());
@@ -156,7 +158,9 @@ impl GroupManager {
             .entries
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("分组不存在: {}", name))?;
-        entry.description = description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+        entry.description = description
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
         let cloned = entry.clone();
         self.save_locked(&inner);
         Ok(cloned)
@@ -348,7 +352,10 @@ mod tests {
     #[test]
     fn load_empty_file_yields_empty_manager() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("kiro_test_groups_empty_{}.json", std::process::id()));
+        let path = dir.join(format!(
+            "kiro_test_groups_empty_{}.json",
+            std::process::id()
+        ));
         std::fs::write(&path, "").unwrap();
         let mgr = GroupManager::load(&path).unwrap();
         assert!(mgr.list().is_empty());

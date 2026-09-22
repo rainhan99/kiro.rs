@@ -157,7 +157,10 @@ mod tests {
         let event = parse(json!({"contextUsagePercentage": 99.9}));
         assert_eq!(event.context_usage_percentage, 99.9);
         assert_eq!(event.formatted_percentage(), "99.90%");
-        assert_eq!(event.shape.unwrap(), json!({"contextUsagePercentage": 99.9}));
+        assert_eq!(
+            event.shape.unwrap(),
+            json!({"contextUsagePercentage": 99.9})
+        );
     }
 
     /// 病态深度/宽度必须有界终止，且超出部分要留下标记而不是静默消失。

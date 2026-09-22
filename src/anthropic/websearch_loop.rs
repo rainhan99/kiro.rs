@@ -34,8 +34,8 @@ use crate::pipeline::artifacts::{ContextSession, is_internal_tool};
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_pipeline, get_context_window_size};
-use super::handlers::{KiroRouting, 
-    RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
+use super::handlers::{
+    KiroRouting, RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
     map_provider_error,
 };
 use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator, ToolJsonAccumulatorError};
@@ -269,9 +269,9 @@ fn tool_round_disposition(
             ToolRoundDisposition::ContextLimitExceeded
         };
     }
-    let has_context = tool_uses
-        .iter()
-        .any(|tool| is_internal_tool(&tool.name) || crate::pipeline::chunked_map::is_map_tool(&tool.name));
+    let has_context = tool_uses.iter().any(|tool| {
+        is_internal_tool(&tool.name) || crate::pipeline::chunked_map::is_map_tool(&tool.name)
+    });
     if has_context {
         let Some(limit) = context_limit else {
             return ToolRoundDisposition::ContextUnavailable;
@@ -768,7 +768,11 @@ async fn execute_chunked_map(
         json!({"type":"tool_result","tool_use_id":tool.id,"is_error":true,
             "content": json!({"error":"chunked_map_error","message":message}).to_string()})
     };
-    let config = &provider.token_manager().config().request_pipeline.chunked_map;
+    let config = &provider
+        .token_manager()
+        .config()
+        .request_pipeline
+        .chunked_map;
     let Some(context) = context else {
         return error("chunked map requires an active context artifact session".into());
     };
@@ -1547,7 +1551,14 @@ async fn execute_web_search(
     let result = if let Some(query) = query {
         log_normalized_web_search_query(tool_use, &query);
         let (_, mcp_request) = websearch::create_mcp_request(&query);
-        match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), routing.group.as_deref()).await {
+        match websearch::call_mcp_api(
+            provider,
+            &mcp_request,
+            Some(tracer),
+            routing.group.as_deref(),
+        )
+        .await
+        {
             Ok(response) => websearch::parse_search_results(&response),
             Err(error) if websearch::is_no_results_mcp_error(&error) => {
                 tracing::warn!(

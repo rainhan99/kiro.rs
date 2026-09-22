@@ -216,16 +216,15 @@ impl RoutingEngine {
                 match mode {
                     // 粘性模式下首次选号与故障转移都取有效权重最高者，
                     // 同分按 binding_id 稳定排序，保证可复现。
-                    RoutingMode::Sticky => {
-                        pool.iter()
-                            .max_by(|a, b| {
-                                a.weight
-                                    .cmp(&b.weight)
-                                    .then_with(|| b.binding_id.cmp(&a.binding_id))
-                            })?
-                            .binding_id
-                            .clone()
-                    }
+                    RoutingMode::Sticky => pool
+                        .iter()
+                        .max_by(|a, b| {
+                            a.weight
+                                .cmp(&b.weight)
+                                .then_with(|| b.binding_id.cmp(&a.binding_id))
+                        })?
+                        .binding_id
+                        .clone(),
                     RoutingMode::WeightedRandom => weighted_pick(&pool, ticket)?.binding_id.clone(),
                 }
             }
@@ -304,7 +303,10 @@ impl RoutingEngine {
             return (StickyOutcome::NoBinding, None);
         };
         if bound.generation != self.generation() {
-            return (StickyOutcome::GenerationChanged, Some(bound.binding_id.clone()));
+            return (
+                StickyOutcome::GenerationChanged,
+                Some(bound.binding_id.clone()),
+            );
         }
         if bound.expires_at <= now {
             return (StickyOutcome::Expired, Some(bound.binding_id.clone()));

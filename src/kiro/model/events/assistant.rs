@@ -115,8 +115,7 @@ mod tests {
     #[test]
     fn test_strip_tool_use_xml_leaks() {
         // 剥离标签块本身，保留其两侧文本（周围换行原样保留）。
-        let content =
-            "before\n<tool_use id=\"toolu_1\" name=\"Read\">\n{\"path\":\"/a\"}\n</tool_use>\nafter";
+        let content = "before\n<tool_use id=\"toolu_1\" name=\"Read\">\n{\"path\":\"/a\"}\n</tool_use>\nafter";
         assert_eq!(strip_tool_use_xml_leaks(content), "before\n\nafter");
     }
 

@@ -47,8 +47,7 @@ pub(crate) fn foundation(options: &Options) -> anyhow::Result<Foundation> {
     ensure_config_files(&config_path, &credentials_path);
 
     // 加载配置
-    let config =
-        Config::load(&config_path).map_err(|e| anyhow::anyhow!("加载配置失败: {e}"))?;
+    let config = Config::load(&config_path).map_err(|e| anyhow::anyhow!("加载配置失败: {e}"))?;
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_config = CredentialsConfig::load(&credentials_path)
@@ -245,8 +244,10 @@ pub fn ensure_config_files_with_host(config_path: &str, credentials_path: &str, 
         });
         match serde_json::to_string_pretty(&default)
             .map_err(anyhow::Error::from)
-            .and_then(|s| crate::common::fs::write_private(config_p, s.as_bytes()).map_err(anyhow::Error::from))
-        {
+            .and_then(|s| {
+                crate::common::fs::write_private(config_p, s.as_bytes())
+                    .map_err(anyhow::Error::from)
+            }) {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
                 tracing::info!("  apiKey = {}（客户端用，同时同步为系统 Key）", api_key);

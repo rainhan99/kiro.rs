@@ -826,7 +826,10 @@ fn resolve_breakpoints(
         let Some(auto_ttl) = validated_ttl(top_cc) else {
             return Vec::new();
         };
-        let target_idx = if blocks.iter().any(|b| !b.is_current_turn_input && b.cacheable) {
+        let target_idx = if blocks
+            .iter()
+            .any(|b| !b.is_current_turn_input && b.cacheable)
+        {
             blocks
                 .iter()
                 .enumerate()

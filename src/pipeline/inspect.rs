@@ -62,8 +62,13 @@ pub fn run(config_path: &str, request_path: Option<&str>) -> anyhow::Result<()> 
             &super::serialize_request(&payload, &request, &config.request_pipeline)?,
             &config,
         );
-        result["audit"] =
-            pipeline.audit(&wire, &config.default_endpoint, 0, &http::HeaderMap::new(), None)?;
+        result["audit"] = pipeline.audit(
+            &wire,
+            &config.default_endpoint,
+            0,
+            &http::HeaderMap::new(),
+            None,
+        )?;
         result["stage"] = json!(
             "offline-endpoint-without-credentials; final profile/header inspection occurs on normal traffic only"
         );

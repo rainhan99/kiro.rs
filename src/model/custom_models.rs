@@ -47,15 +47,11 @@ pub fn lookup(model: &str) -> Option<CustomModel> {
     let reg = REGISTRY.read().ok()?;
     let registry = reg.as_ref()?;
     let key = model.to_ascii_lowercase();
-    let idx = registry
-        .by_id
-        .get(&key)
-        .copied()
-        .or_else(|| {
-            key.strip_suffix("-thinking")
-                .and_then(|stripped| registry.by_id.get(stripped))
-                .copied()
-        })?;
+    let idx = registry.by_id.get(&key).copied().or_else(|| {
+        key.strip_suffix("-thinking")
+            .and_then(|stripped| registry.by_id.get(stripped))
+            .copied()
+    })?;
     registry.ordered.get(idx).cloned()
 }
 

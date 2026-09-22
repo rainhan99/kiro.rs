@@ -514,8 +514,7 @@ fn should_retry_usage_api_without_profile_arn(
 
     status == 403
         || (status == 400
-            && (body.contains("Improperly formed request")
-                || body.contains("Invalid profileArn")))
+            && (body.contains("Improperly formed request") || body.contains("Invalid profileArn")))
 }
 
 fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
@@ -6398,8 +6397,7 @@ mod tests {
             ..Default::default()
         };
         let host = "q.us-east-1.amazonaws.com";
-        let encoded =
-            "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
+        let encoded = "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
 
         let arn = credentials.effective_profile_arn();
         assert_eq!(
@@ -6504,9 +6502,7 @@ mod tests {
 
         // BuilderID 占位符仍不应作为 Enterprise profileArn 外发。
         let builder_credentials = KiroCredentials {
-            profile_arn: Some(
-                crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
-            ),
+            profile_arn: Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -7236,7 +7232,8 @@ mod tests {
         first.priority = 0;
         let mut second = grouped_cred("second", &[]);
         second.priority = 10;
-        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
         let first_context = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(first_context.id, 1);
@@ -7284,7 +7281,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.id, 2);
-        assert_eq!(route.sticky_outcome, StickyOutcome::MissFirst, "尚未 bind 过");
+        assert_eq!(
+            route.sticky_outcome,
+            StickyOutcome::MissFirst,
+            "尚未 bind 过"
+        );
         manager.bind_session("sess-A", 2);
 
         // #1 恢复：不带会话的请求立刻回切 #1（既有 priority 语义不变）
@@ -7347,7 +7348,8 @@ mod tests {
         first.priority = 0;
         let mut second = grouped_cred("second", &[]);
         second.priority = 10;
-        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
         let (ctx, _) = manager
             .acquire_context_routed(None, None, Some("s"))

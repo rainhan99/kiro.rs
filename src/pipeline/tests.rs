@@ -766,4 +766,3 @@ fn prefill_request() -> MessagesRequest {
     }))
     .unwrap()
 }
-

@@ -157,7 +157,11 @@ fn field(value: &serde_json::Value, name: &str) -> Option<String> {
     value
         .get(name)
         .and_then(|v| v.as_str())
-        .or_else(|| value.pointer(&format!("/error/{name}")).and_then(|v| v.as_str()))
+        .or_else(|| {
+            value
+                .pointer(&format!("/error/{name}"))
+                .and_then(|v| v.as_str())
+        })
         .or_else(|| {
             if name == "reason" {
                 value.get("__type").and_then(|v| v.as_str())
@@ -288,7 +292,11 @@ mod tests {
         assert_eq!(err.reason(), Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD"));
         assert_eq!(
             err.to_string(),
-            format!("IDE API 请求失败: {} {}", http::StatusCode::BAD_REQUEST, body),
+            format!(
+                "IDE API 请求失败: {} {}",
+                http::StatusCode::BAD_REQUEST,
+                body
+            ),
             "Display 必须与旧格式逐字一致，既有日志与 trace 片段才不受影响"
         );
     }

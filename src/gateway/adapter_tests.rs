@@ -38,8 +38,7 @@ fn same_protocol_preserves_unknown_but_legitimate_fields() {
             "some_new_upstream_field": {"nested": [1, 2, 3]},
             "another": true
         });
-        let converted =
-            convert_request(protocol, protocol, &body, "real-model").unwrap();
+        let converted = convert_request(protocol, protocol, &body, "real-model").unwrap();
         assert_eq!(converted["model"], "real-model", "{protocol:?} 只换模型名");
         assert_eq!(
             converted["some_new_upstream_field"],
@@ -79,8 +78,7 @@ fn tools_calls_and_results_keep_their_ids_across_protocols() {
     assert_eq!(converted["tools"][0]["type"], "function");
     assert_eq!(converted["tools"][0]["function"]["name"], "read");
     assert_eq!(
-        converted["tools"][0]["function"]["parameters"]["properties"]["path"]["type"],
-        "string",
+        converted["tools"][0]["function"]["parameters"]["properties"]["path"]["type"], "string",
         "input_schema 必须成为 parameters"
     );
 
@@ -290,13 +288,8 @@ fn malformed_tool_arguments_are_an_error_not_an_empty_object() {
 #[test]
 fn responses_reasoning_output_is_rejected() {
     let body = json!({"output": [{"type": "reasoning", "summary": []}]});
-    let error = convert_response(
-        WireProtocol::Responses,
-        WireProtocol::Anthropic,
-        &body,
-        "m",
-    )
-    .unwrap_err();
+    let error =
+        convert_response(WireProtocol::Responses, WireProtocol::Anthropic, &body, "m").unwrap_err();
     assert!(format!("{error:#}").contains("provider-signed state"));
 }
 

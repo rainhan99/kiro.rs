@@ -178,7 +178,11 @@ impl ClientKeyManager {
     ) -> ClientKey {
         let mut inner = self.inner.write();
         if let Some(&id) = inner.by_key.get(&plaintext) {
-            return inner.entries.get(&id).cloned().expect("by_key 与 entries 应一致");
+            return inner
+                .entries
+                .get(&id)
+                .cloned()
+                .expect("by_key 与 entries 应一致");
         }
         let id = inner.next_id;
         inner.next_id += 1;
@@ -344,7 +348,11 @@ impl ClientKeyManager {
 
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
-        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.group.clone())
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -565,7 +573,12 @@ impl ClientKeyManager {
 
     /// 获取统计后的 active Key 数（未禁用）
     pub fn active_count(&self) -> usize {
-        self.inner.read().entries.values().filter(|e| !e.disabled).count()
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| !e.disabled)
+            .count()
     }
 }
 
@@ -581,8 +594,7 @@ fn is_false(b: &bool) -> bool {
 
 /// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let body: String = (0..32)
         .map(|_| {
             let idx = fastrand::usize(..CHARSET.len());
@@ -692,7 +704,10 @@ mod tests {
     fn mask_format() {
         assert_eq!(mask_client_key("sk-abcdefghijklmnop"), "sk-abcde...mnop");
         assert_eq!(mask_client_key("short"), "short");
-        assert_eq!(mask_client_key("密钥🔐测试abcdefgh"), "密钥🔐测试abc...efgh");
+        assert_eq!(
+            mask_client_key("密钥🔐测试abcdefgh"),
+            "密钥🔐测试abc...efgh"
+        );
     }
 
     #[test]
@@ -734,7 +749,11 @@ mod tests {
     #[test]
     fn sync_system_key_replaces_config_value_and_revokes_old_key() {
         let mgr = ClientKeyManager::new();
-        mgr.sync_system_key("默认密钥".into(), Some("初始描述".into()), "custom-a".into());
+        mgr.sync_system_key(
+            "默认密钥".into(),
+            Some("初始描述".into()),
+            "custom-a".into(),
+        );
         mgr.update_meta(
             0,
             Some("保留名称".into()),
@@ -745,12 +764,7 @@ mod tests {
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));
         mgr.set_disabled(0, true);
 
-        let conflicting = mgr.create_with_key(
-            "冲突密钥".into(),
-            None,
-            None,
-            "custom-b".into(),
-        );
+        let conflicting = mgr.create_with_key("冲突密钥".into(), None, None, "custom-b".into());
         assert_ne!(conflicting.id, 0);
 
         mgr.sync_system_key("默认密钥".into(), None, "custom-b".into());

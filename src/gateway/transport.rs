@@ -53,13 +53,19 @@ pub enum UpstreamFailure {
 impl std::fmt::Display for UpstreamFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidRequest { status, .. } => write!(f, "upstream rejected the request ({status})"),
+            Self::InvalidRequest { status, .. } => {
+                write!(f, "upstream rejected the request ({status})")
+            }
             Self::ContextLimit { status, .. } => write!(f, "upstream context limit ({status})"),
             Self::Quota { status, .. } => write!(f, "upstream quota exhausted ({status})"),
             Self::Throttled { status, .. } => write!(f, "upstream throttled ({status})"),
-            Self::Authentication { status } => write!(f, "upstream authentication failed ({status})"),
+            Self::Authentication { status } => {
+                write!(f, "upstream authentication failed ({status})")
+            }
             Self::Transient { status, .. } => write!(f, "upstream transient failure ({status})"),
-            Self::StreamInterrupted { detail } => write!(f, "upstream stream interrupted: {detail}"),
+            Self::StreamInterrupted { detail } => {
+                write!(f, "upstream stream interrupted: {detail}")
+            }
         }
     }
 }
@@ -152,7 +158,10 @@ pub struct Endpoint {
 /// 构造并校验目标 URL。路径由协议决定，调用方无权指定。
 pub fn resolve_endpoint(upstream: &Upstream, protocol: WireProtocol) -> Result<Endpoint> {
     let Some(base) = upstream.base_url.as_deref() else {
-        bail!("upstream `{}` has no baseUrl to build an endpoint from", upstream.id);
+        bail!(
+            "upstream `{}` has no baseUrl to build an endpoint from",
+            upstream.id
+        );
     };
     let parsed = reqwest::Url::parse(base)
         .map_err(|e| anyhow::anyhow!("upstream `{}` baseUrl is not a URL: {e}", upstream.id))?;
@@ -176,7 +185,10 @@ pub fn resolve_endpoint(upstream: &Upstream, protocol: WireProtocol) -> Result<E
             "upstream `{}` uses plaintext http; enable allowPrivateNetwork explicitly if this is intended",
             upstream.id
         ),
-        other => bail!("upstream `{}` uses unsupported scheme `{other}`", upstream.id),
+        other => bail!(
+            "upstream `{}` uses unsupported scheme `{other}`",
+            upstream.id
+        ),
     }
 
     // 字面量 IP 当场判定（纯函数，不碰网络）；域名留到连接前由
@@ -227,7 +239,10 @@ pub fn ensure_public_target(endpoint: &Endpoint, upstream_id: &str) -> Result<()
 ///
 /// `Url::host_str` 对 IPv6 会保留方括号，标准库的解析器不接受，所以先剥掉。
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
-    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     bare.parse::<IpAddr>().ok()
 }
 

@@ -721,8 +721,9 @@ fn create_compaction_history_tool() -> Tool {
     Tool {
         tool_specification: ToolSpecification {
             name: COMPACTION_HISTORY_TOOL_NAME.to_string(),
-            description: "Inert placeholder for structured tool calls in compacted history. Do not call it."
-                .to_string(),
+            description:
+                "Inert placeholder for structured tool calls in compacted history. Do not call it."
+                    .to_string(),
             input_schema: InputSchema::from_json(serde_json::json!({
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
@@ -1986,8 +1987,13 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user =
-                    merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve, tool_results_config)?;
+                let merged_user = merge_user_messages(
+                    &user_buffer,
+                    model_id,
+                    &mut image_dedup,
+                    preserve,
+                    tool_results_config,
+                )?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -2004,7 +2010,13 @@ fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup, preserve, tool_results_config)?;
+        let merged_user = merge_user_messages(
+            &user_buffer,
+            model_id,
+            &mut image_dedup,
+            preserve,
+            tool_results_config,
+        )?;
         history.push(Message::User(merged_user));
 
         if purpose == ConversionPurpose::Compact {
@@ -2033,8 +2045,12 @@ fn merge_user_messages(
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) =
-            process_message_content_dedup(&msg.content, Some(dedup), preserve, tool_results_config)?;
+        let (text, images, tool_results) = process_message_content_dedup(
+            &msg.content,
+            Some(dedup),
+            preserve,
+            tool_results_config,
+        )?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -2093,17 +2109,12 @@ fn convert_assistant_message(
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                let (mapped_name, input) = if purpose
-                                    == ConversionPurpose::Compact
+                                let (mapped_name, input) = if purpose == ConversionPurpose::Compact
                                 {
                                     (COMPACTION_HISTORY_TOOL_NAME.to_string(), input)
                                 } else {
                                     (
-                                        map_client_tool_name_to_kiro(
-                                            &name,
-                                            tool_name_map,
-                                            mode,
-                                        ),
+                                        map_client_tool_name_to_kiro(&name, tool_name_map, mode),
                                         map_tool_input_to_kiro(&name, input, mode)?,
                                     )
                                 };
@@ -4095,8 +4106,7 @@ mod tests {
 
     fn chunked_config(chunk_bytes: usize) -> crate::pipeline::config::PipelineConfig {
         let mut config = crate::pipeline::config::PipelineConfig::default();
-        config.tool_results.strategy =
-            crate::pipeline::config::ToolResultStrategy::LosslessChunks;
+        config.tool_results.strategy = crate::pipeline::config::ToolResultStrategy::LosslessChunks;
         config.tool_results.chunk_bytes = chunk_bytes;
         config
     }
@@ -4106,9 +4116,12 @@ mod tests {
     #[test]
     fn lossless_chunking_emits_multiple_entries_that_reassemble_exactly() {
         let body = "工具输出的一行内容\n".repeat(2000);
-        let converted =
-            convert_request_with_pipeline(&request_with_tool_result(&body), ToolCompatibilityMode::Raw, &chunked_config(4096))
-                .unwrap();
+        let converted = convert_request_with_pipeline(
+            &request_with_tool_result(&body),
+            ToolCompatibilityMode::Raw,
+            &chunked_config(4096),
+        )
+        .unwrap();
         let tr = &converted
             .conversation_state
             .current_message

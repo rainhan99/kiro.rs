@@ -83,10 +83,7 @@ pub fn catalog_tools(total: usize) -> Vec<Tool> {
 
 /// 执行目录列举。
 pub fn list(tools: &[Tool], input: &Value) -> Result<Value> {
-    let offset = input
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let limit = input
         .get("limit")
         .and_then(Value::as_u64)

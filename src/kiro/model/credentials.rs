@@ -165,7 +165,11 @@ fn validate_metadata_field_css(key: &str, field: &serde_json::Value) -> anyhow::
         "animation",
         "transition",
     ];
-    for declaration in css.split(';').map(str::trim).filter(|item| !item.is_empty()) {
+    for declaration in css
+        .split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         let (property, value) = declaration
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("metadata.{} 的 x-css 声明格式不正确", key))?;
@@ -186,11 +190,7 @@ fn validate_metadata_field_css(key: &str, field: &serde_json::Value) -> anyhow::
             anyhow::bail!("metadata.{} 的 x-css 属性名不正确", key);
         }
         if BLOCKED_PROPERTIES.contains(&property.as_str()) {
-            anyhow::bail!(
-                "metadata.{} 的 x-css 不允许使用布局属性 {}",
-                key,
-                property
-            );
+            anyhow::bail!("metadata.{} 的 x-css 不允许使用布局属性 {}", key, property);
         }
     }
     Ok(())
@@ -230,9 +230,7 @@ pub fn validate_credential_metadata_schema(schema: &serde_json::Value) -> anyhow
         .flatten()
         .filter_map(|item| item.get("const").and_then(|v| v.as_str()))
         .collect();
-    if type_values.len() != 2
-        || !type_values.contains(&"normal")
-        || !type_values.contains(&"boom")
+    if type_values.len() != 2 || !type_values.contains(&"normal") || !type_values.contains(&"boom")
     {
         anyhow::bail!("metadata.type 只能描述 normal 和 boom 两个可选值");
     }
@@ -257,9 +255,7 @@ pub fn validate_credential_metadata_schema(schema: &serde_json::Value) -> anyhow
         || !sale_status_values.contains(&"for_sale")
         || !sale_status_values.contains(&"sold")
     {
-        anyhow::bail!(
-            "metadata.saleStatus 只能描述 not_for_sale、for_sale 和 sold 三个可选值"
-        );
+        anyhow::bail!("metadata.saleStatus 只能描述 not_for_sale、for_sale 和 sold 三个可选值");
     }
     let sale_price_field = properties
         .get("salePrice")
@@ -343,7 +339,10 @@ pub fn validate_credential_metadata_schema(schema: &serde_json::Value) -> anyhow
                 }
             }
             if let Some(default) = field.get("default") {
-                if !options.iter().any(|option| option.get("const") == Some(default)) {
+                if !options
+                    .iter()
+                    .any(|option| option.get("const") == Some(default))
+                {
                     anyhow::bail!("metadata.{} 的默认值不在 oneOf 中", key);
                 }
             }
@@ -359,7 +358,9 @@ pub fn validate_credential_metadata(
 ) -> anyhow::Result<()> {
     validate_credential_metadata_schema(schema)?;
     let value = serde_json::to_value(metadata)?;
-    let values = value.as_object().expect("CredentialMetadata 必须序列化为对象");
+    let values = value
+        .as_object()
+        .expect("CredentialMetadata 必须序列化为对象");
     let properties = schema["properties"]
         .as_object()
         .expect("schema 已完成 properties 校验");
@@ -371,7 +372,9 @@ pub fn validate_credential_metadata(
         }
     }
     for (key, field) in properties {
-        let Some(actual) = values.get(key) else { continue };
+        let Some(actual) = values.get(key) else {
+            continue;
+        };
         let valid_type = match field.get("type").and_then(|v| v.as_str()) {
             Some("string") => actual.is_string(),
             Some("number") => actual.is_number(),
@@ -383,10 +386,7 @@ pub fn validate_credential_metadata(
             anyhow::bail!("metadata.{} 的值类型不符合 schema", key);
         }
         if let Some(minimum) = field.get("minimum").and_then(|value| value.as_f64()) {
-            if actual
-                .as_f64()
-                .is_some_and(|value| value < minimum)
-            {
+            if actual.as_f64().is_some_and(|value| value < minimum) {
                 anyhow::bail!("metadata.{} 的值不能小于 {}", key, minimum);
             }
         }
@@ -1115,11 +1115,13 @@ mod tests {
             normalized["properties"]["supplier"]["x-css"],
             "color: #b45309"
         );
-        assert!(normalized["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "saleStatus"));
+        assert!(
+            normalized["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "saleStatus")
+        );
         assert!(validate_credential_metadata_schema(&normalized).is_ok());
     }
 
@@ -1141,7 +1143,9 @@ mod tests {
     #[test]
     fn test_metadata_values_are_validated_by_schema() {
         let mut metadata = CredentialMetadata::default();
-        metadata.extra.insert("score".to_string(), serde_json::json!(3));
+        metadata
+            .extra
+            .insert("score".to_string(), serde_json::json!(3));
         let mut schema = credential_metadata_schema();
         schema["properties"]["score"] = serde_json::json!({
             "title": "评分",
@@ -1149,7 +1153,9 @@ mod tests {
         });
         assert!(validate_credential_metadata(&metadata, &schema).is_ok());
 
-        metadata.extra.insert("score".to_string(), serde_json::json!("3"));
+        metadata
+            .extra
+            .insert("score".to_string(), serde_json::json!("3"));
         assert!(validate_credential_metadata(&metadata, &schema).is_err());
 
         metadata.extra.remove("score");

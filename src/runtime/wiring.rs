@@ -166,7 +166,7 @@ pub fn startup_banner_lines(
             String::new(),
             format!("      {token}"),
             String::new(),
-                format!("  打开 http://{reachable}/admin ，粘贴它并设置你自己的密码。"),
+            format!("  打开 http://{reachable}/admin ，粘贴它并设置你自己的密码。"),
             "  口令只存在于内存，重启即换；设置完成后立即失效。".to_string(),
             rule,
         ]);
@@ -190,11 +190,7 @@ fn reachable_address(addr: SocketAddr) -> String {
 }
 
 /// 启动后把横幅打到日志里。
-pub fn log_startup_banner(
-    addr: SocketAddr,
-    data_dir: &std::path::Path,
-    setup_token: Option<&str>,
-) {
+pub fn log_startup_banner(addr: SocketAddr, data_dir: &std::path::Path, setup_token: Option<&str>) {
     for line in startup_banner_lines(addr, data_dir, setup_token) {
         tracing::info!("{line}");
     }

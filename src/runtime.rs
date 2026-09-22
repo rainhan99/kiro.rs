@@ -21,8 +21,8 @@ pub(crate) use foundation::{Foundation, foundation};
 // 桌面应用用它生成自己的默认配置——同一份实现，避免默认值与权限策略漂移。
 pub use foundation::ensure_config_files_with_host;
 pub use keys::{key_report_lines, run_show_keys};
-pub use wiring::{log_startup_banner, startup_banner_lines};
 use wiring::wiring;
+pub use wiring::{log_startup_banner, startup_banner_lines};
 
 /// 库入口的启动参数。字段公开，调用方直接构造。
 pub struct Options {
@@ -76,7 +76,6 @@ impl RunningServer {
     pub fn setup_token(&self) -> Option<&str> {
         self.setup_token.as_deref()
     }
-
 
     /// 优雅关停：停止收新连接，等在飞请求走完。
     ///
@@ -144,7 +143,11 @@ async fn bind_with_fallback(spec: SocketAddr) -> anyhow::Result<tokio::net::TcpL
             let listener = tokio::net::TcpListener::bind(fallback)
                 .await
                 .map_err(|e2| anyhow::anyhow!("端口 {} 被占用，回退也失败: {e2}", spec.port()))?;
-            tracing::warn!("端口 {} 已被占用，改用 {}", spec.port(), listener.local_addr()?);
+            tracing::warn!(
+                "端口 {} 已被占用，改用 {}",
+                spec.port(),
+                listener.local_addr()?
+            );
             Ok(listener)
         }
         Err(e) => Err(anyhow::anyhow!("监听 {spec} 失败: {e}")),

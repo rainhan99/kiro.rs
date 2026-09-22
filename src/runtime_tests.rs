@@ -204,7 +204,10 @@ async fn a_credential_pointing_at_an_unknown_endpoint_returns_an_error() {
         .await
         .expect_err("必须返回错误");
     let text = format!("{err:#}");
-    assert!(text.contains("made-up"), "错误要点名是哪个端点，实际: {text}");
+    assert!(
+        text.contains("made-up"),
+        "错误要点名是哪个端点，实际: {text}"
+    );
     assert!(text.contains("未知端点"), "实际: {text}");
 }
 
@@ -344,7 +347,10 @@ async fn self_update_is_refused_with_an_explanation_when_disabled() {
             "{path} 在禁用时要明确拒绝，不能静默成功或 500"
         );
         let text = resp.text().await.unwrap();
-        assert!(text.contains("桌面版"), "{path} 要说清为什么被拒，实际: {text}");
+        assert!(
+            text.contains("桌面版"),
+            "{path} 要说清为什么被拒，实际: {text}"
+        );
     }
 
     server.shutdown().await.unwrap();
@@ -414,8 +420,8 @@ async fn the_auto_update_scheduler_does_not_start_when_self_update_is_disabled()
     let base = crate::runtime::foundation(&options).unwrap();
 
     // 开关只有一处，手动端点与调度器都查它。这里直接问那一处。
-    let service = crate::admin::AdminService::new(base.token_manager.clone(), vec![])
-        .with_self_update(false);
+    let service =
+        crate::admin::AdminService::new(base.token_manager.clone(), vec![]).with_self_update(false);
     assert!(
         !std::sync::Arc::new(service).start_auto_update_scheduler(),
         "禁用自更新时调度器不得启动"
@@ -637,7 +643,8 @@ fn a_freshly_generated_config_has_no_admin_key_to_claim() {
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     assert!(
-        raw.get("adminApiKey").is_none_or(|v| v.as_str().is_none_or(str::is_empty)),
+        raw.get("adminApiKey")
+            .is_none_or(|v| v.as_str().is_none_or(str::is_empty)),
         "新配置不该自带管理密钥，实际: {raw}"
     );
     assert!(
@@ -666,7 +673,10 @@ async fn the_setup_token_never_touches_the_disk() {
     std::fs::write(&config, raw.to_string()).unwrap();
 
     let server = serve(Options::new(&config, &creds)).await.unwrap();
-    let token = server.setup_token().expect("未初始化时必须有 token").to_string();
+    let token = server
+        .setup_token()
+        .expect("未初始化时必须有 token")
+        .to_string();
     server.shutdown().await.unwrap();
 
     for entry in std::fs::read_dir(dir.path()).unwrap() {
@@ -696,7 +706,10 @@ fn an_uninitialized_instance_shows_the_setup_token_prominently() {
     );
     let joined = lines.join("\n");
 
-    assert!(joined.contains("TOKENTOKEN"), "token 要打出来，实际:\n{joined}");
+    assert!(
+        joined.contains("TOKENTOKEN"),
+        "token 要打出来，实际:\n{joined}"
+    );
     assert!(
         joined.contains("初始化"),
         "要说清这串东西是干什么用的，实际:\n{joined}"
@@ -706,7 +719,9 @@ fn an_uninitialized_instance_shows_the_setup_token_prominently() {
         "要说清拿它去哪儿用，实际:\n{joined}"
     );
     assert!(
-        joined.lines().any(|l| l.contains("━") || l.contains("=====")),
+        joined
+            .lines()
+            .any(|l| l.contains("━") || l.contains("=====")),
         "要有分隔线，否则夹在 INFO 流里扫不出来，实际:\n{joined}"
     );
 }
@@ -821,15 +836,13 @@ async fn the_setup_status_is_readable_without_a_key_and_says_only_that() {
     let dir = tempfile::tempdir().unwrap();
     let server = uninitialized_server(dir.path()).await;
 
-    let body: serde_json::Value = reqwest::get(format!(
-        "http://{}/api/admin/setup/status",
-        server.addr()
-    ))
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
+    let body: serde_json::Value =
+        reqwest::get(format!("http://{}/api/admin/setup/status", server.addr()))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
 
     assert_eq!(body["initialized"], serde_json::json!(false));
     // 只回一个布尔。任何多余的字段都是在给未认证的人送情报。
@@ -1001,7 +1014,10 @@ async fn an_unset_admin_key_authenticates_nobody_not_even_an_empty_one() {
             .await
             .unwrap()
             .status();
-        assert_eq!(status, 401, "空密钥状态下 x-api-key: {presented:?} 被放行了");
+        assert_eq!(
+            status, 401,
+            "空密钥状态下 x-api-key: {presented:?} 被放行了"
+        );
     }
 
     // Bearer 那条路同理

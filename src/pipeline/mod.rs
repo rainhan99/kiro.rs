@@ -1,9 +1,9 @@
 //! Configurable request preparation and final-wire inspection. No upstream probes.
 pub mod artifacts;
 pub mod calibration;
+pub mod capture;
 pub mod chunked_map;
 pub mod config;
-pub mod capture;
 pub mod expressible;
 pub mod images;
 pub mod inspect;
@@ -850,4 +850,3 @@ pub fn measure_wire(body: &str) -> anyhow::Result<WireMetrics> {
 
 #[cfg(test)]
 mod tests;
-

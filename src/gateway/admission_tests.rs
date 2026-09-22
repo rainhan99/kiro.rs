@@ -70,7 +70,10 @@ fn policy(unit: BillingUnit, limit: Option<&str>, enforcement: BudgetEnforcement
 }
 
 /// 建一个带 (积分路, 人民币路) 两条备选的计划。
-fn plan_with(bindings: Vec<ModelBinding>, upstreams: Vec<Upstream>) -> (GatewayService, RequestPlan, PathBuf, PathBuf) {
+fn plan_with(
+    bindings: Vec<ModelBinding>,
+    upstreams: Vec<Upstream>,
+) -> (GatewayService, RequestPlan, PathBuf, PathBuf) {
     let config_path = temp("config.json");
     let ledger_path = temp("billing.db");
     let config = GatewayConfig {
@@ -90,18 +93,11 @@ fn plan_with(bindings: Vec<ModelBinding>, upstreams: Vec<Upstream>) -> (GatewayS
     (service, plan, config_path, ledger_path)
 }
 
-fn verdicts(
-    ledger: &Ledger,
-    key: u64,
-    plan: &RequestPlan,
-) -> Vec<(String, CandidateVerdict)> {
+fn verdicts(ledger: &Ledger, key: u64, plan: &RequestPlan) -> Vec<(String, CandidateVerdict)> {
     evaluate(ledger, key, plan, &plan.candidates).unwrap()
 }
 
-fn verdict_for<'a>(
-    list: &'a [(String, CandidateVerdict)],
-    id: &str,
-) -> &'a CandidateVerdict {
+fn verdict_for<'a>(list: &'a [(String, CandidateVerdict)], id: &str) -> &'a CandidateVerdict {
     &list.iter().find(|(b, _)| b == id).unwrap().1
 }
 
@@ -123,10 +119,16 @@ fn an_exhausted_credit_account_does_not_block_a_funded_money_route() {
 
     // 积分账户额度为 0（耗尽），人民币账户有额度且为软策略。
     ledger
-        .set_account(7, policy(BillingUnit::KiroCredit, Some("0"), BudgetEnforcement::Soft))
+        .set_account(
+            7,
+            policy(BillingUnit::KiroCredit, Some("0"), BudgetEnforcement::Soft),
+        )
         .unwrap();
     ledger
-        .set_account(7, policy(BillingUnit::Cny, Some("100"), BudgetEnforcement::Soft))
+        .set_account(
+            7,
+            policy(BillingUnit::Cny, Some("100"), BudgetEnforcement::Soft),
+        )
         .unwrap();
 
     let list = verdicts(ledger, 7, &plan);
@@ -159,7 +161,10 @@ fn a_credit_only_key_cannot_reach_a_money_route() {
     );
     let ledger = service.ledger().unwrap();
     ledger
-        .set_account(7, policy(BillingUnit::KiroCredit, Some("50"), BudgetEnforcement::Soft))
+        .set_account(
+            7,
+            policy(BillingUnit::KiroCredit, Some("50"), BudgetEnforcement::Soft),
+        )
         .unwrap();
 
     let list = verdicts(ledger, 7, &plan);
@@ -187,7 +192,10 @@ fn a_hard_account_gets_a_bound_derived_from_declared_maxima() {
     );
     let ledger = service.ledger().unwrap();
     ledger
-        .set_account(7, policy(BillingUnit::Cny, Some("1000000"), BudgetEnforcement::Hard))
+        .set_account(
+            7,
+            policy(BillingUnit::Cny, Some("1000000"), BudgetEnforcement::Hard),
+        )
         .unwrap();
 
     let list = verdicts(ledger, 7, &plan);
@@ -238,7 +246,10 @@ fn a_soft_account_may_proceed_without_a_bound() {
     );
     let ledger = service.ledger().unwrap();
     ledger
-        .set_account(7, policy(BillingUnit::KiroCredit, None, BudgetEnforcement::Soft))
+        .set_account(
+            7,
+            policy(BillingUnit::KiroCredit, None, BudgetEnforcement::Soft),
+        )
         .unwrap();
     let list = verdicts(ledger, 7, &plan);
     let CandidateVerdict::Eligible(admission) = verdict_for(&list, "credit") else {
@@ -269,7 +280,10 @@ fn an_account_authorization_list_is_enforced_per_route() {
     ledger.set_account(7, restricted).unwrap();
 
     let list = verdicts(ledger, 7, &plan);
-    assert!(matches!(verdict_for(&list, "a"), CandidateVerdict::Eligible(_)));
+    assert!(matches!(
+        verdict_for(&list, "a"),
+        CandidateVerdict::Eligible(_)
+    ));
     assert_eq!(
         verdict_for(&list, "b"),
         &CandidateVerdict::Refused(Refusal::NotAuthorized {

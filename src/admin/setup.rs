@@ -66,10 +66,7 @@ impl SetupState {
             // 已初始化。即使 token 正确也不能再用——这里根本没有 token 了。
             return false;
         };
-        let matches: bool = expected
-            .as_bytes()
-            .ct_eq(presented.as_bytes())
-            .into();
+        let matches: bool = expected.as_bytes().ct_eq(presented.as_bytes()).into();
         if matches {
             *guard = None;
         }

@@ -70,13 +70,13 @@ pub fn harden(path: &Path) -> std::io::Result<()> {
 /// 这张表是**唯一**的真相源：`harden_data_dir` 按它扫，
 /// `runtime_tests` 的守卫也按它查。新增一个秘密文件只要加进这里。
 pub const SECRET_FILES: &[&str] = &[
-    "config.json",            // apiKey / adminApiKey
-    "credentials.json",       // Kiro 刷新令牌
-    "client_api_keys.json",   // 明文 sk-… 客户端 Key
-    "groups.json",            // 分组本身不是秘密，但同一套规矩
-    "gateway.json",           // 上游 API Key
-    "billing.db",             // 账本
-    "traces.db",              // 请求链路
+    "config.json",          // apiKey / adminApiKey
+    "credentials.json",     // Kiro 刷新令牌
+    "client_api_keys.json", // 明文 sk-… 客户端 Key
+    "groups.json",          // 分组本身不是秘密，但同一套规矩
+    "gateway.json",         // 上游 API Key
+    "billing.db",           // 账本
+    "traces.db",            // 请求链路
     "kiro_balance_cache.json",
     "proxy_pool.json",
     "cache_metering.json",

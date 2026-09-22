@@ -5,16 +5,13 @@ use super::*;
 /// 而真相只是「再等两秒」。
 #[test]
 fn the_window_starts_on_the_bundled_waiting_page() {
-    let conf: serde_json::Value =
-        serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json 要是合法 JSON");
+    let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+        .expect("tauri.conf.json 要是合法 JSON");
     let url = conf["app"]["windows"][0]["url"]
         .as_str()
         .expect("窗口要有初始 URL");
     assert_eq!(url, "waiting.html");
-    assert!(
-        !url.starts_with("http"),
-        "初始 URL 不能指向尚未监听的服务"
-    );
+    assert!(!url.starts_with("http"), "初始 URL 不能指向尚未监听的服务");
 }
 
 #[test]
@@ -37,8 +34,7 @@ fn the_target_url_follows_the_actual_port() {
 
 #[test]
 fn the_bundle_targets_cover_both_platforms() {
-    let conf: serde_json::Value =
-        serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+    let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
     let targets: Vec<&str> = conf["bundle"]["targets"]
         .as_array()
         .expect("bundle.targets 要是数组")
@@ -85,7 +81,10 @@ fn the_injected_script_escapes_its_payload() {
 #[test]
 fn nothing_is_injected_once_the_instance_is_claimed() {
     assert!(setup_token_script_for(None).is_none());
-    assert!(setup_token_script_for(Some("   ")).is_none(), "空白串等同没有");
+    assert!(
+        setup_token_script_for(Some("   ")).is_none(),
+        "空白串等同没有"
+    );
     assert!(setup_token_script_for(Some("TOKEN123")).is_some());
 }
 

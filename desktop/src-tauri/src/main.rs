@@ -1,6 +1,9 @@
 // Windows 上不要在启动 GUI 时弹一个控制台窗口。debug 构建保留控制台，
 // 否则开发时看不到日志。
-#![cfg_attr(not(debug_assertions), cfg_attr(windows, windows_subsystem = "windows"))]
+#![cfg_attr(
+    not(debug_assertions),
+    cfg_attr(windows, windows_subsystem = "windows")
+)]
 
 use std::sync::Mutex;
 

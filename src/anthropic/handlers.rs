@@ -808,7 +808,13 @@ pub async fn get_models(
     let managed: Vec<Model> = state
         .gateway
         .as_ref()
-        .map(|entry| entry.public_models().into_iter().map(gateway_model).collect())
+        .map(|entry| {
+            entry
+                .public_models()
+                .into_iter()
+                .map(gateway_model)
+                .collect()
+        })
         .unwrap_or_default();
 
     let Some(provider) = &state.kiro_provider else {
@@ -1114,10 +1120,9 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -1301,7 +1306,9 @@ fn take_tool_catalog(
     }
     let declared = payload.tools.as_ref()?;
     if declared.is_empty()
-        || declared.iter().any(|tool| tool_catalog::is_catalog_tool(&tool.name))
+        || declared
+            .iter()
+            .any(|tool| tool_catalog::is_catalog_tool(&tool.name))
         || !tool_catalog::should_paginate(declared, config.tool_catalog.budget_bytes)
     {
         return None;
@@ -1364,11 +1371,11 @@ async fn handle_stream_request(
                 );
                 provider
                     .call_api_stream(
-                    corrected,
-                    Some(tracer.as_ref()),
-                    routing.group.as_deref(),
-                    routing.sticky,
-                )
+                        corrected,
+                        Some(tracer.as_ref()),
+                        routing.group.as_deref(),
+                        routing.sticky,
+                    )
                     .await
             }
             None => Err(first_error),
@@ -1783,11 +1790,11 @@ pub(crate) async fn execute_non_stream_request(
                 );
                 provider
                     .call_api(
-                    corrected,
-                    Some(tracer.as_ref()),
-                    routing.group.as_deref(),
-                    routing.sticky,
-                )
+                        corrected,
+                        Some(tracer.as_ref()),
+                        routing.group.as_deref(),
+                        routing.sticky,
+                    )
                     .await
             }
             None => Err(first_error),
@@ -2421,10 +2428,9 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -3004,7 +3010,10 @@ mod tests {
         MessagesRequest {
             model: "claude-sonnet-4.5".into(),
             max_tokens: 64,
-            messages: vec![Message { role: "user".into(), content: serde_json::json!("hi") }],
+            messages: vec![Message {
+                role: "user".into(),
+                content: serde_json::json!("hi"),
+            }],
             stream: false,
             system: None,
             tools: Some(tools),
@@ -3027,8 +3036,8 @@ mod tests {
     #[test]
     fn oversized_tool_declarations_become_a_catalog_without_losing_any_tool() {
         let mut payload = request_with_tools(50);
-        let session = take_tool_catalog(&mut payload, &on_demand_config(4096))
-            .expect("超预算应启用按需发现");
+        let session =
+            take_tool_catalog(&mut payload, &on_demand_config(4096)).expect("超预算应启用按需发现");
         assert_eq!(session.total(), 50, "全部工具仍在会话中，未被丢弃");
         let sent = payload.tools.as_ref().unwrap();
         assert_eq!(sent.len(), 2, "本轮只声明两个目录工具");
@@ -3044,8 +3053,11 @@ mod tests {
         let mut payload = request_with_tools(50);
         let before = serde_json::to_value(&payload.tools).unwrap();
         assert!(
-            take_tool_catalog(&mut payload, &crate::pipeline::config::PipelineConfig::default())
-                .is_none()
+            take_tool_catalog(
+                &mut payload,
+                &crate::pipeline::config::PipelineConfig::default()
+            )
+            .is_none()
         );
         assert_eq!(
             serde_json::to_value(&payload.tools).unwrap(),
@@ -3101,7 +3113,8 @@ mod tests {
     }
 
     fn rejection(body: &str) -> anyhow::Error {
-        crate::kiro::error::UpstreamRequestError::api("非流式", StatusCode::BAD_REQUEST, body).into()
+        crate::kiro::error::UpstreamRequestError::api("非流式", StatusCode::BAD_REQUEST, body)
+            .into()
     }
 
     const LENGTH_REJECTION: &str = r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;

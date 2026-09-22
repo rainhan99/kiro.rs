@@ -166,8 +166,14 @@ mod tests {
     #[test]
     fn the_result_states_the_cost_next_to_the_data() {
         let chunks = vec![
-            ChunkOutput { range: (0, 10), output: "first".into() },
-            ChunkOutput { range: (10, 18), output: "second".into() },
+            ChunkOutput {
+                range: (0, 10),
+                output: "first".into(),
+            },
+            ChunkOutput {
+                range: (10, 18),
+                output: "second".into(),
+            },
         ];
         let value = build_result(&"a".repeat(64), 18, &chunks);
         assert_eq!(value["chunk_count"], 2);
@@ -181,7 +187,10 @@ mod tests {
     fn the_tool_description_declares_it_is_not_lossless() {
         let tool = map_tool(32_768, 8);
         assert!(tool.description.contains("NOT LOSSLESS"));
-        assert!(tool.description.contains("no round sees more than one chunk"));
+        assert!(
+            tool.description
+                .contains("no round sees more than one chunk")
+        );
         assert!(
             tool.description.contains("kiro_context_read"),
             "必须指出存在无损替代路径"
@@ -191,7 +200,14 @@ mod tests {
     /// 每块请求只带这一块原文，且不带工具——它是一次受限的从属调用。
     #[test]
     fn chunk_request_carries_only_its_own_excerpt() {
-        let request = chunk_request("claude-sonnet-4", "列出人名", (10, 20), 100, "仅此一块", 512);
+        let request = chunk_request(
+            "claude-sonnet-4",
+            "列出人名",
+            (10, 20),
+            100,
+            "仅此一块",
+            512,
+        );
         assert_eq!(request.model, "claude-sonnet-4");
         assert!(request.tools.is_none());
         assert!(!request.stream);

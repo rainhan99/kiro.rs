@@ -18,7 +18,10 @@ fn both_keys_and_the_location_are_reported() {
     assert!(text.contains("sk-kiro-rs-abc"));
     assert!(text.contains("sk-admin-xyz"));
     assert!(text.contains("/data/kiro"));
-    assert!(text.contains("/data/kiro/config.json"), "要指出配置文件本身");
+    assert!(
+        text.contains("/data/kiro/config.json"),
+        "要指出配置文件本身"
+    );
 }
 
 /// 缺失要说「未配置」，不能打一个空值让人以为程序坏了。

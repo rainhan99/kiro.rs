@@ -16,9 +16,10 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    CredentialMetadata, KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
-    normalize_import_auth_method, validate_credential_metadata,
-    validate_credential_metadata_schema, validate_external_idp_endpoint,
+    CredentialMetadata, KiroCredentials, credential_metadata_schema,
+    normalize_credential_metadata_schema, normalize_import_auth_method,
+    validate_credential_metadata, validate_credential_metadata_schema,
+    validate_external_idp_endpoint,
 };
 use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
 use crate::kiro::model::requests::conversation::{
@@ -36,24 +37,21 @@ use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
-    AddCredentialResponse, AssignProxyRequest,
-    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
-    CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
-    EnableOverageAllResult, ExportedAccount,
-    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    CredentialMetadataSchemaConfig,
-    CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
-    SessionAffinityConfigResponse, SetSessionAffinityConfigRequest,
-    LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
-    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
-    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    AddCredentialResponse, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    CacheMeteringConfigResponse, CheckRateLimitRequest, CredentialMetadataDetail,
+    CredentialMetadataSchemaConfig, CredentialStatusItem, CredentialsExportResponse,
+    CredentialsStatusResponse, CustomModelItem, CustomModelsConfigResponse, EnableOverageAllResult,
+    ExportedAccount, ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest,
+    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
+    SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
+    SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetSelfHealConfigRequest,
+    SetSessionAffinityConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
+    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -92,9 +90,10 @@ fn credential_metadata_details(
     keys.into_iter()
         .filter_map(|key| {
             let field = properties.and_then(|fields| fields.get(&key));
-            let value = values.get(&key).cloned().or_else(|| {
-                field.and_then(|schema_field| schema_field.get("default").cloned())
-            })?;
+            let value = values
+                .get(&key)
+                .cloned()
+                .or_else(|| field.and_then(|schema_field| schema_field.get("default").cloned()))?;
             let title = field
                 .and_then(|schema_field| schema_field.get("title"))
                 .and_then(serde_json::Value::as_str)
@@ -653,26 +652,23 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
-        let credential_metadata_schema = match token_manager
-            .config()
-            .credential_metadata_schema
-            .clone()
-        {
-            Some(schema) => {
-                let schema = normalize_credential_metadata_schema(schema);
-                match validate_credential_metadata_schema(&schema) {
-                    Ok(()) => schema,
-                    Err(error) => {
-                        tracing::warn!(
-                            "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
-                            error
-                        );
-                        credential_metadata_schema()
+        let credential_metadata_schema =
+            match token_manager.config().credential_metadata_schema.clone() {
+                Some(schema) => {
+                    let schema = normalize_credential_metadata_schema(schema);
+                    match validate_credential_metadata_schema(&schema) {
+                        Ok(()) => schema,
+                        Err(error) => {
+                            tracing::warn!(
+                                "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
+                                error
+                            );
+                            credential_metadata_schema()
+                        }
                     }
                 }
-            }
-            None => credential_metadata_schema(),
-        };
+                None => credential_metadata_schema(),
+            };
 
         let svc = Self {
             token_manager,
@@ -1769,10 +1765,14 @@ impl AdminService {
                     i + 1,
                 )));
             }
-            if backend_id.is_empty() || backend_id.len() > 256 || backend_id.chars().any(char::is_control) {
+            if backend_id.is_empty()
+                || backend_id.len() > 256
+                || backend_id.chars().any(char::is_control)
+            {
                 return Err(AdminServiceError::InvalidCredential(format!(
                     "第 {} 条模型（{}）的 backend_id 必须是 1-256 个非控制字符",
-                    i + 1, id,
+                    i + 1,
+                    id,
                 )));
             }
             if let Some(value) = m.context_window {
@@ -1883,9 +1883,7 @@ impl AdminService {
 
     /// 自更新被禁用时的统一拒绝。措辞一处，三个端点共用。
     pub fn self_update_refusal(&self) -> AdminServiceError {
-        AdminServiceError::Unavailable(
-            "桌面版通过应用更新，代理不自行替换可执行文件".to_string(),
-        )
+        AdminServiceError::Unavailable("桌面版通过应用更新，代理不自行替换可执行文件".to_string())
     }
 
     pub fn get_update_config(&self) -> UpdateConfigResponse {
@@ -2041,10 +2039,7 @@ impl AdminService {
 
         Ok(ImageUpdateResponse {
             success: true,
-            message: format!(
-                "已替换为 v{}，进程将在 2 秒后用新二进制重启自己",
-                version
-            ),
+            message: format!("已替换为 v{}，进程将在 2 秒后用新二进制重启自己", version),
             output: Some(format!(
                 "previous: v{}\n{}: v{}",
                 previous_version,
@@ -3073,7 +3068,16 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
+                .update_credential(
+                    *cred_id,
+                    None,
+                    Some(Some(url)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .is_ok()
             {
                 assigned += 1;

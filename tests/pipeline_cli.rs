@@ -173,8 +173,14 @@ fn show_keys_prints_both_keys_and_the_data_directory_offline() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
-    assert!(stdout.contains("sk-kiro-rs-forshow"), "要给出客户端 Key，实际: {stdout}");
-    assert!(stdout.contains("sk-admin-forshow"), "要给出管理密钥，实际: {stdout}");
+    assert!(
+        stdout.contains("sk-kiro-rs-forshow"),
+        "要给出客户端 Key，实际: {stdout}"
+    );
+    assert!(
+        stdout.contains("sk-admin-forshow"),
+        "要给出管理密钥，实际: {stdout}"
+    );
     assert!(
         stdout.contains(&dir.display().to_string()),
         "要说清数据目录在哪，实际: {stdout}"

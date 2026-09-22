@@ -530,7 +530,11 @@ impl TraceStore {
                 samples: samples.max(0) as u64,
                 min_window_tokens: row.get::<_, i64>(3)?.max(0) as u64,
                 max_window_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                mean_window_tokens: if samples > 0 { (sum / samples).max(0) as u64 } else { 0 },
+                mean_window_tokens: if samples > 0 {
+                    (sum / samples).max(0) as u64
+                } else {
+                    0
+                },
                 last_seen: row.get(6)?,
             })
         })?;
@@ -1071,7 +1075,9 @@ mod tests {
         assert!(store.calibration_aggregates().unwrap().is_empty());
 
         for window in [180_000_u64, 200_000, 220_000] {
-            store.record_calibration_sample(&calibration_sample(window)).unwrap();
+            store
+                .record_calibration_sample(&calibration_sample(window))
+                .unwrap();
         }
         let aggregates = store.calibration_aggregates().unwrap();
         assert_eq!(aggregates.len(), 1);
@@ -1088,7 +1094,9 @@ mod tests {
     #[test]
     fn calibration_is_scoped_per_model_and_endpoint() {
         let store = TraceStore::open_in_memory().unwrap();
-        store.record_calibration_sample(&calibration_sample(200_000)).unwrap();
+        store
+            .record_calibration_sample(&calibration_sample(200_000))
+            .unwrap();
         let mut other = calibration_sample(1_000_000);
         other.model = "claude-opus-4.8".into();
         store.record_calibration_sample(&other).unwrap();

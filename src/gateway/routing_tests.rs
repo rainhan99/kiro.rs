@@ -32,7 +32,12 @@ fn engine() -> RoutingEngine {
 
 fn pick(engine: &RoutingEngine, c: &[Candidate], ticket: u64) -> String {
     engine
-        .select(&ctx(Some(SESSION)), c, RoutingMode::WeightedRandom, Some(ticket))
+        .select(
+            &ctx(Some(SESSION)),
+            c,
+            RoutingMode::WeightedRandom,
+            Some(ticket),
+        )
         .expect("应有候选")
         .binding_id
 }
@@ -92,9 +97,21 @@ fn a_binding_dies_on_disable_zero_weight_or_exclusion() {
     let context = ctx(Some(SESSION));
 
     for (name, mutate) in [
-        ("禁用", Box::new(|c: &mut Vec<Candidate>| c[0].enabled = false) as Box<dyn Fn(&mut Vec<Candidate>)>),
-        ("权重归零", Box::new(|c: &mut Vec<Candidate>| c[0].weight = 0)),
-        ("被调用方排除", Box::new(|c: &mut Vec<Candidate>| { c.remove(0); })),
+        (
+            "禁用",
+            Box::new(|c: &mut Vec<Candidate>| c[0].enabled = false)
+                as Box<dyn Fn(&mut Vec<Candidate>)>,
+        ),
+        (
+            "权重归零",
+            Box::new(|c: &mut Vec<Candidate>| c[0].weight = 0),
+        ),
+        (
+            "被调用方排除",
+            Box::new(|c: &mut Vec<Candidate>| {
+                c.remove(0);
+            }),
+        ),
     ] {
         let engine = engine();
         let mut c = vec![candidate("a", 0, 5), candidate("b", 0, 5)];
@@ -205,8 +222,14 @@ fn route_keys_are_scoped_and_carry_no_secret() {
     let base = ctx(Some(SESSION));
     assert!(engine.bind_success(&base, "a", engine.generation()));
 
-    let other_key = RouteContext { key_id: 7, ..base.clone() };
-    let other_model = RouteContext { public_model: "other".into(), ..base.clone() };
+    let other_key = RouteContext {
+        key_id: 7,
+        ..base.clone()
+    };
+    let other_model = RouteContext {
+        public_model: "other".into(),
+        ..base.clone()
+    };
     let other_session = RouteContext {
         session_id: Some("session-9876543210".into()),
         ..base.clone()
@@ -238,7 +261,11 @@ fn preview_has_no_side_effects() {
     let generation = engine.generation();
     for _ in 0..5 {
         let evidence = engine.preview(&context, &c, RoutingMode::WeightedRandom);
-        assert_eq!(evidence.sticky, StickyOutcome::NoBinding, "预览不得写入绑定");
+        assert_eq!(
+            evidence.sticky,
+            StickyOutcome::NoBinding,
+            "预览不得写入绑定"
+        );
     }
     assert_eq!(engine.generation(), generation, "预览不得改变代际");
     // 预览过后仍然没有绑定，说明它确实没有副作用。
@@ -296,8 +323,14 @@ fn capability_filters_report_their_own_reason() {
     c[0].supports_reasoning = false;
 
     for (need, expected) in [
-        (("tools", true, false, false), FilterReason::ToolsUnsupported),
-        (("images", false, true, false), FilterReason::ImagesUnsupported),
+        (
+            ("tools", true, false, false),
+            FilterReason::ToolsUnsupported,
+        ),
+        (
+            ("images", false, true, false),
+            FilterReason::ImagesUnsupported,
+        ),
         (
             ("reasoning", false, false, true),
             FilterReason::ReasoningUnsupported,
@@ -324,7 +357,11 @@ fn capability_filters_report_their_own_reason() {
 #[test]
 fn sticky_mode_picks_the_highest_weight_with_a_stable_tie_break() {
     let engine = engine();
-    let c = vec![candidate("b", 0, 5), candidate("a", 0, 5), candidate("c", 0, 3)];
+    let c = vec![
+        candidate("b", 0, 5),
+        candidate("a", 0, 5),
+        candidate("c", 0, 3),
+    ];
     let context = ctx(Some(SESSION));
     let first = engine
         .select(&context, &c, RoutingMode::Sticky, None)
@@ -351,10 +388,19 @@ fn no_eligible_candidate_yields_no_selection() {
     c[0].enabled = false;
     assert!(
         engine
-            .select(&ctx(Some(SESSION)), &c, RoutingMode::WeightedRandom, Some(0))
+            .select(
+                &ctx(Some(SESSION)),
+                &c,
+                RoutingMode::WeightedRandom,
+                Some(0)
+            )
             .is_none()
     );
-    assert!(engine.select(&ctx(Some(SESSION)), &[], RoutingMode::Sticky, None).is_none());
+    assert!(
+        engine
+            .select(&ctx(Some(SESSION)), &[], RoutingMode::Sticky, None)
+            .is_none()
+    );
 }
 
 /// 标记不可用应清掉所有指向它的绑定。
