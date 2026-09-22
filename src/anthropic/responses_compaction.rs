@@ -21,8 +21,8 @@ use crate::token;
 
 use super::super::converter::{ConversionPurpose, convert_request_with_purpose};
 use super::super::handlers::{
-    NonStreamExecutionError, UsageRecordHook, execute_non_stream_request, map_provider_error,
-    new_non_stream_request_tracer,
+    NonStreamExecutionError, UsageRecordHook, conversion_error_response,
+    execute_non_stream_request, map_provider_error, new_non_stream_request_tracer,
 };
 use super::super::middleware::{AppState, KeyContext};
 use super::super::openai::{
@@ -216,13 +216,7 @@ async fn run_attempt(
         &provider.pipeline().config,
         ConversionPurpose::Compact,
     )
-    .map_err(|error| {
-        AttemptError::Response(responses_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            &error.to_string(),
-        ))
-    })?;
+    .map_err(|error| AttemptError::Response(conversion_error_response(&error)))?;
     let kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: None,
@@ -751,6 +745,63 @@ pub(super) fn restored_context(summary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_conversion_failures_are_safe_before_provider_execution() {
+        use crate::kiro::{provider::KiroProvider, token_manager::MultiTokenManager};
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let endpoints = std::collections::HashMap::from([(
+            "ide".into(),
+            std::sync::Arc::new(crate::kiro::endpoint::IdeEndpoint::new())
+                as std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+        )]);
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".into());
+        let state = AppState::new(false, crate::model::config::ToolCompatibilityMode::Raw)
+            .with_shared_kiro_provider(std::sync::Arc::new(provider));
+        for (content, status, code) in [
+            (
+                json!([{"type":"PRIVATE_TYPE","text":"PRIVATE_CONTENT"}]),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "portable_history.invariant_violation",
+            ),
+            (
+                json!([{"type":"tool_result","tool_use_id":"PRIVATE_ID","content":"PRIVATE_CONTENT"}]),
+                StatusCode::BAD_REQUEST,
+                "kiro_converter.invalid_message_sequence",
+            ),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(json!({
+                "model":"claude-sonnet-4", "max_tokens":1024,
+                "messages":[{"role":"user","content":content}]
+            }))
+            .unwrap();
+            let key = KeyContext {
+                key_id: 0,
+                group: None,
+                key_source: crate::admin::trace_db::TraceKeySource::MasterApiKey,
+                client_ip: None,
+                legacy_credit_exhausted: None,
+            };
+            let response = match run_attempt(state.clone(), key, request, "claude-sonnet-4").await {
+                Err(AttemptError::Response(response)) => response,
+                _ => panic!("conversion failure must stop before provider execution"),
+            };
+            assert_eq!(response.status(), status);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["error"]["message"].as_str().unwrap().starts_with(code));
+            assert!(!body.to_string().contains("PRIVATE_"));
+        }
+    }
 
     fn convert_compact(
         request: &MessagesRequest,

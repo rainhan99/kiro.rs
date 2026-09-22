@@ -519,6 +519,45 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
+fn pipeline_prepare_error_response(error: &crate::pipeline::PipelinePrepareError) -> Response {
+    let status = error.status();
+    let error_type = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        if let crate::pipeline::PipelinePrepareError::Portable(detail) = error {
+            tracing::error!(error = %detail, "portable history preparation invariant failed");
+        }
+        "internal_error"
+    } else {
+        "invalid_request_error"
+    };
+    (
+        status,
+        Json(ErrorResponse::new(
+            error_type,
+            format!("{}: {}", error.code(), error.safe_message()),
+        )),
+    )
+        .into_response()
+}
+
+pub(super) fn conversion_error_response(error: &ConversionError) -> Response {
+    if let ConversionError::InvariantViolation(reason) = error {
+        return pipeline_prepare_error_response(&crate::pipeline::PipelinePrepareError::Portable(
+            crate::pipeline::portable_history::PortableHistoryError::InvariantViolation {
+                path: "converter".into(),
+                reason: reason.clone(),
+            },
+        ));
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            format!("{}: {}", error.code(), error.safe_message()),
+        )),
+    )
+        .into_response()
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
@@ -1015,20 +1054,7 @@ pub async fn post_messages(
                 TraceUsage::zero(),
             );
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                error.status(),
-                Json(ErrorResponse::new(
-                    if error.status() == StatusCode::INTERNAL_SERVER_ERROR {
-                        "internal_error"
-                    } else if matches!(&error, crate::pipeline::PipelinePrepareError::Portable(_)) {
-                        "invalid_request_error"
-                    } else {
-                        "pipeline_preparation_error"
-                    },
-                    format!("{}: {}", error.code(), error.safe_message()),
-                )),
-            )
-                .into_response();
+            return pipeline_prepare_error_response(&error);
         }
     };
     let context = prepared.context;
@@ -1129,28 +1155,9 @@ pub async fn post_messages(
     ) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::InvalidModel(reason) => {
-                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::InvalidMessageSequence(reason) => {
-                    ("invalid_request_error", format!("消息序列无效: {}", reason))
-                }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
-            };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return conversion_error_response(&e);
         }
     };
 
@@ -2339,20 +2346,7 @@ pub async fn post_messages_cc(
                 TraceUsage::zero(),
             );
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                error.status(),
-                Json(ErrorResponse::new(
-                    if error.status() == StatusCode::INTERNAL_SERVER_ERROR {
-                        "internal_error"
-                    } else if matches!(&error, crate::pipeline::PipelinePrepareError::Portable(_)) {
-                        "invalid_request_error"
-                    } else {
-                        "pipeline_preparation_error"
-                    },
-                    format!("{}: {}", error.code(), error.safe_message()),
-                )),
-            )
-                .into_response();
+            return pipeline_prepare_error_response(&error);
         }
     };
     let context = prepared.context;
@@ -2450,28 +2444,9 @@ pub async fn post_messages_cc(
     ) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::InvalidModel(reason) => {
-                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::InvalidMessageSequence(reason) => {
-                    ("invalid_request_error", format!("消息序列无效: {}", reason))
-                }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
-            };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return conversion_error_response(&e);
         }
     };
 
@@ -2814,6 +2789,117 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
+
+    #[tokio::test]
+    async fn preparation_error_responses_have_stable_status_codes_and_no_private_details() {
+        use crate::pipeline::{PipelinePrepareError, portable_history::PortableHistoryError};
+        let detail =
+            "PRIVATE_DETAIL https://private.invalid/path signature encrypted id fingerprint";
+        let cases = [
+            (
+                PipelinePrepareError::from(PortableHistoryError::CurrentUnexpressible {
+                    path: detail.into(),
+                    reason: detail.into(),
+                }),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "portable_history.current_unexpressible",
+            ),
+            (
+                PipelinePrepareError::from(PortableHistoryError::BudgetExceeded {
+                    actual: 100,
+                    limit: 10,
+                }),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "portable_history.budget_exceeded",
+            ),
+            (
+                PipelinePrepareError::from(PortableHistoryError::InvariantViolation {
+                    path: detail.into(),
+                    reason: detail.into(),
+                }),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "portable_history.invariant_violation",
+            ),
+            (
+                PipelinePrepareError::Other(anyhow::anyhow!(detail)),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "pipeline_preparation",
+            ),
+        ];
+        for (error, status, kind, code) in cases {
+            let response = pipeline_prepare_error_response(&error);
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], kind);
+            assert!(body["error"]["message"].as_str().unwrap().starts_with(code));
+            for private in [
+                "PRIVATE_DETAIL",
+                "https://",
+                "signature",
+                "encrypted",
+                "fingerprint",
+            ] {
+                assert!(!body.to_string().contains(private));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn converter_invariant_response_is_safe_and_internal() {
+        let response = conversion_error_response(&ConversionError::InvariantViolation(
+            "PRIVATE_DETAIL https://private.invalid/path signature encrypted id fingerprint".into(),
+        ));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "internal_error");
+        assert_eq!(
+            body["error"]["message"],
+            "portable_history.invariant_violation: portable history invariant failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn converter_client_error_responses_never_echo_diagnostics() {
+        let detail = "PRIVATE_DETAIL https://private.invalid/path tool-id signature fingerprint";
+        for (error, code) in [
+            (
+                ConversionError::InvalidModel(detail.into()),
+                "kiro_converter.invalid_model",
+            ),
+            (
+                ConversionError::EmptyMessages,
+                "kiro_converter.empty_messages",
+            ),
+            (
+                ConversionError::InvalidMessageSequence(detail.into()),
+                "kiro_converter.invalid_message_sequence",
+            ),
+            (
+                ConversionError::UnsupportedToolMapping(detail.into()),
+                "kiro_converter.unsupported_tool_mapping",
+            ),
+        ] {
+            let response = conversion_error_response(&error);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(!body.to_string().contains("PRIVATE_DETAIL"));
+            assert!(body["error"]["message"].as_str().unwrap().starts_with(code));
+        }
+    }
 
     fn test_key_context() -> KeyContext {
         KeyContext {

@@ -619,6 +619,8 @@ pub enum ConversionError {
     InvalidMessageSequence(String),
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
+    /// Normalization must remove or reject blocks that Kiro cannot represent.
+    InvariantViolation(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -632,11 +634,63 @@ impl std::fmt::Display for ConversionError {
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
             }
+            ConversionError::InvariantViolation(reason) => {
+                write!(f, "Kiro converter invariant violation: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for ConversionError {}
+
+impl ConversionError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidModel(_) => "kiro_converter.invalid_model",
+            Self::EmptyMessages => "kiro_converter.empty_messages",
+            Self::InvalidMessageSequence(_) => "kiro_converter.invalid_message_sequence",
+            Self::UnsupportedToolMapping(_) => "kiro_converter.unsupported_tool_mapping",
+            Self::InvariantViolation(_) => "portable_history.invariant_violation",
+        }
+    }
+
+    /// Client-facing messages never include diagnostic details from Display.
+    pub(crate) fn safe_message(&self) -> &'static str {
+        match self {
+            Self::InvalidModel(_) => "invalid model id",
+            Self::EmptyMessages => "message list is empty",
+            Self::InvalidMessageSequence(_) => "invalid message sequence",
+            Self::UnsupportedToolMapping(_) => "unsupported tool mapping",
+            Self::InvariantViolation(_) => "portable history invariant failed",
+        }
+    }
+}
+
+fn invariant(reason: &str) -> ConversionError {
+    ConversionError::InvariantViolation(reason.to_string())
+}
+
+/// Never include serde errors or caller-supplied type strings in invariant details.
+fn parse_content_block(item: &serde_json::Value) -> Result<ContentBlock, ConversionError> {
+    if !item.is_object() || !item.get("type").is_some_and(serde_json::Value::is_string) {
+        return Err(invariant(
+            "content block must be an object with a type string",
+        ));
+    }
+    let block: ContentBlock = serde_json::from_value(item.clone())
+        .map_err(|_| invariant("content block must be an object with a valid type and fields"))?;
+    // Option<Value> collapses explicit null into absence; null is still an invalid scalar.
+    if block.block_type == "tool_result"
+        && item.get("content").is_some_and(serde_json::Value::is_null)
+    {
+        return Err(invariant("tool_result content must be a string or array"));
+    }
+    if block.block_type == "image" && !item.get("source").is_some_and(serde_json::Value::is_object)
+    {
+        return Err(invariant("image source must be an object"));
+    }
+    Ok(block)
+}
 
 /// 从 metadata.user_id 中提取 session UUID
 ///
@@ -839,6 +893,19 @@ fn convert_request_inner(
             .iter()
             .rposition(|m| m.role == "user")
             .ok_or(ConversionError::EmptyMessages)?;
+        // Legacy prefill removal may omit supported assistant turns, but must not hide
+        // unnormalized blocks from callers that bypass pipeline preparation.
+        for message in &req.messages[last_user_idx + 1..] {
+            if message.role != "assistant" {
+                return Err(invariant("unsupported message role"));
+            }
+            convert_assistant_message(
+                message,
+                &mut HashMap::new(),
+                ToolCompatibilityMode::Raw,
+                purpose,
+            )?;
+        }
         &req.messages[..=last_user_idx]
     } else {
         &req.messages
@@ -1020,64 +1087,68 @@ fn process_message_content_dedup(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    match block.block_type.as_str() {
-                        "text" => {
-                            if let Some(text) = block.text {
-                                text_parts.push(text);
-                            }
-                        }
-                        "image" => {
-                            if let Some(source) = block.source
-                                && let Some(placeholder) =
-                                    extract_kiro_image(&source, &mut dedup, &mut images, preserve)
-                            {
-                                text_parts.push(placeholder);
-                            }
-                        }
-                        "tool_result" => {
-                            if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(
-                                    &block.content,
-                                    &mut dedup,
-                                    &mut images,
-                                    preserve,
-                                );
-                                let is_error = block.is_error.unwrap_or(false);
-
-                                // 默认 join：与改造前逐字一致的单条目形状。
-                                // 开启 lossless-chunks 且超过 chunkBytes 时才切成多条目；
-                                // 切分逐字节保留原文，不摘要、不卸载、不引用替代。
-                                let result = if tool_results_config.strategy
-                                    == crate::pipeline::config::ToolResultStrategy::LosslessChunks
-                                    && result_content.len() > tool_results_config.chunk_bytes
-                                {
-                                    ToolResult::from_parts(
-                                        &tool_use_id,
-                                        &crate::pipeline::split_lossless(
-                                            &result_content,
-                                            tool_results_config.chunk_bytes,
-                                        ),
-                                        is_error,
-                                    )
-                                } else if is_error {
-                                    ToolResult::error(&tool_use_id, result_content)
-                                } else {
-                                    ToolResult::success(&tool_use_id, result_content)
-                                };
-
-                                tool_results.push(result);
-                            }
-                        }
-                        "tool_use" => {
-                            // tool_use 在 assistant 消息中处理，这里忽略
-                        }
-                        _ => {}
+                let block = parse_content_block(item)?;
+                match block.block_type.as_str() {
+                    "text" => {
+                        text_parts.push(
+                            block
+                                .text
+                                .ok_or_else(|| invariant("text block requires text"))?,
+                        );
                     }
+                    "image" => {
+                        let source = block
+                            .source
+                            .ok_or_else(|| invariant("image block requires source"))?;
+                        if let Some(placeholder) =
+                            extract_kiro_image(&source, &mut dedup, &mut images, preserve)?
+                        {
+                            text_parts.push(placeholder);
+                        }
+                    }
+                    "tool_result" => {
+                        let tool_use_id = block
+                            .tool_use_id
+                            .ok_or_else(|| invariant("tool_result requires tool_use_id"))?;
+                        let result_content = extract_tool_result_content(
+                            &block.content,
+                            &mut dedup,
+                            &mut images,
+                            preserve,
+                        )?;
+                        let is_error = block.is_error.unwrap_or(false);
+
+                        // 默认 join：与改造前逐字一致的单条目形状。
+                        // 开启 lossless-chunks 且超过 chunkBytes 时才切成多条目；
+                        // 切分逐字节保留原文，不摘要、不卸载、不引用替代。
+                        let result = if tool_results_config.strategy
+                            == crate::pipeline::config::ToolResultStrategy::LosslessChunks
+                            && result_content.len() > tool_results_config.chunk_bytes
+                        {
+                            ToolResult::from_parts(
+                                &tool_use_id,
+                                &crate::pipeline::split_lossless(
+                                    &result_content,
+                                    tool_results_config.chunk_bytes,
+                                ),
+                                is_error,
+                            )
+                        } else if is_error {
+                            ToolResult::error(&tool_use_id, result_content)
+                        } else {
+                            ToolResult::success(&tool_use_id, result_content)
+                        };
+
+                        tool_results.push(result);
+                    }
+                    "tool_use" | "thinking" => {
+                        return Err(invariant("content block is not valid in a user message"));
+                    }
+                    _ => return Err(invariant("unhandled user content block")),
                 }
             }
         }
-        _ => {}
+        _ => return Err(invariant("user content must be a string or array")),
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
@@ -1098,17 +1169,21 @@ fn get_image_format(media_type: &str) -> Option<String> {
 ///
 /// Reuses the same conversion chain as top-level images (format validation + SHA256 dedup + resize + `from_base64`),
 /// so an image inside a tool_result is lifted into the top-level images field the same way.
-/// Returns `Some(placeholder)` when history dedup hit and the image was omitted; `None` when it was lifted or the format is unsupported.
+/// Returns `Some(placeholder)` on a history dedup hit, `None` when lifted, or an error for unsupported sources.
 fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
     preserve: bool,
-) -> Option<String> {
-    let format = get_image_format(&source.media_type)?;
+) -> Result<Option<String>, ConversionError> {
+    if source.source_type != "base64" {
+        return Err(invariant("image source must be inline base64"));
+    }
+    let format = get_image_format(&source.media_type)
+        .ok_or_else(|| invariant("unsupported image media type"))?;
     if preserve {
         images.push(KiroImage::from_base64(format, source.data.clone()));
-        return None;
+        return Ok(None);
     }
     // History dedup: an already-seen image omits its base64 and returns placeholder text
     if let Some(seen) = dedup.as_deref_mut() {
@@ -1116,7 +1191,9 @@ fn extract_kiro_image(
         hasher.update(source.data.as_bytes());
         let digest = format!("{:x}", hasher.finalize());
         if !seen.insert(digest) {
-            return Some("[image omitted: identical to an earlier screenshot]".to_string());
+            return Ok(Some(
+                "[image omitted: identical to an earlier screenshot]".to_string(),
+            ));
         }
     }
     let cfg = ResizeConfig::from_env();
@@ -1125,7 +1202,7 @@ fn extract_kiro_image(
         processed.format,
         processed.data_base64,
     ));
-    None
+    Ok(None)
 }
 
 /// 提取工具结果内容
@@ -1138,34 +1215,42 @@ fn extract_tool_result_content(
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
     preserve: bool,
-) -> String {
+) -> Result<String, ConversionError> {
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => Ok(s.clone()),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             let mut had_image = false;
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
-                } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
-                    && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
-                    && let Some(source) = block.source
-                {
-                    had_image = true;
-                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images, preserve)
-                    {
-                        parts.push(placeholder);
+                let block = parse_content_block(item)?;
+                match block.block_type.as_str() {
+                    "text" => parts.push(
+                        block
+                            .text
+                            .ok_or_else(|| invariant("tool_result text requires text"))?,
+                    ),
+                    "image" => {
+                        let source = block
+                            .source
+                            .ok_or_else(|| invariant("tool_result image requires source"))?;
+                        had_image = true;
+                        if let Some(placeholder) =
+                            extract_kiro_image(&source, dedup, images, preserve)?
+                        {
+                            parts.push(placeholder);
+                        }
                     }
+                    _ => return Err(invariant("unhandled tool_result content block")),
                 }
             }
             if parts.is_empty() && had_image {
-                "[image attached]".to_string()
+                Ok("[image attached]".to_string())
             } else {
-                parts.join("\n")
+                Ok(parts.join("\n"))
             }
         }
-        Some(v) => v.to_string(),
-        None => String::new(),
+        Some(_) => Err(invariant("tool_result content must be a string or array")),
+        None => Ok(String::new()),
     }
 }
 
@@ -1999,6 +2084,8 @@ fn build_history(
             }
             // 累积 assistant 消息（支持连续多条）
             assistant_buffer.push(msg);
+        } else {
+            return Err(invariant("unsupported message role"));
         }
     }
 
@@ -2094,40 +2181,51 @@ fn convert_assistant_message(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    match block.block_type.as_str() {
-                        "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
-                            }
-                        }
-                        "text" => {
-                            if let Some(text) = block.text {
-                                text_content.push_str(&text);
-                            }
-                        }
-                        "tool_use" => {
-                            if let (Some(id), Some(name)) = (block.id, block.name) {
-                                let input = block.input.unwrap_or(serde_json::json!({}));
-                                let (mapped_name, input) = if purpose == ConversionPurpose::Compact
-                                {
-                                    (COMPACTION_HISTORY_TOOL_NAME.to_string(), input)
-                                } else {
-                                    (
-                                        map_client_tool_name_to_kiro(&name, tool_name_map, mode),
-                                        map_tool_input_to_kiro(&name, input, mode)?,
-                                    )
-                                };
-                                tool_uses
-                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
-                            }
-                        }
-                        _ => {}
+                let block = parse_content_block(item)?;
+                match block.block_type.as_str() {
+                    "thinking" => {
+                        thinking_content.push_str(
+                            &block
+                                .thinking
+                                .ok_or_else(|| invariant("thinking block requires thinking"))?,
+                        );
                     }
+                    "text" => {
+                        text_content.push_str(
+                            &block
+                                .text
+                                .ok_or_else(|| invariant("text block requires text"))?,
+                        );
+                    }
+                    "tool_use" => {
+                        let id = block.id.ok_or_else(|| invariant("tool_use requires id"))?;
+                        let name = block
+                            .name
+                            .ok_or_else(|| invariant("tool_use requires name"))?;
+                        let input = block.input.unwrap_or(serde_json::json!({}));
+                        if !input.is_object() {
+                            return Err(invariant("tool_use input must be an object"));
+                        }
+                        let (mapped_name, input) = if purpose == ConversionPurpose::Compact {
+                            (COMPACTION_HISTORY_TOOL_NAME.to_string(), input)
+                        } else {
+                            (
+                                map_client_tool_name_to_kiro(&name, tool_name_map, mode),
+                                map_tool_input_to_kiro(&name, input, mode)?,
+                            )
+                        };
+                        tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                    }
+                    "tool_result" | "image" => {
+                        return Err(invariant(
+                            "content block is not valid in an assistant message",
+                        ));
+                    }
+                    _ => return Err(invariant("unhandled assistant content block")),
                 }
             }
         }
-        _ => {}
+        _ => return Err(invariant("assistant content must be a string or array")),
     }
 
     // 组合 thinking 和 text 内容
@@ -2203,6 +2301,174 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn converter_request(messages: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4", "max_tokens": 1024, "messages": messages
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn converter_refuses_unknown_top_level_content_instead_of_omitting_it() {
+        let request = converter_request(serde_json::json!([
+            {"role":"user","content":[{"type":"future_block","text":"MUST_NOT_VANISH"}]}
+        ]));
+        let error = convert_request(&request).unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_refuses_unknown_nested_tool_result_content() {
+        let request = converter_request(serde_json::json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+                {"type":"document","source":{"type":"text","data":"MUST_NOT_VANISH"}}
+            ]}]}
+        ]));
+        let error = convert_request(&request).unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_refuses_unknown_assistant_history_content() {
+        let request = converter_request(serde_json::json!([
+            {"role":"assistant","content":[{"type":"future_block","text":"MUST_NOT_VANISH"}]},
+            {"role":"user","content":"continue"}
+        ]));
+        let error = convert_request(&request).unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_rejects_malformed_blocks_and_role_mismatches() {
+        for (role, block) in [
+            ("user", serde_json::json!(7)),
+            ("user", serde_json::json!({"text":"PRIVATE_CONTENT"})),
+            ("user", serde_json::json!({"type":"text"})),
+            ("user", serde_json::json!({"type":"text","text":7})),
+            ("user", serde_json::json!({"type":"image"})),
+            (
+                "user",
+                serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/tiff","data":"PRIVATE_CONTENT"}}),
+            ),
+            (
+                "user",
+                serde_json::json!({"type":"image","source":{"type":"url","media_type":"image/png","data":"PRIVATE_CONTENT"}}),
+            ),
+            (
+                "user",
+                serde_json::json!({"type":"tool_result","content":"PRIVATE_CONTENT"}),
+            ),
+            (
+                "user",
+                serde_json::json!({"type":"tool_use","id":"id","name":"read","input":{}}),
+            ),
+            ("assistant", serde_json::json!({"type":"thinking"})),
+            ("assistant", serde_json::json!({"type":"text"})),
+            (
+                "assistant",
+                serde_json::json!({"type":"tool_use","name":"read","input":{}}),
+            ),
+            (
+                "assistant",
+                serde_json::json!({"type":"tool_use","id":"id","name":"read","input":7}),
+            ),
+            (
+                "assistant",
+                serde_json::json!({"type":"tool_result","tool_use_id":"id","content":"PRIVATE_CONTENT"}),
+            ),
+        ] {
+            let request = converter_request(serde_json::json!([
+                {"role":role,"content":[block]}, {"role":"user","content":"continue"}
+            ]));
+            let error = convert_request(&request).expect_err("invalid content must not be omitted");
+            assert!(matches!(error, ConversionError::InvariantViolation(_)));
+            assert!(!error.to_string().contains("PRIVATE_CONTENT"));
+        }
+    }
+
+    #[test]
+    fn converter_rejects_malformed_nested_tool_results() {
+        for content in [
+            serde_json::json!(7),
+            serde_json::json!({"text":"PRIVATE_CONTENT"}),
+            serde_json::json!([{"text":"PRIVATE_CONTENT"}]),
+            serde_json::json!([{"type":"future_block","text":"PRIVATE_CONTENT"}]),
+            serde_json::json!([{"type":"text"}]),
+            serde_json::json!([{"type":"image"}]),
+            serde_json::json!([{"type":"image","source":{"type":"base64","media_type":"image/tiff","data":"PRIVATE_CONTENT"}}]),
+        ] {
+            let request = converter_request(serde_json::json!([
+                {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":content}]}
+            ]));
+            let error =
+                convert_request(&request).expect_err("invalid nested content must not be omitted");
+            assert!(matches!(error, ConversionError::InvariantViolation(_)));
+            assert!(!error.to_string().contains("PRIVATE_CONTENT"));
+        }
+    }
+
+    #[test]
+    fn converter_rejects_invalid_message_containers_and_unknown_roles() {
+        for role in ["user", "assistant", "PRIVATE_ROLE"] {
+            for content in [
+                serde_json::json!(7),
+                serde_json::json!({"type":"text","text":"PRIVATE_CONTENT"}),
+            ] {
+                let request = converter_request(serde_json::json!([
+                    {"role":role,"content":content}, {"role":"user","content":"continue"}
+                ]));
+                let error =
+                    convert_request(&request).expect_err("invalid message must not be omitted");
+                assert!(matches!(error, ConversionError::InvariantViolation(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn converter_rejects_null_tool_result_content() {
+        let request = converter_request(serde_json::json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":null}]}
+        ]));
+        let error = convert_request(&request).unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_refuses_unknown_content_even_in_legacy_dropped_prefill() {
+        let request = converter_request(serde_json::json!([
+            {"role":"user","content":"continue"},
+            {"role":"assistant","content":[{"type":"future_block","text":"MUST_NOT_VANISH"}]}
+        ]));
+        let config = crate::pipeline::config::PipelineConfig {
+            unexpressible: crate::pipeline::expressible::UnexpressibleStrategy::Drop,
+            ..Default::default()
+        };
+        let error = convert_request_with_pipeline(&request, ToolCompatibilityMode::Raw, &config)
+            .unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_rejects_sequence_shaped_content_blocks() {
+        let request = converter_request(serde_json::json!([
+            {"role":"user","content":[["text","PRIVATE_CONTENT",null,null,null,null,null,null,null,null,null]]}
+        ]));
+        let error = convert_request(&request).unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_rejects_sequence_shaped_image_sources() {
+        let request = converter_request(serde_json::json!([
+            {"role":"user","content":[{"type":"image","source":["base64","image/png","PRIVATE_CONTENT"]}]}
+        ]));
+        let error = convert_request(&request).unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
 
     #[test]
     fn test_map_model_sonnet() {

@@ -531,28 +531,14 @@ async fn run_round(
     let conversion = match convert_request_with_pipeline(payload, tool_compatibility_mode, config) {
         Ok(c) => c,
         Err(e) => {
-            let (et, msg) = match &e {
-                ConversionError::InvalidModel(reason) => (
-                    "invalid_request_error",
-                    format!("invalid model id: {}", reason),
-                ),
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "message list is empty".to_string())
-                }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("invalid message sequence: {}", reason),
-                ),
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("unsupported tool mapping: {}", reason),
-                ),
-            };
-            let error_message = msg.clone();
+            let error_message = format!("{}: {}", e.code(), e.safe_message());
             return Err(RoundFailure {
-                response: (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg)))
-                    .into_response(),
-                error_type: outcome::BAD_REQUEST,
+                response: super::handlers::conversion_error_response(&e),
+                error_type: if matches!(&e, ConversionError::InvariantViolation(_)) {
+                    "internal_error"
+                } else {
+                    outcome::BAD_REQUEST
+                },
                 error_message,
                 credential_id: 0,
                 token_usage: None,
