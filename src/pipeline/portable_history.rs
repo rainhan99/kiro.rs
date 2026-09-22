@@ -344,11 +344,14 @@ fn normalize_block(
             action = NormalizationAction::PortableText;
         }
         "server_tool_use" | "web_search_tool_result" => {
-            return Err(PortableHistoryError::Malformed {
-                path: path.into(),
-                reason: "server history records must be consumed in an assistant block array"
-                    .into(),
-            });
+            return match scope {
+                Scope::Current => unsupported_current(scope, path),
+                Scope::History => Err(PortableHistoryError::Malformed {
+                    path: path.into(),
+                    reason: "server history records must be consumed in an assistant block array"
+                        .into(),
+                }),
+            };
         }
         _ if scope == Scope::History => {
             *block = unknown_projection(&original, &block_type);
@@ -1236,6 +1239,79 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "portable_history.malformed");
         assert!(!error.safe_message().contains("NESTED_SERVER_SENTINEL"));
+    }
+
+    #[test]
+    fn current_server_records_are_current_unexpressible_at_top_level_and_nested() {
+        let top_level = request(json!([
+            {"role":"user","content":[{"type":"server_tool_use","id":"server-1","name":"web_search","input":{}}]}
+        ]));
+        assert_eq!(
+            normalize(
+                &top_level,
+                UnexpressibleStrategy::PortableText,
+                &TestFingerprint,
+            )
+            .unwrap_err()
+            .code(),
+            "portable_history.current_unexpressible"
+        );
+
+        let nested = request(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+                {"type":"web_search_tool_result","tool_use_id":"server-1","content":"CURRENT_NESTED_SERVER_SENTINEL"}
+            ]}]}
+        ]));
+        assert_eq!(
+            normalize(
+                &nested,
+                UnexpressibleStrategy::PortableText,
+                &TestFingerprint,
+            )
+            .unwrap_err()
+            .code(),
+            "portable_history.current_unexpressible"
+        );
+    }
+
+    #[test]
+    fn historical_top_level_user_redacted_thinking_is_rejected_without_opaque_leakage() {
+        let input = request(json!([
+            {"role":"user","content":[{"type":"redacted_thinking","data":"TOP_LEVEL_OPAQUE_SENTINEL"}]},
+            {"role":"assistant","content":"previous answer"},
+            {"role":"user","content":"continue"}
+        ]));
+        let before = serde_json::to_value(&input).unwrap();
+        let error = normalize(
+            &input,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "portable_history.malformed");
+        assert!(!error.safe_message().contains("TOP_LEVEL_OPAQUE_SENTINEL"));
+        assert_eq!(serde_json::to_value(&input).unwrap(), before);
+    }
+
+    #[test]
+    fn historical_nested_user_redacted_thinking_is_rejected_without_opaque_leakage() {
+        let input = request(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+                {"type":"redacted_thinking","data":"NESTED_OPAQUE_SENTINEL"}
+            ]}]},
+            {"role":"assistant","content":"previous answer"},
+            {"role":"user","content":"continue"}
+        ]));
+        let error = normalize(
+            &input,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "portable_history.malformed");
+        assert!(!error.safe_message().contains("NESTED_OPAQUE_SENTINEL"));
     }
 
     #[test]
