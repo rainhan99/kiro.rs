@@ -274,14 +274,14 @@ fn normalize_block(
         }
         "tool_use" => {
             if role != "assistant" {
-                return unsupported_current(scope, path);
+                return invalid_block_role(scope, path);
             }
             require_string(block, "id", path, "tool_use requires an id string")?;
             require_string(block, "name", path, "tool_use requires a name string")?;
         }
         "tool_result" => {
             if role != "user" {
-                return unsupported_current(scope, path);
+                return invalid_block_role(scope, path);
             }
             require_string(
                 block,
@@ -303,7 +303,7 @@ fn normalize_block(
         }
         "thinking" => {
             if role != "assistant" {
-                return unsupported_current(scope, path);
+                return invalid_block_role(scope, path);
             }
             require_string(
                 block,
@@ -321,7 +321,7 @@ fn normalize_block(
         }
         "redacted_thinking" => {
             if role != "assistant" {
-                return unsupported_current(scope, path);
+                return invalid_block_role(scope, path);
             }
             if scope == Scope::Current {
                 return unsupported_current(scope, path);
@@ -342,6 +342,13 @@ fn normalize_block(
             }
             *block = document_projection(&original);
             action = NormalizationAction::PortableText;
+        }
+        "server_tool_use" | "web_search_tool_result" => {
+            return Err(PortableHistoryError::Malformed {
+                path: path.into(),
+                reason: "server history records must be consumed in an assistant block array"
+                    .into(),
+            });
         }
         _ if scope == Scope::History => {
             *block = unknown_projection(&original, &block_type);
@@ -490,8 +497,14 @@ fn normalize_server_searches(
                 pending.insert(id.to_string(), (index, query));
             }
             Some("web_search_tool_result") => {
-                let id = match block.get("tool_use_id").and_then(Value::as_str) {
-                    Some(id) => id.to_string(),
+                let id = match block.get("tool_use_id") {
+                    Some(Value::String(id)) => id.to_string(),
+                    Some(_) => {
+                        return Err(tool_pairing_error(
+                            &format!("{path}[{index}]"),
+                            "server search result has a malformed tool_use_id",
+                        ));
+                    }
                     None if pending.len() == 1 => {
                         pending.keys().next().cloned().expect("one pending id")
                     }
@@ -574,7 +587,6 @@ fn search_result_text(block: &Value) -> String {
     let mut fields = Vec::new();
     collect_public_fields(block, &mut fields);
     match block.get("content") {
-        Some(Value::String(content)) => fields.push(format!("content: {content}")),
         Some(Value::Array(content)) => {
             for result in content {
                 collect_public_fields(result, &mut fields);
@@ -598,6 +610,16 @@ fn tool_pairing_error(path: &str, reason: &str) -> PortableHistoryError {
     PortableHistoryError::ToolPairing {
         path: path.into(),
         reason: reason.into(),
+    }
+}
+
+fn invalid_block_role(scope: Scope, path: &str) -> Result<(), PortableHistoryError> {
+    match scope {
+        Scope::History => Err(PortableHistoryError::Malformed {
+            path: path.into(),
+            reason: "content block is invalid for the message role".into(),
+        }),
+        Scope::Current => unsupported_current(scope, path),
     }
 }
 
@@ -1108,6 +1130,168 @@ mod tests {
         assert_eq!(fingerprint.0.get(), MAX_REPORT_EVENTS + 1);
         assert_eq!(outcome.report.events.len(), MAX_REPORT_EVENTS);
         assert!(outcome.report.events_truncated);
+    }
+
+    #[test]
+    fn invalid_historical_roles_are_rejected_without_leaking_private_block_content() {
+        let input = request(json!([
+            {"role":"user","content":[
+                {"type":"thinking","thinking":"TOP_LEVEL_REASONING_SENTINEL","signature":"TOP_LEVEL_SIGNATURE_SENTINEL"},
+                {"type":"redacted_thinking","data":"TOP_LEVEL_REDACTED_SENTINEL"}
+            ]},
+            {"role":"assistant","content":"previous answer"},
+            {"role":"user","content":"continue"}
+        ]));
+        let before = serde_json::to_value(&input).unwrap();
+        let error = normalize(
+            &input,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "portable_history.malformed");
+        for sentinel in [
+            "TOP_LEVEL_REASONING_SENTINEL",
+            "TOP_LEVEL_SIGNATURE_SENTINEL",
+            "TOP_LEVEL_REDACTED_SENTINEL",
+        ] {
+            assert!(!error.safe_message().contains(sentinel));
+        }
+        assert_eq!(serde_json::to_value(&input).unwrap(), before);
+
+        let nested = request(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+                {"type":"thinking","thinking":"NESTED_REASONING_SENTINEL","signature":"NESTED_SIGNATURE_SENTINEL"}
+            ]}]},
+            {"role":"assistant","content":"previous answer"},
+            {"role":"user","content":"continue"}
+        ]));
+        let error = normalize(
+            &nested,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "portable_history.malformed");
+        assert!(!error.safe_message().contains("NESTED_REASONING_SENTINEL"));
+
+        let assistant_result = request(json!([
+            {"role":"assistant","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ASSISTANT_RESULT_SENTINEL"}]},
+            {"role":"user","content":"continue"}
+        ]));
+        let error = normalize(
+            &assistant_result,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "portable_history.malformed");
+        assert!(!error.safe_message().contains("ASSISTANT_RESULT_SENTINEL"));
+
+        let current = request(json!([
+            {"role":"user","content":[{"type":"thinking","thinking":"CURRENT_REASONING_SENTINEL"}]}
+        ]));
+        assert_eq!(
+            normalize(
+                &current,
+                UnexpressibleStrategy::PortableText,
+                &TestFingerprint,
+            )
+            .unwrap_err()
+            .code(),
+            "portable_history.current_unexpressible"
+        );
+    }
+
+    #[test]
+    fn server_records_outside_assistant_prescan_are_rejected_without_projection() {
+        let user_server_record = request(json!([
+            {"role":"user","content":[{"type":"server_tool_use","id":"server-1","name":"web_search","input":{"query":"USER_SERVER_SENTINEL"}}]},
+            {"role":"assistant","content":"previous answer"},
+            {"role":"user","content":"continue"}
+        ]));
+        let error = normalize(
+            &user_server_record,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "portable_history.malformed");
+        assert!(!error.safe_message().contains("USER_SERVER_SENTINEL"));
+
+        let nested_server_record = request(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[
+                {"type":"web_search_tool_result","tool_use_id":"server-1","content":"NESTED_SERVER_SENTINEL"}
+            ]}]},
+            {"role":"assistant","content":"previous answer"},
+            {"role":"user","content":"continue"}
+        ]));
+        let error = normalize(
+            &nested_server_record,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "portable_history.malformed");
+        assert!(!error.safe_message().contains("NESTED_SERVER_SENTINEL"));
+    }
+
+    #[test]
+    fn server_result_ids_must_be_absent_or_exact_strings() {
+        for malformed_id in [json!(null), json!(7), json!({"id":"search-1"}), json!([])] {
+            let input = request(json!([
+                {"role":"assistant","content":[
+                    {"type":"server_tool_use","id":"search-1","name":"web_search","input":{"query":"query"}},
+                    {"type":"web_search_tool_result","tool_use_id":malformed_id,"content":"RESULT_SENTINEL"}
+                ]},
+                {"role":"user","content":"continue"}
+            ]));
+            assert!(matches!(
+                normalize(
+                    &input,
+                    UnexpressibleStrategy::PortableText,
+                    &TestFingerprint
+                ),
+                Err(PortableHistoryError::ToolPairing { .. })
+            ));
+        }
+
+        let mismatched = request(json!([
+            {"role":"assistant","content":[
+                {"type":"server_tool_use","id":"search-1","name":"web_search","input":{"query":"query"}},
+                {"type":"web_search_tool_result","tool_use_id":"search-2","content":"RESULT_SENTINEL"}
+            ]},
+            {"role":"user","content":"continue"}
+        ]));
+        assert!(matches!(
+            normalize(
+                &mismatched,
+                UnexpressibleStrategy::PortableText,
+                &TestFingerprint
+            ),
+            Err(PortableHistoryError::ToolPairing { .. })
+        ));
+    }
+
+    #[test]
+    fn string_server_result_content_is_projected_once() {
+        let input = request(json!([
+            {"role":"assistant","content":[
+                {"type":"server_tool_use","id":"search-1","name":"web_search","input":{"query":"query"}},
+                {"type":"web_search_tool_result","tool_use_id":"search-1","content":"STRING_CONTENT_SENTINEL"}
+            ]},
+            {"role":"user","content":"continue"}
+        ]));
+        let outcome = normalize(
+            &input,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&outcome.payload).unwrap();
+        assert_eq!(serialized.matches("STRING_CONTENT_SENTINEL").count(), 1);
     }
 
     #[test]
