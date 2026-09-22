@@ -63,7 +63,7 @@ pub struct ModelsResponse {
 // === Messages 端点类型 ===
 
 /// Thinking 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
@@ -100,7 +100,7 @@ where
 }
 
 /// OutputConfig 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
@@ -111,14 +111,14 @@ fn default_effort() -> String {
 }
 
 /// Claude Code 请求中的 metadata
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
 }
 
 /// Messages 请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
@@ -344,6 +344,16 @@ mod tests {
     fn messages_request_preserves_explicit_max_tokens() {
         let request: MessagesRequest = serde_json::from_value(request_json(Some(4096))).unwrap();
         assert_eq!(request.max_tokens, 4096);
+    }
+
+    #[test]
+    fn messages_request_can_be_cloned_and_serialized_for_atomic_normalization() {
+        let request: MessagesRequest = serde_json::from_value(request_json(Some(4096))).unwrap();
+        let cloned = request.clone();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::to_value(&cloned).unwrap()
+        );
     }
 
     #[test]

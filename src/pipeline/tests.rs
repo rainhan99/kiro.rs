@@ -2,6 +2,31 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn portable_text_is_the_missing_field_default_but_explicit_legacy_values_survive() {
+    let default: config::PipelineConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(
+        default.unexpressible,
+        expressible::UnexpressibleStrategy::PortableText
+    );
+
+    for (wire, expected) in [
+        ("refuse", expressible::UnexpressibleStrategy::Refuse),
+        ("drop", expressible::UnexpressibleStrategy::Drop),
+        (
+            "portable-text",
+            expressible::UnexpressibleStrategy::PortableText,
+        ),
+    ] {
+        let parsed: config::PipelineConfig = serde_json::from_value(json!({
+            "unexpressible": wire
+        }))
+        .unwrap();
+        assert_eq!(parsed.unexpressible, expected);
+        assert_eq!(serde_json::to_value(parsed).unwrap()["unexpressible"], wire);
+    }
+}
+
+#[test]
 fn strict_configuration_rejects_typos_and_zero_limits() {
     assert!(
         serde_json::from_value::<config::PipelineConfig>(json!({"cacheStratgey":"static-prefix"}))

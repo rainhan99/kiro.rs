@@ -239,7 +239,7 @@ impl Default for PipelineConfig {
         Self {
             mode: PipelineMode::Enforce,
             capture: super::capture::CaptureConfig::default(),
-            unexpressible: super::expressible::UnexpressibleStrategy::Drop,
+            unexpressible: super::expressible::UnexpressibleStrategy::PortableText,
             strip_billing_header: true,
             cache_strategy: CacheStrategy::Off,
             agent_mode: "vibe".into(),

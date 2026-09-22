@@ -8,6 +8,7 @@
 //!
 //! | | 那部分内容 | 请求 |
 //! |---|---|---|
+//! | [`UnexpressibleStrategy::PortableText`] | 历史上的不兼容内容转为可携带的引用文本；当前的不兼容内容 | 成功或失败 |
 //! | [`UnexpressibleStrategy::Refuse`] | 用不上 | 失败 |
 //! | [`UnexpressibleStrategy::Drop`] | 用不上 | 成功，且**逐项记明丢了什么** |
 //!
@@ -33,11 +34,15 @@ use crate::anthropic::types::MessagesRequest;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnexpressibleStrategy {
-    /// 丢弃那一部分并逐项记录，请求继续。0.9.0 及更早的实际行为（但那时没有记录）。
+    /// 历史上的不兼容内容变成带来源的可携带文本；当前的不兼容内容使请求失败。
     #[default]
-    Drop,
+    PortableText,
     /// 拒绝整个请求，并说明是哪一项、实际收到的是什么。
     Refuse,
+    /// 丢弃那一部分并逐项记录，请求继续。0.9.0 及更早的实际行为（但那时没有记录）。
+    ///
+    /// 这是有意造成信息损失的兼容模式，已弃用；请优先使用 [`Self::PortableText`]。
+    Drop,
 }
 
 /// 一次为了让请求可被 Kiro 表达而做的删除。

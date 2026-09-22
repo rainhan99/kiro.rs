@@ -205,12 +205,12 @@ fn refusing_says_how_many_problems_there_are() {
     assert!(format!("{error:#}").contains("and 1 more"), "{error:#}");
 }
 
-/// 默认是 `drop`：拒绝并不能把内容保住，却会让请求失败。
+/// 默认是 `portable-text`：历史上的不兼容内容可被携带，当前的不兼容内容会失败。
 #[test]
-fn the_default_is_drop() {
+fn the_default_is_portable_text() {
     assert_eq!(
         UnexpressibleStrategy::default(),
-        UnexpressibleStrategy::Drop
+        UnexpressibleStrategy::PortableText
     );
 }
 
