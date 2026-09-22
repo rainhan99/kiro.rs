@@ -3,6 +3,7 @@
   "cacheMeteringEnabled": false,
   "requestPipeline": {
     "mode": "enforce",
+    "unexpressible": "portable-text",
     "stripBillingHeader": true,
     "cacheStrategy": "static-prefix",
     "agentMode": "vibe",

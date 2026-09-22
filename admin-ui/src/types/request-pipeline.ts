@@ -1,7 +1,7 @@
 export interface PipelineConfig {
   mode: 'off' | 'audit' | 'enforce'
   /** Kiro 表达不了的内容怎么处理（prefill、未知角色、未知内容块……都归它）。与 mode 正交。 */
-  unexpressible: 'drop' | 'refuse'
+  unexpressible: 'portable-text' | 'refuse' | 'drop'
   /** 入站请求抓取。默认关，且默认只抓形状不抓内容。 */
   capture: { enabled: boolean; maxRequests: number; maxBytes: number; redactText: boolean }
   stripBillingHeader: boolean

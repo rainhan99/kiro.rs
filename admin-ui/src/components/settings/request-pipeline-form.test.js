@@ -9,13 +9,22 @@ const config = () => ({
   toolResults: { strategy: 'join', chunkBytes: 400000 },
   toolCatalog: { strategy: 'inline', budgetBytes: 131072 },
   chunkedMap: { strategy: 'off', chunkBytes: 32768, maxChunks: 8 },
-  admission: 'off', recovery: 'off',
+  admission: 'off', recovery: 'off', unexpressible: 'portable-text',
   images: { strategy: 'preserve', tileMaxBase64Bytes: 400000, maxTiles: 32, maxPixels: 40000000 },
   auditEnabled: true, allowSimulatedCache: false, kiroOnly: true,
 })
 const snapshot = () => ({ source: 'startup', runtimeEditable: false, editable: true, effectiveConfig: config(), savedConfig: config(), revision: 'one', restartRequired: false })
 
 describe('pipeline configuration editor', () => {
+  test('portable history is preserved through a save and missing old drafts use the safe default', () => {
+    const editor = createEditor(snapshot())
+    expect(validateDraft(editor.draft).config?.unexpressible).toBe('portable-text')
+    delete editor.draft.unexpressible
+    expect(validateDraft(editor.draft).config?.unexpressible).toBe('portable-text')
+    editor.draft.unexpressible = 'drop'
+    expect(validateDraft(editor.draft).config?.unexpressible).toBe('drop')
+  })
+
   test('blank optional limit submits null; zero is rejected instead of disabling the limit', () => {
     const { draft } = createEditor(snapshot())
     expect(validateDraft(draft).config?.limits.bodyBytes).toBeNull()

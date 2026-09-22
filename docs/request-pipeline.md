@@ -26,6 +26,7 @@
 | `mode: enforce` | 执行所配置的净化、图片/原文处理、缓存标记和本地预算拒绝 |
 | `mode: audit` | 保留旧转换行为，仅观察 wire；不执行净化、卸载、切片或缓存标记 |
 | `mode: off` | 同样保留旧转换；另设 `auditEnabled:false` 关闭 wire 审计 |
+| `unexpressible: portable-text/refuse/drop` | `portable-text`（默认）将**历史**中 Kiro 无法表达的可读块投影为可移植文本；`refuse` 拒绝该请求；`drop` 是仅为兼容旧配置保留的有损行为，可能丢失内容，不建议新配置使用 |
 | `stripBillingHeader` | 仅删除第一个 system 块开头精确匹配的 `x-anthropic-billing-header:` 一行；不删除引文、后续块/行或任意“无效头” |
 | `cacheStrategy: off/static-prefix` | 关闭或只在转换后的 system 历史消息末尾添加一个 `cachePoint:{type:default}`；不标记增长中的当前消息 |
 | `limits` | 独立检查最终 JSON body 字节、最大 UTF-8 文本值、整个工具结果 JSON、单张 base64 字节；不是 token 计数 |
@@ -39,6 +40,14 @@
 | `recovery: off/lossless-retry` | `off` 为默认。`lossless-retry` 在分类明确的长度拒绝后，对 payload 施加一次无损修正并同模型重发一次 |
 | `allowSimulatedCache:false` | 无论旧计量开关如何，客户端路径不采用模拟缓存分摊；原生用量缺失不补出“命中” |
 | `kiroOnly:true` | 拒绝配置外部 countTokensApiUrl；推理/搜索仍走现有 Kiro 路径 |
+
+## 跨上游历史的可移植边界
+
+`unexpressible` 与 `mode` 正交：历史归一化在请求准备阶段先运行，不以 `audit`、`off` 或 `enforce` 作为关闭它的开关。默认 `portable-text` 只处理**历史**，即最后一条用户消息之前的会话记录；当前输入是安全边界，最后一条用户消息遇到 document、未知块、provider 私有块或其他 Kiro 无法表达的内容会明确拒绝，绝不降级、截断或静默丢弃。
+
+历史 document 的可读文本、已完成搜索的公共标题/URL，以及未来块的明确可读字段可以投影为文本。provider 私有签名、加密搜索内容和 `redacted_thinking` 的不透明负载会被移除或替换为不含原文的说明；工具 ID 与已验证的工具配对仍保留。此过程**不**抓取 URL、不会下载或探测远程资源、不会 OCR 或解析 PDF/二进制，也没有为转换设置网络重试。不能验证配对、角色或结构时会拒绝，而不是删除历史来“修好”请求。
+
+归一化报告只供本机管理端 trace 与离线检查使用：操作员界面只显示有界的扫描/转换/不透明字节计数和事件是否截断，不显示内容、签名、加密/脱敏 payload、路径、ID、指纹或任意原始 JSON。该报告与本地告警都不会写进 Kiro wire 请求。`drop` 的旧行为仍可显式选择以兼容已有部署，但其故意丢失内容；如要回退到不认识 `portable-text` 的旧二进制，先将配置改为 `refuse` 并重启，再切换旧二进制。
 
 ## 按需工具发现与分块处理（阶段 3）
 
@@ -84,11 +93,11 @@ Token 预算报告随请求构造审计一并输出（`tokenMetrics`）：按当
 
 `agentMode` 的 body 和 IDE header 使用同一配置（vibe/spec）；不要为测缓存而反复切换。`toolCompatibilityMode:raw` 是示例中的独立选择：保留客户端工具定义；继续使用原来的 `claude-code` 模式则仍按既有兼容规则映射内置工具和 schema。
 
-新管线不会因长度错误换模型、缩短思考预算、总结/裁剪历史或盲目换号重试。显式预算不再被反序列化上限或模型名后缀静默覆盖。Kiro 不支持的输入（例如 assistant prefill）直接报错，不静默丢弃。
+新管线不会因长度错误换模型、缩短思考预算、总结/裁剪历史或盲目换号重试。显式预算不再被反序列化上限或模型名后缀静默覆盖。当前输入中 Kiro 不支持的内容（例如 assistant prefill）直接报错；历史跨上游内容则按 `unexpressible` 的可移植、拒绝或旧版有损策略处理。
 
 HTTP 请求头与 prompt 里的“头部文本”必须分开看：本项目由 endpoint 构造出站 HTTP 头，不透传任意客户端头；`amz-sdk-invocation-id` 仍按请求生成，不能为追求缓存而固定。`x-anthropic-billing-header:` 在此指 system 文本里的已知生成行，删除它才会改变模型输入。出站头变化是否参与 Kiro 的服务端缓存键未知，不能仅凭名称或尺寸断言其导致缓存未命中。
 
-网关返回的已完成搜索记录和不透明 `redacted_thinking` 可在后续轮次重放：转为带说明的完整 JSON 历史文本（不重新执行搜索、不解码思考数据），避免丢失来源或拒绝自己的输出。孤立/重复工具结果、未完成配对和畸形内容块明确报错，不通过删除历史“修复”。
+网关返回的已完成搜索记录可在后续轮次以公共标题/URL 等可读字段重放；不透明 `redacted_thinking` 只保留不含原文的说明，不重新执行搜索、不解码思考数据。不会将 server history 变成完整 JSON。孤立/重复工具结果、未完成配对和畸形内容块明确报错，不通过删除历史“修复”。
 
 ## 400 的处理边界
 

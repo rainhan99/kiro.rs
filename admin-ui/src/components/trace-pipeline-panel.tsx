@@ -1,6 +1,7 @@
 import { useTracePipelineEvidence } from '@/hooks/use-traces'
 import type { NativeTokenUsage } from '@/types/api'
 import { tokenBudgetRows } from './trace-token-budget'
+import { normalizationSummary } from './trace-normalization'
 
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -25,6 +26,7 @@ function numberLabel(value: unknown): string {
 function WireAudit({ value, index }: { value: Record<string, unknown>; index: number }) {
   const metrics = objectValue(value.metrics)
   const tokenRows = tokenBudgetRows(value.tokenMetrics)
+  const normalization = normalizationSummary(value.normalization)
   const fields: [string, unknown][] = [
     ['完整请求指纹', value.wireFingerprint],
     ['语义请求指纹', value.semanticFingerprint],
@@ -60,6 +62,13 @@ function WireAudit({ value, index }: { value: Record<string, unknown>; index: nu
           </div>
         ))}
       </dl>
+      {normalization && (
+        <div className="mt-2 rounded border border-border/40 px-2 py-1.5 text-[11px]">
+          <p>跨上游历史：扫描 {normalization.scannedBlocks.toLocaleString('en-US')} 块，转换 {normalization.transformedBlocks.toLocaleString('en-US')} 块，隔离不透明数据 {normalization.opaqueBytes.toLocaleString('en-US')} 字节</p>
+          <p className="mt-1 text-muted-foreground">仅本平台审计；该告警、路径与指纹未发送给 Kiro。</p>
+          {normalization.eventsTruncated && <p className="mt-1 text-muted-foreground">详细事件已达到本地上限</p>}
+        </div>
+      )}
       {tokenRows
         ? (
           <div className="mt-2 rounded border border-border/40 px-2 py-1.5">

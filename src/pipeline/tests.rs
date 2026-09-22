@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn portable_text_is_the_missing_field_default_but_explicit_legacy_values_survive() {
@@ -23,6 +23,74 @@ fn portable_text_is_the_missing_field_default_but_explicit_legacy_values_survive
         .unwrap();
         assert_eq!(parsed.unexpressible, expected);
         assert_eq!(serde_json::to_value(parsed).unwrap()["unexpressible"], wire);
+    }
+}
+
+#[derive(Default)]
+struct FakeKiroUpstream {
+    received: Vec<String>,
+}
+
+impl FakeKiroUpstream {
+    fn send(&mut self, body: String) {
+        self.received.push(body);
+    }
+}
+
+#[test]
+fn cc_switch_history_reaches_fake_kiro_without_private_fields() {
+    let mut payload: MessagesRequest = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/portable-history-cc-switch.json"
+    )))
+    .unwrap();
+    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+    let _prepared = pipeline.prepare(&mut payload, 1).unwrap();
+    let converted = crate::anthropic::converter::convert_request_with_pipeline(
+        &payload,
+        crate::model::config::ToolCompatibilityMode::Raw,
+        &pipeline.config,
+    )
+    .unwrap();
+    let body = serialize_request(
+        &payload,
+        &KiroRequest {
+            conversation_state: converted.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: converted.additional_model_request_fields,
+        },
+        &pipeline.config,
+    )
+    .unwrap();
+    let mut upstream = FakeKiroUpstream::default();
+    upstream.send(body);
+    assert_eq!(upstream.received.len(), 1);
+    let received = &upstream.received[0];
+    for expected in [
+        "Continue after switching providers",
+        "PORTABLE_DOCUMENT_TEXT_SENTINEL",
+        "PUBLIC_SEARCH_TITLE_SENTINEL",
+        "https://public-search.invalid/portable-history",
+        "read-1",
+    ] {
+        assert!(
+            received.contains(expected),
+            "fake upstream missed {expected}: {received}"
+        );
+    }
+    for forbidden in [
+        "SIGNATURE_MUST_NOT_REACH_KIRO",
+        "ENCRYPTED_MUST_NOT_REACH_KIRO",
+        "REDACTED_MUST_NOT_REACH_KIRO",
+        "normalization",
+        "messages[",
+        "portable_history.",
+        "\"source\":{\"type\":\"text\"",
+    ] {
+        assert!(
+            !received.contains(forbidden),
+            "fake upstream received {forbidden}: {received}"
+        );
     }
 }
 

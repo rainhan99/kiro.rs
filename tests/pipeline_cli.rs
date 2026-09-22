@@ -141,6 +141,37 @@ fn inspection_rejects_invalid_request_and_outputs_configured_budget_failure() {
     assert_eq!(result["networkRequests"], 0);
 }
 
+#[test]
+fn cc_switch_history_is_inspected_without_network_or_opaque_leakage() {
+    let fixture = Fixture::new();
+    let request: Value =
+        serde_json::from_str(include_str!("fixtures/portable-history-cc-switch.json")).unwrap();
+    let output = fixture.run(
+        json!({"requestPipeline":{"unexpressible":"portable-text"}}),
+        Some(request),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["networkRequests"], 0);
+    assert!(
+        result["normalization"]["transformedBlocks"]
+            .as_u64()
+            .unwrap()
+            >= 3
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for sentinel in ["SIGNATURE_MUST", "ENCRYPTED_MUST", "REDACTED_MUST"] {
+        assert!(
+            !stdout.contains(sentinel),
+            "inspection leaked {sentinel}: {stdout}"
+        );
+    }
+}
+
 /// `--show-keys`：离线取回密钥。
 ///
 /// 存在的理由：密钥只在首次生成时打印过一次，之后被日志刷走；桌面端则

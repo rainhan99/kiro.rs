@@ -82,7 +82,7 @@ export function validateDraft(draft: PipelineDraft): { config?: PipelineConfig; 
   if (Object.keys(errors).length) return { errors }
   return { errors, config: {
     mode: draft.mode as PipelineConfig['mode'],
-    unexpressible: (draft.unexpressible as PipelineConfig['unexpressible']) || 'drop',
+    unexpressible: (draft.unexpressible as PipelineConfig['unexpressible']) || 'portable-text',
     capture: {
       enabled: draft['capture.enabled'] === true,
       maxRequests: n('capture.maxRequests'),
