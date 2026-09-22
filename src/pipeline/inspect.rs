@@ -47,7 +47,7 @@ pub fn run(config_path: &str, request_path: Option<&str>) -> anyhow::Result<()> 
         );
         let mut payload: MessagesRequest = serde_json::from_slice(&bytes)?;
         let pipeline = RequestPipeline::new(config.request_pipeline.clone());
-        let context = pipeline.prepare(&mut payload, 0)?;
+        let prepared = pipeline.prepare(&mut payload, 0)?;
         let converted = convert_request_with_pipeline(
             &payload,
             config.tool_compatibility_mode,
@@ -72,7 +72,8 @@ pub fn run(config_path: &str, request_path: Option<&str>) -> anyhow::Result<()> 
         result["stage"] = json!(
             "offline-endpoint-without-credentials; final profile/header inspection occurs on normal traffic only"
         );
-        result["contextOffloaded"] = json!(context.is_some());
+        result["normalization"] = serde_json::to_value(&prepared.normalization)?;
+        result["contextOffloaded"] = json!(prepared.context.is_some());
         result["nativeCacheEvidence"] = json!(null);
         result["localBudgetAccepted"] = json!(pipeline.preflight(&wire).is_ok());
         // Output measurements even when refused, then signal failure to automation.

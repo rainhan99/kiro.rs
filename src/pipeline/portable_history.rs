@@ -121,19 +121,49 @@ pub fn normalize(
     strategy: UnexpressibleStrategy,
     fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<NormalizationOutcome, PortableHistoryError> {
-    let frontier = current_frontier(&payload.messages)?;
+    let frontier = current_frontier(&payload.messages, strategy)?;
     let mut normalized = payload.clone();
     let mut report = NormalizationReport {
         strategy: strategy_name(strategy).to_string(),
         ..Default::default()
     };
     for (index, message) in normalized.messages.iter_mut().enumerate() {
-        let scope = if index < frontier {
-            Scope::History
-        } else {
-            Scope::Current
-        };
-        normalize_message(message, scope, index, &mut report, fingerprint)?;
+        let scope =
+            if index < frontier || (index > frontier && strategy == UnexpressibleStrategy::Drop) {
+                Scope::History
+            } else {
+                Scope::Current
+            };
+        normalize_message(message, scope, index, strategy, &mut report, fingerprint)?;
+    }
+    // Validate before dropping prefill so a dangling call cannot disappear.
+    validate_tool_pairing(&normalized)?;
+    if strategy == UnexpressibleStrategy::Drop {
+        for message in &normalized.messages[frontier + 1..] {
+            if let Some(blocks) = message.content.as_array() {
+                for block in blocks {
+                    record_block(
+                        &mut report,
+                        block_category(block["type"].as_str().unwrap_or("")),
+                        NormalizationAction::LegacyDropped,
+                        block,
+                        &Value::Null,
+                        fingerprint,
+                    );
+                }
+            } else if !content_is_empty(&message.content) {
+                record_scanned(&mut report, NormalizationBlockCategory::Text);
+                record_block(
+                    &mut report,
+                    NormalizationBlockCategory::Text,
+                    NormalizationAction::LegacyDropped,
+                    &message.content,
+                    &Value::Null,
+                    fingerprint,
+                );
+            }
+        }
+        normalized.messages.truncate(frontier + 1);
     }
     validate_tool_pairing(&normalized)?;
     Ok(NormalizationOutcome {
@@ -142,7 +172,10 @@ pub fn normalize(
     })
 }
 
-fn current_frontier(messages: &[Message]) -> Result<usize, PortableHistoryError> {
+fn current_frontier(
+    messages: &[Message],
+    strategy: UnexpressibleStrategy,
+) -> Result<usize, PortableHistoryError> {
     for (index, message) in messages.iter().enumerate() {
         if !matches!(message.role.as_str(), "user" | "assistant") {
             return Err(PortableHistoryError::Malformed {
@@ -162,9 +195,10 @@ fn current_frontier(messages: &[Message]) -> Result<usize, PortableHistoryError>
             reason: "a final non-empty user message is required".into(),
         });
     };
-    if messages[index + 1..]
-        .iter()
-        .any(|message| !content_is_empty(&message.content))
+    if strategy != UnexpressibleStrategy::Drop
+        && messages[index + 1..]
+            .iter()
+            .any(|message| !content_is_empty(&message.content))
     {
         return Err(PortableHistoryError::CurrentUnexpressible {
             path: format!("messages[{}]", index + 1),
@@ -182,6 +216,7 @@ fn normalize_message(
     message: &mut Message,
     scope: Scope,
     index: usize,
+    strategy: UnexpressibleStrategy,
     report: &mut NormalizationReport,
     fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<(), PortableHistoryError> {
@@ -192,6 +227,7 @@ fn normalize_message(
         scope,
         &path,
         0,
+        strategy,
         report,
         fingerprint,
     )
@@ -203,6 +239,7 @@ fn normalize_content(
     scope: Scope,
     path: &str,
     depth: usize,
+    strategy: UnexpressibleStrategy,
     report: &mut NormalizationReport,
     fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<(), PortableHistoryError> {
@@ -222,7 +259,7 @@ fn normalize_content(
             reason: "content must be a string or content-block array".into(),
         })?;
     let projected_searches = if scope == Scope::History && role == "assistant" {
-        normalize_server_searches(blocks, path, report, fingerprint)?
+        normalize_server_searches(blocks, path, strategy, report, fingerprint)?
     } else {
         BTreeSet::new()
     };
@@ -231,8 +268,19 @@ fn normalize_content(
             continue;
         }
         let block_path = format!("{path}[{index}]");
-        normalize_block(block, role, scope, &block_path, depth, report, fingerprint)?;
+        normalize_block(
+            block,
+            role,
+            scope,
+            &block_path,
+            depth,
+            strategy,
+            report,
+            fingerprint,
+        )?;
     }
+    // Only explicit legacy removals create null here; malformed input nulls fail above.
+    blocks.retain(|block| !block.is_null());
     Ok(())
 }
 
@@ -242,6 +290,7 @@ fn normalize_block(
     scope: Scope,
     path: &str,
     depth: usize,
+    strategy: UnexpressibleStrategy,
     report: &mut NormalizationReport,
     fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<(), PortableHistoryError> {
@@ -265,6 +314,17 @@ fn normalize_block(
         }
         "image" => {
             if !supported_image(block, role) {
+                if let Some(legacy_action) = legacy_unexpressible(block, strategy, path)? {
+                    record_block(
+                        report,
+                        category,
+                        legacy_action,
+                        &original,
+                        block,
+                        fingerprint,
+                    );
+                    return Ok(());
+                }
                 if scope == Scope::Current {
                     return unsupported_current(scope, path);
                 }
@@ -296,6 +356,7 @@ fn normalize_block(
                     scope,
                     &format!("{path}.content"),
                     depth + 1,
+                    strategy,
                     report,
                     fingerprint,
                 )?;
@@ -337,6 +398,17 @@ fn normalize_block(
             action = NormalizationAction::OpaqueRedacted;
         }
         "document" => {
+            if let Some(legacy_action) = legacy_unexpressible(block, strategy, path)? {
+                record_block(
+                    report,
+                    category,
+                    legacy_action,
+                    &original,
+                    block,
+                    fingerprint,
+                );
+                return Ok(());
+            }
             if scope == Scope::Current {
                 return unsupported_current(scope, path);
             }
@@ -353,15 +425,38 @@ fn normalize_block(
                 }),
             };
         }
-        _ if scope == Scope::History => {
-            *block = unknown_projection(&original, &block_type);
-            action = NormalizationAction::PortableText;
+        _ => {
+            if let Some(legacy_action) = legacy_unexpressible(block, strategy, path)? {
+                action = legacy_action;
+            } else if scope == Scope::History {
+                *block = unknown_projection(&original, &block_type);
+                action = NormalizationAction::PortableText;
+            } else {
+                return unsupported_current(scope, path);
+            }
         }
-        _ => return unsupported_current(scope, path),
     }
 
     record_block(report, category, action, &original, block, fingerprint);
     Ok(())
+}
+
+fn legacy_unexpressible(
+    block: &mut Value,
+    strategy: UnexpressibleStrategy,
+    path: &str,
+) -> Result<Option<NormalizationAction>, PortableHistoryError> {
+    match strategy {
+        UnexpressibleStrategy::PortableText => Ok(None),
+        UnexpressibleStrategy::Refuse => Err(PortableHistoryError::CurrentUnexpressible {
+            path: path.into(),
+            reason: "legacy refuse strategy rejects unexpressible content".into(),
+        }),
+        UnexpressibleStrategy::Drop => {
+            *block = Value::Null;
+            Ok(Some(NormalizationAction::LegacyDropped))
+        }
+    }
 }
 
 fn text_block(text: String) -> Value {
@@ -465,6 +560,7 @@ fn unknown_projection(block: &Value, block_type: &str) -> Value {
 fn normalize_server_searches(
     blocks: &mut [Value],
     path: &str,
+    strategy: UnexpressibleStrategy,
     report: &mut NormalizationReport,
     fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<BTreeSet<usize>, PortableHistoryError> {
@@ -551,12 +647,15 @@ fn normalize_server_searches(
             .unwrap_or_else(|| "Web search record".into());
         blocks[use_index] = quoted_text(use_text);
         blocks[result_index] = quoted_text(search_result_text(&original_result));
+        let action = legacy_unexpressible(&mut blocks[use_index], strategy, path)?
+            .unwrap_or(NormalizationAction::PortableText);
+        legacy_unexpressible(&mut blocks[result_index], strategy, path)?;
         record_scanned(report, NormalizationBlockCategory::ServerToolUse);
         record_scanned(report, NormalizationBlockCategory::WebSearchToolResult);
         record_block(
             report,
             NormalizationBlockCategory::ServerToolUse,
-            NormalizationAction::PortableText,
+            action,
             &original_use,
             &blocks[use_index],
             fingerprint,
@@ -564,7 +663,7 @@ fn normalize_server_searches(
         record_block(
             report,
             NormalizationBlockCategory::WebSearchToolResult,
-            NormalizationAction::PortableText,
+            action,
             &original_result,
             &blocks[result_index],
             fingerprint,

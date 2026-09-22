@@ -130,6 +130,153 @@ fn request_fixture() -> MessagesRequest {
     serde_json::from_value(json!({"model":"claude-sonnet-4", "system":"x-anthropic-billing-header: nonce=one\nStatic instructions", "messages":[{"role":"user","content":"Question one"}], "metadata":{"user_id":"user_test_session_6a4d25ce-039d-4fd5-8712-3645c3d387f7"}})).unwrap()
 }
 
+fn historical_nested_document_fixture() -> MessagesRequest {
+    serde_json::from_value(json!({
+        "model":"claude-sonnet-4", "max_tokens":1024,
+        "messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":[
+                {"type":"document","source":{"type":"text","media_type":"text/plain","data":"portable body"}}
+            ]}]},
+            {"role":"assistant","content":"previous answer"},
+            {"role":"user","content":"continue"}
+        ]
+    })).unwrap()
+}
+
+#[test]
+fn compatibility_strategy_is_orthogonal_to_pipeline_mode() {
+    for mode in [
+        config::PipelineMode::Off,
+        config::PipelineMode::Audit,
+        config::PipelineMode::Enforce,
+    ] {
+        for strategy in [
+            expressible::UnexpressibleStrategy::PortableText,
+            expressible::UnexpressibleStrategy::Refuse,
+            expressible::UnexpressibleStrategy::Drop,
+        ] {
+            let pipeline = RequestPipeline::new(config::PipelineConfig {
+                mode,
+                unexpressible: strategy,
+                ..Default::default()
+            });
+            let mut payload = historical_nested_document_fixture();
+            let result = pipeline.prepare(&mut payload, 1);
+            match strategy {
+                expressible::UnexpressibleStrategy::PortableText => {
+                    let outcome = result.unwrap();
+                    assert!(outcome.normalization.transformed_blocks > 0);
+                    let content = &payload.messages[1].content[0]["content"];
+                    assert_eq!(content[0]["type"], "text", "{mode:?}");
+                    assert!(content.to_string().contains("portable body"));
+                }
+                expressible::UnexpressibleStrategy::Refuse => assert!(result.is_err(), "{mode:?}"),
+                expressible::UnexpressibleStrategy::Drop => {
+                    let outcome = result.unwrap();
+                    assert_eq!(outcome.normalization.by_action["legacy_dropped"], 1);
+                    assert!(
+                        !payload.messages[1]
+                            .content
+                            .to_string()
+                            .contains("portable body"),
+                        "{mode:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn normalized_ingress_budget_rejection_is_atomic_in_every_mode() {
+    struct Fingerprint;
+    impl portable_history::SensitiveFingerprint for Fingerprint {
+        fn fingerprint(&self, _: &[u8], _: &[u8]) -> String {
+            "local".into()
+        }
+    }
+    for mode in [
+        config::PipelineMode::Off,
+        config::PipelineMode::Audit,
+        config::PipelineMode::Enforce,
+    ] {
+        let mut payload = historical_nested_document_fixture();
+        let original = serde_json::to_value(&payload).unwrap();
+        let normalized = portable_history::normalize(
+            &payload,
+            expressible::UnexpressibleStrategy::PortableText,
+            &Fingerprint,
+        )
+        .unwrap();
+        let limit = serde_json::to_vec(&normalized.payload).unwrap().len() - 1;
+        let pipeline = RequestPipeline::new(config::PipelineConfig {
+            mode,
+            ingress_max_bytes: limit,
+            ..Default::default()
+        });
+        let error = pipeline
+            .prepare(&mut payload, 1)
+            .err()
+            .expect("normalized budget must be checked");
+        assert_eq!(error.code(), "portable_history.budget_exceeded");
+        assert_eq!(error.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(serde_json::to_value(&payload).unwrap(), original);
+    }
+}
+
+#[test]
+fn later_image_failure_does_not_commit_normalization_or_thinking_or_billing() {
+    let mut payload = historical_nested_document_fixture();
+    payload.model = "claude-sonnet-4-thinking".into();
+    payload.system = request_fixture().system;
+    payload.messages[3].content = json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"INVALID"}}]);
+    let original = serde_json::to_value(&payload).unwrap();
+    let mut config = config::PipelineConfig::default();
+    config.images.strategy = config::ImageStrategy::LosslessTiles;
+    assert!(
+        RequestPipeline::new(config)
+            .prepare(&mut payload, 1)
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(&payload).unwrap(), original);
+}
+
+#[test]
+fn later_artifact_failure_does_not_commit_preparation() {
+    let mut payload = historical_nested_document_fixture();
+    payload.model = "claude-sonnet-4-thinking".into();
+    payload.system = request_fixture().system;
+    payload.tools = Some(vec![serde_json::from_value(json!({"name":"kiro_context_read","description":"collision","input_schema":{"type":"object"}})).unwrap()]);
+    let original = serde_json::to_value(&payload).unwrap();
+    let mut config = config::PipelineConfig::default();
+    config.artifacts.enabled = true;
+    assert!(
+        RequestPipeline::new(config)
+            .prepare(&mut payload, 1)
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(payload).unwrap(), original);
+}
+
+#[test]
+fn preparation_errors_hide_internal_paths_reasons_and_other_error_contents() {
+    let invariant =
+        PipelinePrepareError::from(portable_history::PortableHistoryError::InvariantViolation {
+            path: "messages[PRIVATE_PATH]".into(),
+            reason: "PRIVATE_REASON".into(),
+        });
+    assert_eq!(invariant.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(invariant.code(), "portable_history.invariant_violation");
+    let other = PipelinePrepareError::from(anyhow::anyhow!("PRIVATE_FILE /secret/provider.json"));
+    assert_eq!(other.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(other.code(), "pipeline_preparation");
+    for error in [invariant, other] {
+        assert!(!error.safe_message().contains("PRIVATE"));
+        assert!(!error.to_string().contains("PRIVATE"));
+    }
+}
+
 fn fixture_wire(pipeline: &RequestPipeline, payload: &mut MessagesRequest) -> String {
     pipeline.prepare(payload, 1).unwrap();
     let converted = crate::anthropic::converter::convert_request_with_pipeline(
@@ -288,12 +435,13 @@ fn offline_and_live_share_normalization_and_reject_unsupported_inputs() {
     assert!(request.thinking.is_some());
 
     // max_tokens 为 0 与「表达不了」无关：它是一个无效请求，两种策略下都报错。
-    request.max_tokens = 0;
-    assert!(p.prepare(&mut request, 1).is_err());
+    for invalid in [0, -1] {
+        request.max_tokens = invalid;
+        assert!(p.prepare(&mut request, 1).is_err(), "{invalid}");
+    }
     request.max_tokens = 1000;
 
-    // URL 图片与未知内容块属于「Kiro 表达不了」：默认丢弃并记录，
-    // 选了 refuse 才拒绝。拒绝并不能把它们保住——转换器无论如何都不会送出去。
+    // Current unsupported input is refused by default; explicit Drop is legacy compatibility.
     let refusing = RequestPipeline::new(config::PipelineConfig {
         unexpressible: expressible::UnexpressibleStrategy::Refuse,
         ..config::PipelineConfig::default()
@@ -305,10 +453,12 @@ fn offline_and_live_share_normalization_and_reject_unsupported_inputs() {
         let mut dropping = request_fixture();
         dropping.max_tokens = 1000;
         dropping.messages[0].content = content.clone();
-        assert!(
-            p.prepare(&mut dropping, 1).is_ok(),
-            "默认应丢弃并继续：{content}"
-        );
+        assert!(p.prepare(&mut dropping, 1).is_err());
+        let legacy = RequestPipeline::new(config::PipelineConfig {
+            unexpressible: expressible::UnexpressibleStrategy::Drop,
+            ..Default::default()
+        });
+        assert!(legacy.prepare(&mut dropping, 1).is_ok());
 
         let mut refusing_request = request_fixture();
         refusing_request.max_tokens = 1000;
@@ -371,7 +521,7 @@ fn offline_cli_uses_actual_endpoint_removals_before_total_budget() {
 }
 
 #[test]
-fn gateway_search_and_opaque_thinking_responses_can_be_replayed_without_data_loss() {
+fn gateway_search_retains_public_history_and_withholds_opaque_data() {
     let p = RequestPipeline::new(config::PipelineConfig::default());
     let mut request = request_fixture();
     let search = json!({"type":"server_tool_use","id":"search-1","name":"web_search","input":{"query":"exact query"}});
@@ -388,21 +538,16 @@ fn gateway_search_and_opaque_thinking_responses_can_be_replayed_without_data_los
         },
     ]);
     p.prepare(&mut request, 1).unwrap();
-    for (index, original) in [search, result, redacted].into_iter().enumerate() {
-        let quoted = request.messages[1].content[index]["text"]
-            .as_str()
-            .unwrap()
-            .split_once('\n')
-            .unwrap()
-            .1;
-        assert_eq!(serde_json::from_str::<Value>(quoted).unwrap(), original);
-    }
+    let history = request.messages[1].content.to_string();
+    assert!(history.contains("exact query"));
+    assert!(history.contains("https://example.invalid/source"));
+    assert!(history.contains("Source"));
     let first = request.messages[1].content.clone();
     p.prepare(&mut request, 1).unwrap();
     assert_eq!(first, request.messages[1].content);
     let wire = fixture_wire(&p, &mut request);
-    assert!(wire.contains("opaque source data"));
-    assert!(wire.contains("opaque thinking data"));
+    assert!(!wire.contains("opaque source data"));
+    assert!(!wire.contains("opaque thinking data"));
 }
 
 #[test]
@@ -416,7 +561,7 @@ fn invalid_tool_pairs_are_rejected_instead_of_removed() {
             .err()
             .unwrap()
             .to_string()
-            .contains("orphan")
+            .contains("tool history pairing")
     );
     request.messages = vec![
         crate::anthropic::types::Message {
@@ -773,13 +918,6 @@ fn recovery_body_is_inert_while_disabled() {
 
 // ---------- 末尾 assistant（prefill）----------
 
-fn refusing_config() -> config::PipelineConfig {
-    config::PipelineConfig {
-        unexpressible: expressible::UnexpressibleStrategy::Refuse,
-        ..config::PipelineConfig::default()
-    }
-}
-
 fn prefill_request() -> MessagesRequest {
     serde_json::from_value(json!({
         "model": "claude-sonnet-4",
@@ -790,4 +928,61 @@ fn prefill_request() -> MessagesRequest {
         ]
     }))
     .unwrap()
+}
+
+#[test]
+fn only_explicit_drop_removes_prefill_but_never_malformed_or_broken_pairs() {
+    for strategy in [
+        expressible::UnexpressibleStrategy::PortableText,
+        expressible::UnexpressibleStrategy::Refuse,
+        expressible::UnexpressibleStrategy::Drop,
+    ] {
+        let pipeline = RequestPipeline::new(config::PipelineConfig {
+            unexpressible: strategy,
+            ..Default::default()
+        });
+        let mut payload = prefill_request();
+        let result = pipeline.prepare(&mut payload, 1);
+        if strategy == expressible::UnexpressibleStrategy::Drop {
+            result.unwrap();
+            assert_eq!(payload.messages.len(), 1);
+        } else {
+            assert!(result.is_err());
+        }
+        for messages in [
+            json!([{"role":"PRIVATE_ROLE","content":"secret"},{"role":"user","content":"continue"}]),
+            json!([{"role":"user","content":[false]}]),
+            json!([{"role":"assistant","content":[{"type":"tool_use","id":"missing","name":"read","input":{}}]},{"role":"user","content":"continue"}]),
+            json!([{"role":"user","content":[{"type":"tool_result","tool_use_id":"orphan","content":[{"type":"document"}]}]}]),
+        ] {
+            let mut malformed = request_fixture();
+            malformed.messages = serde_json::from_value(messages).unwrap();
+            let original = serde_json::to_value(&malformed).unwrap();
+            assert!(pipeline.prepare(&mut malformed, 1).is_err());
+            assert_eq!(serde_json::to_value(malformed).unwrap(), original);
+        }
+    }
+}
+
+#[test]
+fn legacy_strategies_redact_known_private_reasoning() {
+    for strategy in [
+        expressible::UnexpressibleStrategy::Refuse,
+        expressible::UnexpressibleStrategy::Drop,
+    ] {
+        let pipeline = RequestPipeline::new(config::PipelineConfig {
+            unexpressible: strategy,
+            ..Default::default()
+        });
+        let mut payload = request_fixture();
+        payload.messages.insert(0, crate::anthropic::types::Message { role:"assistant".into(), content:json!([
+            {"type":"thinking","thinking":"public reasoning","signature":"SIGNATURE_SENTINEL"},
+            {"type":"redacted_thinking","data":"OPAQUE_SENTINEL"}
+        ])});
+        pipeline.prepare(&mut payload, 1).unwrap();
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(serialized.contains("public reasoning"));
+        assert!(!serialized.contains("SIGNATURE_SENTINEL"));
+        assert!(!serialized.contains("OPAQUE_SENTINEL"));
+    }
 }

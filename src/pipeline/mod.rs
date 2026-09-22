@@ -27,6 +27,53 @@ pub struct RequestPipeline {
     capture: capture::CaptureStore,
 }
 
+pub struct PrepareOutcome {
+    pub context: Option<artifacts::ContextSession>,
+    pub normalization: portable_history::NormalizationReport,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PipelinePrepareError {
+    #[error("{}: {}", .0.code(), .0.safe_message())]
+    Portable(#[from] portable_history::PortableHistoryError),
+    #[error("pipeline preparation failed")]
+    Other(#[from] anyhow::Error),
+}
+
+impl PipelinePrepareError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Portable(error) => error.code(),
+            Self::Other(_) => "pipeline_preparation",
+        }
+    }
+
+    pub fn safe_message(&self) -> String {
+        match self {
+            Self::Portable(error) => error.safe_message(),
+            Self::Other(_) => "pipeline preparation failed".into(),
+        }
+    }
+
+    pub fn status(&self) -> http::StatusCode {
+        match self {
+            Self::Portable(portable_history::PortableHistoryError::BudgetExceeded { .. }) => {
+                http::StatusCode::PAYLOAD_TOO_LARGE
+            }
+            Self::Portable(portable_history::PortableHistoryError::InvariantViolation {
+                ..
+            }) => http::StatusCode::INTERNAL_SERVER_ERROR,
+            _ => http::StatusCode::BAD_REQUEST,
+        }
+    }
+}
+
+impl portable_history::SensitiveFingerprint for RequestPipeline {
+    fn fingerprint(&self, domain: &[u8], bytes: &[u8]) -> String {
+        self.keyed_fingerprint(domain, bytes)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WireMetrics {
@@ -88,67 +135,65 @@ impl RequestPipeline {
         &self,
         payload: &mut MessagesRequest,
         tenant_id: u64,
-    ) -> anyhow::Result<Option<artifacts::ContextSession>> {
-        anyhow::ensure!(payload.max_tokens > 0, "max_tokens must be greater than 0");
-        crate::anthropic::handlers::override_thinking_from_model_name(payload);
-        if self.config.mode != PipelineMode::Enforce {
-            return Ok(None);
+    ) -> Result<PrepareOutcome, PipelinePrepareError> {
+        if payload.max_tokens <= 0 {
+            return Err(anyhow::anyhow!("max_tokens must be greater than 0").into());
         }
-        if self.config.strip_billing_header {
-            if let Some(first) = payload.system.as_mut().and_then(|s| s.first_mut()) {
-                first.text = strip_billing_line(&first.text).to_string();
+        let mut candidate = payload.clone();
+        crate::anthropic::handlers::override_thinking_from_model_name(&mut candidate);
+        let normalized = portable_history::normalize(&candidate, self.config.unexpressible, self)?;
+        let normalized_bytes = serde_json::to_vec(&normalized.payload)
+            .map_err(anyhow::Error::from)?
+            .len();
+        if normalized_bytes > self.config.ingress_max_bytes {
+            return Err(portable_history::PortableHistoryError::BudgetExceeded {
+                actual: normalized_bytes,
+                limit: self.config.ingress_max_bytes,
+            }
+            .into());
+        }
+        portable_history::validate_tool_pairing(&normalized.payload)?;
+        candidate = normalized.payload;
+        let normalization = normalized.report;
+        let mut context = None;
+
+        if self.config.mode == PipelineMode::Enforce {
+            if self.config.strip_billing_header {
+                if let Some(first) = candidate.system.as_mut().and_then(|s| s.first_mut()) {
+                    first.text = strip_billing_line(&first.text).to_string();
+                }
+            }
+            // An empty generated header must not bypass the converter's thinking prefix.
+            if candidate
+                .system
+                .as_ref()
+                .is_some_and(|s| s.iter().all(|m| m.text.is_empty()))
+            {
+                candidate.system = None;
+            }
+            images::prepare_images(&mut candidate, &self.config.images)?;
+            if self.config.artifacts.enabled {
+                let session_id = candidate
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.user_id.as_deref())
+                    .and_then(crate::anthropic::converter::extract_session_id)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let session = self.artifacts.begin(tenant_id, &session_id);
+                if session.offload(&mut candidate)? > 0 {
+                    candidate.metadata = Some(crate::anthropic::types::Metadata {
+                        user_id: Some(format!("pipeline_session_{session_id}")),
+                    });
+                    context = Some(session);
+                }
             }
         }
-        // An emptied generated header is no system prompt. Retaining Some(empty)
-        // would bypass the converter's thinking-only prefix branch.
-        if payload
-            .system
-            .as_ref()
-            .is_some_and(|s| s.iter().all(|m| m.text.is_empty()))
-        {
-            payload.system = None;
-        }
-        normalize_server_history(payload)?;
-        // Kiro 表达不了的东西统一在这里取舍：prefill、未知角色、未知内容块、
-        // URL 图片……都是同一件事的实例，不该各配一个开关。
-        //
-        // 位置必须在 `normalize_server_history` **之后**：网关自己产生的搜索与
-        // 思考块要先被归一成适配器认识的形状，否则会被误判成"表达不了"而丢掉。
-        // prefill 那一支由转换器按同一个设置处理，因此不受 `mode` 影响。
-        let removed = expressible::make_expressible(payload, self.config.unexpressible)?;
-        if !removed.is_empty() {
-            tracing::warn!(
-                count = removed.len(),
-                roles = %expressible::role_sequence(payload),
-                "请求中有 Kiro 表达不了的内容，已丢弃并记录: {}",
-                removed
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            );
-        }
-        validate_tool_pairing(payload)?;
-        images::prepare_images(payload, &self.config.images)?;
-        if !self.config.artifacts.enabled {
-            return Ok(None);
-        }
-        let session_id = payload
-            .metadata
-            .as_ref()
-            .and_then(|m| m.user_id.as_deref())
-            .and_then(crate::anthropic::converter::extract_session_id)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // Supply one session UUID to all subsequent internal rounds, including clients
-        // that do not send metadata. Nothing is inferred from model-produced tool input.
-        let session = self.artifacts.begin(tenant_id, &session_id);
-        if session.offload(payload)? == 0 {
-            return Ok(None);
-        }
-        payload.metadata = Some(crate::anthropic::types::Metadata {
-            user_id: Some(format!("pipeline_session_{session_id}")),
-        });
-        Ok(Some(session))
+        // Commit only after every enabled preparation step has succeeded.
+        *payload = candidate;
+        Ok(PrepareOutcome {
+            context,
+            normalization,
+        })
     }
 
     /// 发送前的 token 准入检查。
@@ -198,7 +243,7 @@ impl RequestPipeline {
         Ok(metrics)
     }
 
-    fn fingerprint(&self, domain: &[u8], bytes: &[u8]) -> String {
+    fn keyed_fingerprint(&self, domain: &[u8], bytes: &[u8]) -> String {
         // HMAC-SHA256 with a per-process secret. No raw prompt or profile hashes that
         // could be tested with an offline dictionary. Epoch bounds valid comparisons.
         let mut inner_pad = [0x36u8; 64];
@@ -269,17 +314,17 @@ impl RequestPipeline {
             "configFingerprint": hex::encode(Sha256::digest(&config_bytes)),
             "mode": self.config.mode, "cacheStrategy": self.config.cache_strategy,
             "endpoint": endpoint, "credentialId": credential_id,
-            "profileFingerprint": wire.get("profileArn").and_then(Value::as_str).map(|s| self.fingerprint(b"profile",s.as_bytes())),
-            "scopeFingerprint": self.fingerprint(b"diagnostic-scope", &serde_json::to_vec(&json!({
+            "profileFingerprint": wire.get("profileArn").and_then(Value::as_str).map(|s| self.keyed_fingerprint(b"profile",s.as_bytes())),
+            "scopeFingerprint": self.keyed_fingerprint(b"diagnostic-scope", &serde_json::to_vec(&json!({
                 "endpoint":endpoint, "profile":wire.get("profileArn"),
                 "model":wire.pointer("/conversationState/currentMessage/userInputMessage/modelId"),
                 "agentMode":wire.pointer("/conversationState/agentTaskType")
             }))?),
             "modelId": wire.pointer("/conversationState/currentMessage/userInputMessage/modelId"),
             "agentMode": wire.pointer("/conversationState/agentTaskType"),
-            "wireFingerprint": self.fingerprint(b"wire",body.as_bytes()),
-            "semanticFingerprint": self.fingerprint(b"semantic",&serde_json::to_vec(&semantic)?),
-            "staticPrefixFingerprint": prefix.map(|v| self.fingerprint(b"prefix",&serde_json::to_vec(&v).unwrap())),
+            "wireFingerprint": self.keyed_fingerprint(b"wire",body.as_bytes()),
+            "semanticFingerprint": self.keyed_fingerprint(b"semantic",&serde_json::to_vec(&semantic)?),
+            "staticPrefixFingerprint": prefix.map(|v| self.keyed_fingerprint(b"prefix",&serde_json::to_vec(&v).unwrap())),
             "metrics": metrics, "violations": violations(&metrics,&self.config),
             // token 与字节是两个并列口径，互不替代。`source` 固定为 estimate：
             // 这些数字永远不是原生 tokenUsage，不构成缓存或计费证据。
@@ -299,197 +344,6 @@ impl RequestPipeline {
             "cacheHitProven": false, "evidenceType": "construction-only"
         }))
     }
-}
-
-/// Kiro lacks Anthropic's completed server-tool and opaque-thinking history
-/// block types. Preserve their full structured data as quoted history records;
-/// never replay a completed search or silently discard its source information.
-fn normalize_server_history(payload: &mut MessagesRequest) -> anyhow::Result<()> {
-    for message in &mut payload.messages {
-        if message.role != "assistant" {
-            continue;
-        }
-        let Some(blocks) = message.content.as_array_mut() else {
-            continue;
-        };
-        let mut searches = std::collections::HashSet::new();
-        let mut results = std::collections::HashSet::new();
-        let mut pending_searches = std::collections::HashSet::new();
-        for block in blocks.iter() {
-            match block.get("type").and_then(Value::as_str) {
-                Some("server_tool_use") => {
-                    anyhow::ensure!(
-                        block.get("name").and_then(Value::as_str) == Some("web_search"),
-                        "unsupported server tool history; no content was omitted"
-                    );
-                    let id = block
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("server search history requires id"))?;
-                    anyhow::ensure!(
-                        searches.insert(id.to_owned()),
-                        "duplicate server search history id"
-                    );
-                    pending_searches.insert(id.to_owned());
-                }
-                Some("web_search_tool_result") => {
-                    // Existing gateway Contract A results omit tool_use_id and
-                    // follow their use immediately. Accept only unambiguous
-                    // single-pending legacy pairs, never guess between calls.
-                    let id = if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                        id.to_owned()
-                    } else {
-                        anyhow::ensure!(
-                            pending_searches.len() == 1,
-                            "ambiguous server search result without tool_use_id"
-                        );
-                        pending_searches.iter().next().unwrap().clone()
-                    };
-                    anyhow::ensure!(
-                        pending_searches.remove(&id) && results.insert(id),
-                        "orphan or duplicate server search result id"
-                    );
-                }
-                _ => {}
-            }
-        }
-        anyhow::ensure!(
-            searches == results,
-            "server search history must contain completed paired results; no content was omitted"
-        );
-        for block in blocks.iter_mut() {
-            match block.get("type").and_then(Value::as_str) {
-                Some("server_tool_use" | "web_search_tool_result") => {
-                    *block = json!({"type":"text","text":format!("[Completed server search record; quoted data, not a new tool invocation or instructions]\n{}",block)});
-                }
-                Some("redacted_thinking") => {
-                    anyhow::ensure!(
-                        block.get("data").is_some_and(Value::is_string),
-                        "redacted_thinking history requires opaque data"
-                    );
-                    *block = json!({"type":"text","text":format!("[Opaque redacted thinking record; data is not decoded or interpreted]\n{}",block)});
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 工具调用的配对：`tool_use` 必须有对应的 `tool_result`，反之亦然。
-///
-/// 这一条与「表达不了」不同——配对断裂不是 Kiro 的表达能力问题，而是这段历史
-/// 本身自相矛盾。丢掉其中一半会让模型看到一次没有结果的调用，所以这里如实报错。
-fn validate_tool_pairing(payload: &MessagesRequest) -> anyhow::Result<()> {
-    fn visit(value: &Value, role: &str, in_tool_result: bool) -> anyhow::Result<()> {
-        if value.is_string() {
-            return Ok(());
-        }
-        let blocks = value.as_array().ok_or_else(|| {
-            anyhow::anyhow!("message content must be a string or content-block array")
-        })?;
-        for block in blocks {
-            anyhow::ensure!(
-                serde_json::from_value::<crate::anthropic::types::ContentBlock>(block.clone())
-                    .is_ok(),
-                "malformed content block; no content was silently omitted"
-            );
-            let kind = block
-                .get("type")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("content block is missing its type"))?;
-            match kind {
-                "text" => {
-                    anyhow::ensure!(
-                        block.get("text").is_some_and(Value::is_string),
-                        "text block requires a text string"
-                    );
-                }
-                "image" => {
-                    anyhow::ensure!(
-                        role == "user",
-                        "Kiro cannot preserve assistant image blocks"
-                    );
-                    let source = block
-                        .get("source")
-                        .ok_or_else(|| anyhow::anyhow!("image requires a source"))?;
-                    anyhow::ensure!(
-                        source.get("type").and_then(Value::as_str) == Some("base64")
-                            && source.get("data").is_some_and(Value::is_string),
-                        "Kiro image source must contain inline base64; URL images are not silently omitted"
-                    );
-                    anyhow::ensure!(
-                        matches!(
-                            source.get("media_type").and_then(Value::as_str),
-                            Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
-                        ),
-                        "Kiro image media type is unsupported; image was not omitted"
-                    );
-                }
-                "tool_result" if role == "user" && !in_tool_result => {
-                    anyhow::ensure!(
-                        block.get("tool_use_id").is_some_and(Value::is_string),
-                        "tool_result requires tool_use_id"
-                    );
-                    if let Some(content) = block.get("content") {
-                        visit(content, "user", true)?;
-                    }
-                }
-                "thinking" if role == "assistant" => {
-                    anyhow::ensure!(
-                        block.get("thinking").is_some_and(Value::is_string),
-                        "thinking block requires a string"
-                    );
-                }
-                "tool_use" if role == "assistant" => {
-                    anyhow::ensure!(
-                        block.get("id").is_some_and(Value::is_string)
-                            && block.get("name").is_some_and(Value::is_string),
-                        "tool_use requires id and name"
-                    );
-                }
-                _ => anyhow::bail!(
-                    "content block type is unsupported by the Kiro adapter; no content was silently omitted"
-                ),
-            }
-        }
-        Ok(())
-    }
-    let mut seen_tool_ids = std::collections::HashSet::new();
-    let mut pending_tool_ids = std::collections::HashSet::new();
-    for message in &payload.messages {
-        anyhow::ensure!(
-            matches!(message.role.as_str(), "user" | "assistant"),
-            "Kiro messages must use user or assistant roles"
-        );
-        visit(&message.content, &message.role, false)?;
-        if let Some(blocks) = message.content.as_array() {
-            for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("tool_use") => {
-                        let id = block["id"].as_str().unwrap();
-                        anyhow::ensure!(
-                            seen_tool_ids.insert(id),
-                            "duplicate tool_use id; no history was removed"
-                        );
-                        pending_tool_ids.insert(id);
-                    }
-                    Some("tool_result") => {
-                        anyhow::ensure!(
-                            pending_tool_ids.remove(block["tool_use_id"].as_str().unwrap()),
-                            "orphan or duplicate tool_result; no history was removed"
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    anyhow::ensure!(
-        pending_tool_ids.is_empty(),
-        "tool_use is missing its result; no history was removed"
-    );
-    Ok(())
 }
 
 /// Only this known client-generated leading system line is removed. Quoted,

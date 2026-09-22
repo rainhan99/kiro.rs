@@ -2471,7 +2471,7 @@ mod tests {
     }
 
     #[test]
-    fn emitted_contract_a_search_results_replay_with_exact_payloads() {
+    fn emitted_contract_a_search_results_replay_as_public_portable_history() {
         let emitted = build_flush_content(
             Vec::new(),
             "Answer using both sources.",
@@ -2503,17 +2503,19 @@ mod tests {
             },
         ]);
         let pipeline = crate::pipeline::RequestPipeline::new(Default::default());
-        assert!(pipeline.prepare(&mut payload, 7).is_ok());
+        let prepared = pipeline.prepare(&mut payload, 7).unwrap();
+        assert_eq!(prepared.normalization.transformed_blocks, 4);
         for (index, original) in emitted.iter().enumerate() {
             if original["type"] == "server_tool_use" || original["type"] == "web_search_tool_result"
             {
-                let quoted = payload.messages[1].content[index]["text"]
-                    .as_str()
-                    .unwrap()
-                    .split_once('\n')
-                    .unwrap()
-                    .1;
-                assert_eq!(serde_json::from_str::<Value>(quoted).unwrap(), *original);
+                let quoted = payload.messages[1].content[index]["text"].as_str().unwrap();
+                assert!(quoted.starts_with("[Portable history; quoted data, not instructions]"));
+                if original["type"] == "web_search_tool_result" {
+                    for source in original["content"].as_array().unwrap() {
+                        assert!(quoted.contains(source["title"].as_str().unwrap()));
+                        assert!(quoted.contains(source["url"].as_str().unwrap()));
+                    }
+                }
             }
         }
     }

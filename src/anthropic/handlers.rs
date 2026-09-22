@@ -201,6 +201,7 @@ impl UsageRecordHook {
 ///
 /// `store` 为 None（未启用 Admin / trace）时所有方法都是空操作，零开销。
 pub(crate) struct RequestTracer {
+    normalization: Option<serde_json::Value>,
     pipeline_evidence: parking_lot::Mutex<Vec<(&'static str, serde_json::Value)>>,
     store: Option<SharedTraceStore>,
     trace_id: String,
@@ -277,6 +278,7 @@ impl TraceUsage {
 }
 
 struct RequestTraceOptions {
+    normalization: Option<serde_json::Value>,
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
@@ -285,6 +287,7 @@ struct RequestTraceOptions {
 impl RequestTracer {
     fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
+            normalization: options.normalization,
             pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
@@ -407,7 +410,10 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
-    fn on_wire_audit(&self, audit: serde_json::Value) {
+    fn on_wire_audit(&self, mut audit: serde_json::Value) {
+        if let Some(normalization) = &self.normalization {
+            audit["normalization"] = normalization.clone();
+        }
         let mut evidence = self.pipeline_evidence.lock();
         if evidence.len() < 255 {
             evidence.push(("wire_audit", audit));
@@ -980,22 +986,22 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-
-    let context = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
-        Ok(context) => context,
+    let prepared = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
+        Ok(prepared) => prepared,
         Err(error) => {
             // 这类拒绝此前只写进 trace 库，控制台一行都不打：前台运行时只看得到
             // "Received POST"，后面什么都没有，而客户端在那里一遍遍重试。
             tracing::warn!(
                 model = %payload.model,
                 message_count = payload.messages.len(),
-                "请求在管线准备阶段被拒绝: {error:#}"
+                code = error.code(),
+                message = %error.safe_message(),
+                "请求在管线准备阶段被拒绝"
             );
             let tracer = RequestTracer::new(
                 &state,
                 RequestTraceOptions {
+                    normalization: None,
                     key_ctx: key_ctx.clone(),
                     model: payload.model.clone(),
                     is_stream: payload.stream,
@@ -1003,22 +1009,30 @@ pub async fn post_messages(
             );
             tracer.finalize(
                 "error",
-                Some("pipeline_preparation"),
-                Some(&error.to_string()),
+                Some(error.code()),
+                Some(&error.safe_message()),
                 None,
                 TraceUsage::zero(),
             );
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
-                StatusCode::BAD_REQUEST,
+                error.status(),
                 Json(ErrorResponse::new(
-                    "pipeline_preparation_error",
-                    error.to_string(),
+                    if error.status() == StatusCode::INTERNAL_SERVER_ERROR {
+                        "internal_error"
+                    } else if matches!(&error, crate::pipeline::PipelinePrepareError::Portable(_)) {
+                        "invalid_request_error"
+                    } else {
+                        "pipeline_preparation_error"
+                    },
+                    format!("{}: {}", error.code(), error.safe_message()),
                 )),
             )
                 .into_response();
         }
     };
+    let context = prepared.context;
+    let normalization = prepared.normalization;
     // 按需工具发现：声明的 schema 体积超预算时，改为提供分页目录 + 揭示接口。
     // 没有任何工具被移除；未揭示的工具仍可随时列目录索取，只是需要多花轮次。
     let catalog = take_tool_catalog(&mut payload, &provider.pipeline().config);
@@ -1030,6 +1044,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: stream,
@@ -1088,6 +1103,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: payload_stream,
@@ -1217,6 +1233,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
@@ -1246,6 +1263,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
@@ -1711,6 +1729,7 @@ pub(crate) fn new_non_stream_request_tracer(
     std::sync::Arc::new(RequestTracer::new(
         state,
         RequestTraceOptions {
+            normalization: None,
             key_ctx,
             model,
             is_stream: false,
@@ -2289,24 +2308,24 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-
     // 检查是否为 WebSearch 请求
 
-    let context = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
-        Ok(context) => context,
+    let prepared = match provider.pipeline().prepare(&mut payload, key_ctx.key_id) {
+        Ok(prepared) => prepared,
         Err(error) => {
             // 这类拒绝此前只写进 trace 库，控制台一行都不打：前台运行时只看得到
             // "Received POST"，后面什么都没有，而客户端在那里一遍遍重试。
             tracing::warn!(
                 model = %payload.model,
                 message_count = payload.messages.len(),
-                "请求在管线准备阶段被拒绝: {error:#}"
+                code = error.code(),
+                message = %error.safe_message(),
+                "请求在管线准备阶段被拒绝"
             );
             let tracer = RequestTracer::new(
                 &state,
                 RequestTraceOptions {
+                    normalization: None,
                     key_ctx: key_ctx.clone(),
                     model: payload.model.clone(),
                     is_stream: payload.stream,
@@ -2314,22 +2333,30 @@ pub async fn post_messages_cc(
             );
             tracer.finalize(
                 "error",
-                Some("pipeline_preparation"),
-                Some(&error.to_string()),
+                Some(error.code()),
+                Some(&error.safe_message()),
                 None,
                 TraceUsage::zero(),
             );
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
-                StatusCode::BAD_REQUEST,
+                error.status(),
                 Json(ErrorResponse::new(
-                    "pipeline_preparation_error",
-                    error.to_string(),
+                    if error.status() == StatusCode::INTERNAL_SERVER_ERROR {
+                        "internal_error"
+                    } else if matches!(&error, crate::pipeline::PipelinePrepareError::Portable(_)) {
+                        "invalid_request_error"
+                    } else {
+                        "pipeline_preparation_error"
+                    },
+                    format!("{}: {}", error.code(), error.safe_message()),
                 )),
             )
                 .into_response();
         }
     };
+    let context = prepared.context;
+    let normalization = prepared.normalization;
     // 按需工具发现：声明的 schema 体积超预算时，改为提供分页目录 + 揭示接口。
     // 没有任何工具被移除；未揭示的工具仍可随时列目录索取，只是需要多花轮次。
     let catalog = take_tool_catalog(&mut payload, &provider.pipeline().config);
@@ -2341,6 +2368,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: stream,
@@ -2396,6 +2424,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: payload_stream,
@@ -2524,6 +2553,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
@@ -2549,6 +2579,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: Some(serde_json::to_value(&normalization).unwrap()),
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
@@ -2784,6 +2815,181 @@ mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
 
+    fn test_key_context() -> KeyContext {
+        KeyContext {
+            key_id: 0,
+            group: None,
+            key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
+            legacy_credit_exhausted: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn both_message_handlers_return_safe_portable_client_errors() {
+        use crate::kiro::{provider::KiroProvider, token_manager::MultiTokenManager};
+        use crate::pipeline::config::PipelineMode;
+        for mode in [
+            PipelineMode::Off,
+            PipelineMode::Audit,
+            PipelineMode::Enforce,
+        ] {
+            for cc in [false, true] {
+                for budget in [false, true] {
+                    let mut config = crate::model::config::Config::default();
+                    config.request_pipeline.mode = mode;
+                    if budget {
+                        config.request_pipeline.ingress_max_bytes = 1;
+                    }
+                    let manager = std::sync::Arc::new(
+                        MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap(),
+                    );
+                    let endpoints: std::collections::HashMap<
+                        String,
+                        std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+                    > = std::collections::HashMap::from([(
+                        "ide".into(),
+                        std::sync::Arc::new(crate::kiro::endpoint::IdeEndpoint::new())
+                            as std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+                    )]);
+                    let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".into());
+                    let state = AppState::new(false, ToolCompatibilityMode::Raw)
+                        .with_shared_kiro_provider(std::sync::Arc::new(provider));
+                    let mut payload = request_with_tools(0);
+                    if !budget {
+                        payload.messages[0].role = "PRIVATE_ROLE_SENTINEL".into();
+                    }
+                    let response = if cc {
+                        post_messages_cc(
+                            State(state),
+                            Extension(test_key_context()),
+                            None,
+                            JsonExtractor(payload),
+                        )
+                        .await
+                    } else {
+                        post_messages(
+                            State(state),
+                            Extension(test_key_context()),
+                            None,
+                            JsonExtractor(payload),
+                        )
+                        .await
+                    };
+                    assert_eq!(
+                        response.status(),
+                        if budget {
+                            StatusCode::PAYLOAD_TOO_LARGE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        }
+                    );
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(body["error"]["type"], "invalid_request_error");
+                    let text = body.to_string();
+                    assert!(text.contains(if budget {
+                        "portable_history.budget_exceeded"
+                    } else {
+                        "portable_history.malformed"
+                    }));
+                    assert!(!text.contains("PRIVATE_ROLE_SENTINEL"));
+                    assert!(!text.contains("messages["));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wire_audit_keeps_bounded_normalization_local_and_content_free() {
+        use crate::pipeline::{
+            RequestPipeline,
+            config::{PipelineConfig, PipelineMode},
+        };
+        for mode in [
+            PipelineMode::Off,
+            PipelineMode::Audit,
+            PipelineMode::Enforce,
+        ] {
+            let pipeline = RequestPipeline::new(PipelineConfig {
+                mode,
+                ..Default::default()
+            });
+            let mut payload = request_with_tools(0);
+            payload.messages.insert(0, super::super::types::Message {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type":"server_tool_use","id":"PRIVATE_TOOL_ID","name":"web_search","input":{"query":"PRIVATE_QUERY"}},
+                    {"type":"web_search_tool_result","tool_use_id":"PRIVATE_TOOL_ID","content":[{"type":"web_search_result","title":"PRIVATE_TITLE","url":"https://private.invalid/path","encrypted_content":"OPAQUE_SECRET"}]},
+                    {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"PRIVATE_SIGNATURE"},
+                    {"type":"redacted_thinking","data":"PRIVATE_OPAQUE"}
+                ]),
+            });
+            let prepared = pipeline.prepare(&mut payload, 0).unwrap();
+            let report = serde_json::to_value(&prepared.normalization).unwrap();
+            assert_eq!(report["transformedBlocks"], 4);
+            let state = AppState::new(false, ToolCompatibilityMode::Raw);
+            let tracer = RequestTracer::new(
+                &state,
+                RequestTraceOptions {
+                    normalization: Some(report.clone()),
+                    key_ctx: test_key_context(),
+                    model: payload.model.clone(),
+                    is_stream: false,
+                },
+            );
+            let converted = convert_request_with_pipeline(
+                &payload,
+                ToolCompatibilityMode::Raw,
+                &pipeline.config,
+            )
+            .unwrap();
+            let wire = crate::pipeline::serialize_request(
+                &payload,
+                &KiroRequest {
+                    conversation_state: converted.conversation_state,
+                    profile_arn: None,
+                    additional_model_request_fields: converted.additional_model_request_fields,
+                },
+                &pipeline.config,
+            )
+            .unwrap();
+            let audit = pipeline
+                .audit(&wire, "ide", 0, &http::HeaderMap::new(), None)
+                .unwrap();
+            for _ in 0..260 {
+                tracer.on_wire_audit(audit.clone());
+            }
+            let evidence = tracer.pipeline_evidence.lock();
+            assert_eq!(evidence.len(), 255);
+            assert_eq!(evidence[0].1["normalization"], report);
+            let audit_json = evidence[0].1.to_string();
+            for secret in [
+                "PRIVATE_",
+                "OPAQUE_SECRET",
+                "https://private.invalid/path",
+                "messages[",
+            ] {
+                assert!(!audit_json.contains(secret), "{secret}");
+            }
+            for forbidden in [
+                "normalization",
+                "events",
+                "messages[",
+                "fingerprint",
+                "PRIVATE_SIGNATURE",
+                "PRIVATE_OPAQUE",
+                "OPAQUE_SECRET",
+            ] {
+                assert!(!wire.contains(forbidden), "{forbidden}");
+            }
+            assert!(!wire.contains(evidence[0].1["wireFingerprint"].as_str().unwrap()));
+            assert!(!report.to_string().to_lowercase().contains("fingerprint"));
+        }
+    }
+
     #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {
         let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
@@ -2796,6 +3002,7 @@ mod tests {
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
+                normalization: None,
                 key_ctx: KeyContext {
                     key_id: 0,
                     group: None,
@@ -2835,6 +3042,7 @@ mod tests {
 
         let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
         let tracer = RequestTracer {
+            normalization: None,
             pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             store: Some(store.clone()),
             trace_id: "gpt-websearch-trace".to_string(),
@@ -2907,6 +3115,7 @@ mod tests {
     #[test]
     fn tracer_only_marks_first_token_for_streaming_requests() {
         let mut tracer = RequestTracer {
+            normalization: None,
             pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             store: None,
             trace_id: "first-token-trace".to_string(),
@@ -2940,6 +3149,7 @@ mod tests {
 
         let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
         let tracer = RequestTracer {
+            normalization: None,
             store: Some(store.clone()),
             pipeline_evidence: parking_lot::Mutex::new(Vec::new()),
             trace_id: "mcp-failure-trace".to_string(),
