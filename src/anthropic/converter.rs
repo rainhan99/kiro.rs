@@ -677,6 +677,18 @@ fn parse_content_block(item: &serde_json::Value) -> Result<ContentBlock, Convers
             "content block must be an object with a type string",
         ));
     }
+    // Check presence before Option fields collapse explicit null into absence.
+    // Defaults apply only to omitted fields, never to malformed supplied values.
+    if item["type"] == "tool_use" && item.get("input").is_some_and(|input| !input.is_object()) {
+        return Err(invariant("tool_use input must be an object"));
+    }
+    if item["type"] == "tool_result"
+        && item
+            .get("is_error")
+            .is_some_and(|is_error| !is_error.is_boolean())
+    {
+        return Err(invariant("tool_result is_error must be a boolean"));
+    }
     let block: ContentBlock = serde_json::from_value(item.clone())
         .map_err(|_| invariant("content block must be an object with a valid type and fields"))?;
     // Option<Value> collapses explicit null into absence; null is still an invalid scalar.
@@ -2468,6 +2480,109 @@ mod tests {
         ]));
         let error = convert_request(&request).unwrap_err();
         assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_optional_fields_reject_present_non_object_tool_input() {
+        for input in [
+            serde_json::json!(null),
+            serde_json::json!("PRIVATE_CONTENT"),
+            serde_json::json!(7),
+            serde_json::json!([]),
+            serde_json::json!(false),
+        ] {
+            let request = converter_request(serde_json::json!([
+                {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":input}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"result"}]}
+            ]));
+            let error = convert_request(&request).unwrap_err();
+            assert!(matches!(error, ConversionError::InvariantViolation(_)));
+            assert!(!error.to_string().contains("PRIVATE_CONTENT"));
+        }
+    }
+
+    #[test]
+    fn converter_optional_fields_reject_present_non_boolean_result_status() {
+        for is_error in [
+            serde_json::json!(null),
+            serde_json::json!("PRIVATE_CONTENT"),
+            serde_json::json!(7),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let request = converter_request(serde_json::json!([
+                {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"result","is_error":is_error}]}
+            ]));
+            let error = convert_request(&request).unwrap_err();
+            assert!(matches!(error, ConversionError::InvariantViolation(_)));
+            assert!(!error.to_string().contains("PRIVATE_CONTENT"));
+        }
+    }
+
+    #[test]
+    fn converter_optional_fields_reject_null_input_in_legacy_dropped_prefill() {
+        let request = converter_request(serde_json::json!([
+            {"role":"user","content":"continue"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":null}]}
+        ]));
+        let config = crate::pipeline::config::PipelineConfig {
+            unexpressible: crate::pipeline::expressible::UnexpressibleStrategy::Drop,
+            ..Default::default()
+        };
+        let error = convert_request_with_pipeline(&request, ToolCompatibilityMode::Raw, &config)
+            .unwrap_err();
+        assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn converter_optional_fields_preserve_defaults_when_absent() {
+        let request = converter_request(serde_json::json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read"}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"result"}]}
+        ]));
+        let converted = convert_request_with_mode(&request, ToolCompatibilityMode::Raw).unwrap();
+        let Message::Assistant(assistant) = &converted.conversation_state.history[0] else {
+            panic!("paired assistant tool call must remain in history");
+        };
+        let tool_use = &assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(tool_use.input, serde_json::json!({}));
+        let results = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_error);
+        assert_eq!(results[0].status.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn converter_optional_fields_allow_absent_input_in_legacy_dropped_prefill() {
+        let request = converter_request(serde_json::json!([
+            {"role":"user","content":"continue"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read"}]}
+        ]));
+        let config = crate::pipeline::config::PipelineConfig {
+            unexpressible: crate::pipeline::expressible::UnexpressibleStrategy::Drop,
+            ..Default::default()
+        };
+        let converted =
+            convert_request_with_pipeline(&request, ToolCompatibilityMode::Raw, &config).unwrap();
+        assert_eq!(
+            converted
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "continue"
+        );
+        assert!(converted.conversation_state.history.is_empty());
     }
 
     #[test]
