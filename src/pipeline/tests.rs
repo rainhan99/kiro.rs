@@ -37,6 +37,17 @@ impl FakeKiroUpstream {
     }
 }
 
+fn wire_contains_text(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(needle),
+        Value::Array(values) => values.iter().any(|value| wire_contains_text(value, needle)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| wire_contains_text(value, needle)),
+        _ => false,
+    }
+}
+
 #[test]
 fn cc_switch_history_reaches_fake_kiro_without_private_fields() {
     let mut payload: MessagesRequest = serde_json::from_str(include_str!(concat!(
@@ -65,17 +76,72 @@ fn cc_switch_history_reaches_fake_kiro_without_private_fields() {
     let mut upstream = FakeKiroUpstream::default();
     upstream.send(body);
     assert_eq!(upstream.received.len(), 1);
-    let received = &upstream.received[0];
+    let received: Value = serde_json::from_str(&upstream.received[0]).unwrap();
+    assert_eq!(
+        received
+            .pointer("/conversationState/currentMessage/userInputMessage/content")
+            .and_then(Value::as_str),
+        Some("Continue after switching providers")
+    );
+    let history = received
+        .pointer("/conversationState/history")
+        .and_then(Value::as_array)
+        .unwrap();
+    let use_entry = history
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .pointer("/assistantResponseMessage/toolUses")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|tool| tool.get("toolUseId").and_then(Value::as_str) == Some("read-1"));
+    assert!(use_entry.is_some(), "read-1 invocation must reach Kiro");
+    let result_entry = history
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .pointer("/userInputMessage/userInputMessageContext/toolResults")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|result| result.get("toolUseId").and_then(Value::as_str) == Some("read-1"))
+        .expect("read-1 result must reach Kiro");
+    let result_text = result_entry
+        .get("content")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
     for expected in [
-        "Continue after switching providers",
         "PORTABLE_DOCUMENT_TEXT_SENTINEL",
-        "PUBLIC_SEARCH_TITLE_SENTINEL",
-        "https://public-search.invalid/portable-history",
-        "read-1",
+        "FUTURE_READABLE_TEXT_SENTINEL",
     ] {
         assert!(
-            received.contains(expected),
-            "fake upstream missed {expected}: {received}"
+            result_text.contains(expected),
+            "read-1 result missed {expected}: {result_text}"
+        );
+    }
+    let search_text = history
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .pointer("/assistantResponseMessage/content")
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "PUBLIC_SEARCH_TITLE_SENTINEL",
+        "https://public-search.invalid/portable-history",
+    ] {
+        assert!(
+            search_text.contains(expected),
+            "projected search content missed {expected}: {search_text}"
         );
     }
     for forbidden in [
@@ -85,11 +151,12 @@ fn cc_switch_history_reaches_fake_kiro_without_private_fields() {
         "normalization",
         "messages[",
         "portable_history.",
-        "\"source\":{\"type\":\"text\"",
+        "BINARY_ATTACHMENT_MUST_NOT_REACH_KIRO",
+        "QklOQVJZX0FUVEFDSE1FTlRfTVVTVF9OT1RfUkVBQ0hfS0lSTw==",
     ] {
         assert!(
-            !received.contains(forbidden),
-            "fake upstream received {forbidden}: {received}"
+            !wire_contains_text(&received, forbidden),
+            "fake upstream received private value {forbidden}: {received}"
         );
     }
 }

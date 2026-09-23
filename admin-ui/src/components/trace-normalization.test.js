@@ -11,7 +11,25 @@ test('normalization evidence exposes counts but no arbitrary content', () => {
   expect(JSON.stringify(summary)).not.toContain('SECRET')
 })
 
-test('malformed evidence is not rendered as trusted numbers', () => {
-  expect(normalizationSummary({ transformedBlocks: -1 })).toBeNull()
+const validEvidence = () => ({
+  strategy: 'portable-text', scannedBlocks: 9, transformedBlocks: 3,
+  opaqueBytes: 40, eventsTruncated: false,
+})
+
+test('each numeric counter rejects malformed values independently', () => {
+  for (const field of ['scannedBlocks', 'transformedBlocks', 'opaqueBytes']) {
+    for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '9', Infinity, NaN]) {
+      expect(normalizationSummary({ ...validEvidence(), [field]: value })).toBeNull()
+    }
+  }
+})
+
+test('strategy and truncation types are independently validated', () => {
+  for (const strategy of [null, 'unknown', 1, {}]) {
+    expect(normalizationSummary({ ...validEvidence(), strategy })).toBeNull()
+  }
+  for (const eventsTruncated of [null, 0, 'false', {}]) {
+    expect(normalizationSummary({ ...validEvidence(), eventsTruncated })).toBeNull()
+  }
   expect(normalizationSummary('bad')).toBeNull()
 })

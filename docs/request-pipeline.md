@@ -43,7 +43,7 @@
 
 ## 跨上游历史的可移植边界
 
-`unexpressible` 与 `mode` 正交：历史归一化在请求准备阶段先运行，不以 `audit`、`off` 或 `enforce` 作为关闭它的开关。默认 `portable-text` 只处理**历史**，即最后一条用户消息之前的会话记录；当前输入是安全边界，最后一条用户消息遇到 document、未知块、provider 私有块或其他 Kiro 无法表达的内容会明确拒绝，绝不降级、截断或静默丢弃。
+`unexpressible` 与 `mode` 正交：历史归一化在请求准备阶段先运行，不以 `audit`、`off` 或 `enforce` 作为关闭它的开关。默认 `portable-text` 只处理**历史**，即最后一条用户消息之前的会话记录；在 `portable-text` 和 `refuse` 策略中，当前输入是安全边界，最后一条用户消息遇到 document、未知块、provider 私有块或其他 Kiro 无法表达的内容会明确拒绝，绝不降级、截断或静默丢弃。旧版 `drop` 则是明确的兼容/有损选择：它可有意丢弃当前不支持的输入和末尾 assistant prefill。
 
 历史 document 的可读文本、已完成搜索的公共标题/URL，以及未来块的明确可读字段可以投影为文本。provider 私有签名、加密搜索内容和 `redacted_thinking` 的不透明负载会被移除或替换为不含原文的说明；工具 ID 与已验证的工具配对仍保留。此过程**不**抓取 URL、不会下载或探测远程资源、不会 OCR 或解析 PDF/二进制，也没有为转换设置网络重试。不能验证配对、角色或结构时会拒绝，而不是删除历史来“修好”请求。
 
@@ -93,7 +93,7 @@ Token 预算报告随请求构造审计一并输出（`tokenMetrics`）：按当
 
 `agentMode` 的 body 和 IDE header 使用同一配置（vibe/spec）；不要为测缓存而反复切换。`toolCompatibilityMode:raw` 是示例中的独立选择：保留客户端工具定义；继续使用原来的 `claude-code` 模式则仍按既有兼容规则映射内置工具和 schema。
 
-新管线不会因长度错误换模型、缩短思考预算、总结/裁剪历史或盲目换号重试。显式预算不再被反序列化上限或模型名后缀静默覆盖。当前输入中 Kiro 不支持的内容（例如 assistant prefill）直接报错；历史跨上游内容则按 `unexpressible` 的可移植、拒绝或旧版有损策略处理。
+新管线不会因长度错误换模型、缩短思考预算、总结/裁剪历史或盲目换号重试。显式预算不再被反序列化上限或模型名后缀静默覆盖。在 `portable-text` 或 `refuse` 下，当前输入中 Kiro 不支持的内容（例如 assistant prefill）直接报错；显式选择旧版 `drop` 时，这些当前不支持内容和末尾 assistant prefill 可被有意丢弃。历史跨上游内容则按 `unexpressible` 的可移植、拒绝或旧版有损策略处理。
 
 HTTP 请求头与 prompt 里的“头部文本”必须分开看：本项目由 endpoint 构造出站 HTTP 头，不透传任意客户端头；`amz-sdk-invocation-id` 仍按请求生成，不能为追求缓存而固定。`x-anthropic-billing-header:` 在此指 system 文本里的已知生成行，删除它才会改变模型输入。出站头变化是否参与 Kiro 的服务端缓存键未知，不能仅凭名称或尺寸断言其导致缓存未命中。
 

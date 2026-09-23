@@ -20,6 +20,11 @@
               "title": "portable-note.txt",
               "source": { "type": "text", "media_type": "text/plain", "data": "PORTABLE_DOCUMENT_TEXT_SENTINEL" }
             },
+            {
+              "type": "document",
+              "title": "opaque-attachment.bin",
+              "source": { "type": "base64", "media_type": "application/octet-stream", "data": "QklOQVJZX0FUVEFDSE1FTlRfTVVTVF9OT1RfUkVBQ0hfS0lSTw==" }
+            },
             { "type": "future_readable_block", "text": "FUTURE_READABLE_TEXT_SENTINEL" }
           ]
         }

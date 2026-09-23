@@ -62,9 +62,30 @@ impl Fixture {
         Self(path)
     }
     fn run(&self, config: Value, request: Option<Value>) -> std::process::Output {
+        self.run_inner(config, request, false)
+    }
+    #[cfg(target_os = "macos")]
+    fn run_network_denied(&self, config: Value, request: Option<Value>) -> std::process::Output {
+        self.run_inner(config, request, true)
+    }
+    fn run_inner(
+        &self,
+        config: Value,
+        request: Option<Value>,
+        deny_network: bool,
+    ) -> std::process::Output {
         let config_path = self.0.join("config.json");
         fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kiro-rs"));
+        let mut command = if deny_network {
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command
+                .arg("-p")
+                .arg("(version 1) (allow default) (deny network*)")
+                .arg(env!("CARGO_BIN_EXE_kiro-rs"));
+            command
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_kiro-rs"))
+        };
         command
             .arg("--config")
             .arg(&config_path)
@@ -141,12 +162,13 @@ fn inspection_rejects_invalid_request_and_outputs_configured_budget_failure() {
     assert_eq!(result["networkRequests"], 0);
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn cc_switch_history_is_inspected_without_network_or_opaque_leakage() {
     let fixture = Fixture::new();
     let request: Value =
         serde_json::from_str(include_str!("fixtures/portable-history-cc-switch.json")).unwrap();
-    let output = fixture.run(
+    let output = fixture.run_network_denied(
         json!({"requestPipeline":{"unexpressible":"portable-text"}}),
         Some(request),
     );
@@ -156,7 +178,10 @@ fn cc_switch_history_is_inspected_without_network_or_opaque_leakage() {
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["networkRequests"], 0);
+    assert_eq!(
+        result["networkRequests"], 0,
+        "output contract only; the sandbox is the independent network proof"
+    );
     assert!(
         result["normalization"]["transformedBlocks"]
             .as_u64()
