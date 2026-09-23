@@ -59,3 +59,30 @@ release 离线 fixture 实际输出：body 1080 字节、cachePoint 1 个、`net
 已启动仅含临时配置、无账号、无 inference provider 的本机管理端 fixture，浏览器访问被应用内浏览器以 `ERR_BLOCKED_BY_CLIENT` 拦截。没有绕过限制，**没有宣称浏览器交互、视觉或窄屏验收通过**；临时服务已停止、临时配置已清理。生产实例未启动或重启。
 
 三阶段完整要求仍有缺项，见 [逐项覆盖核对](request-pipeline-coverage.md)。本轮补齐网页配置，不代表递归 token 统计、结构化上游 400、修改后重试、模型阈值校准、增量记忆或 Map-Reduce 已实现。
+
+## 2026-09-23：Portable cross-provider history 最终验证
+
+验证代码提交：`c74e50365d5bde110819aefce60ea3e797c0059e`（`feat/portable-history`）。以下是本次在 Apple Silicon macOS 上重新执行的结果；未使用账号、凭据、真实请求或生产数据。
+
+| 命令 | 退出状态与计数 | 说明 |
+| --- | --- | --- |
+| `cargo fmt --all` | 0 | 未产生格式化差异。 |
+| `cargo fmt --all --check` | 0 | Rust 格式检查通过。 |
+| `git diff --check` | 0 | 工作树差异无空白错误；运行后 `git diff --stat` 与 `git status --short` 均为空。 |
+| `cargo test --workspace --locked`（未提权） | 101；1,190 通过、76 失败、1 忽略 | macOS 受限执行环境拒绝 loopback/系统配置访问，报 `SystemConfiguration` NULL object 与 `Operation not permitted`；不是产品断言失败。 |
+| 同一 `cargo test --workspace --locked`（提权的权威重跑） | 0；库 1,266 通过、0 失败、1 忽略；CLI 7 通过；desktop 库 16 通过；`kiro_rs` doctest 3 通过、3 忽略；其余两个测试目标 0 测试 | 完整 Rust workspace 通过。忽略项包含既有手工浏览器 fixture 和既有 doctest。 |
+| `cargo test --locked -p kiro-rs --no-default-features`（未提权） | 101；1,190 通过、76 失败、1 忽略 | 同一 macOS loopback/系统配置沙箱限制。 |
+| 同一无默认特性命令（提权的权威重跑） | 0；库 1,266 通过、0 失败、1 忽略；CLI 7 通过；doctest 3 通过、3 忽略 | 不依赖默认 native-tls 特性。 |
+| `cd admin-ui && bun test` | 0；108 通过、0 失败、268 条 `expect()`，15 个文件 | 前端完整测试通过。 |
+| `cd admin-ui && bun run build` | 0；TypeScript 与 Vite 生产构建完成 | 仅见既有 Node `module.register()` 弃用警告；Vite 转换 2,612 个模块。 |
+| `cd admin-ui && bun test src/components/settings/request-pipeline-form.test.js src/components/trace-normalization.test.js` | 0；16 通过、0 失败、70 条 `expect()` | 配置表单与仅本地、内容安全的审计 UI 覆盖。 |
+| `cargo test --test pipeline_cli cc_switch_history_is_inspected_without_network_or_opaque_leakage`（未提权） | 101；0 通过、1 失败、6 过滤 | 测试的 macOS `sandbox-exec` 网络拒绝 harness 在受限执行环境中不能应用 sandbox profile。 |
+| 同一 CLI 隐私命令（提权的权威重跑） | 0；1 通过、0 失败、6 过滤 | 网络拒绝 harness 下的离线 CLI 断言通过。 |
+| `cargo test -p kiro-rs cc_switch_history_reaches_fake_kiro_without_private_fields --lib` | 0；1 通过、0 失败、1,266 过滤 | fake-upstream 最终 wire 回归通过。 |
+| `jq empty config.pipeline.example.json tests/fixtures/portable-history-cc-switch.json` | 0 | 示例配置和已净化 fixture 都是有效 JSON。 |
+| `cargo run --locked -- --config config.pipeline.example.json --check-config` | 0；`configurationValid: true`，`networkRequests: 0` | 只做本地配置构造。 |
+| `cargo run --locked -- --config config.pipeline.example.json --inspect-request tests/fixtures/portable-history-cc-switch.json` | 0；`configurationValid: true`，`networkRequests: 0`，`normalization.transformedBlocks: 7` | 输出未含 fixture 的私有哨兵或私有内容；仅记录聚合归一化结果。 |
+
+两个 focused privacy 回归共同覆盖离线边界：CLI 在网络拒绝 harness 中构造请求，final-wire 使用内存 fake upstream；它们断言私有字段、原始附件/结构和本地归一化元数据不会出现在可发送 body 中，同时保留公开的工具配对和可读历史。该证据是**离线构造与序列化证据，不是 Kiro 实时接受、缓存或推理等价性的证据**。
+
+分支卫生 RED：`git diff master...HEAD --check` 返回 2，唯一输出是 `docs/superpowers/specs/2026-09-22-portable-history-design.md:272: new blank line at EOF.`；`git blame` 将该行归于本分支已有的设计提交 `1812672`。经明确授权，Task 7 仅删除该文件 EOF 的额外空行（无产品代码变更）。GREEN：包含这两个文档变更的暂存内容执行 `git diff --cached --merge-base master --check` 返回 0；提交后的同一 `master...HEAD` 检查见本任务报告。未推送或合并任何分支。

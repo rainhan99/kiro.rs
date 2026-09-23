@@ -269,4 +269,3 @@ cd admin-ui && bun test && bun run build
 5. 三种 PipelineMode 和三种 unexpressible 策略行为有自动测试证明。
 6. 归一化幂等、原子、无外部网络访问，失败时上游调用次数为零。
 7. 完整 Rust/前端测试、无默认特性测试、格式检查和生产构建通过。
-
