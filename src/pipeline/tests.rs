@@ -42,10 +42,19 @@ fn wire_contains_text(value: &Value, needle: &str) -> bool {
         Value::String(text) => text.contains(needle),
         Value::Array(values) => values.iter().any(|value| wire_contains_text(value, needle)),
         Value::Object(values) => values
-            .values()
-            .any(|value| wire_contains_text(value, needle)),
+            .iter()
+            .any(|(key, value)| key.contains(needle) || wire_contains_text(value, needle)),
         _ => false,
     }
+}
+
+#[test]
+fn wire_contains_text_detects_nested_object_keys_and_values() {
+    let nested = json!({
+        "outer": [{"normalization": {"detail": "safe value"}}]
+    });
+    assert!(wire_contains_text(&nested, "normalization"));
+    assert!(wire_contains_text(&nested, "safe value"));
 }
 
 #[test]
