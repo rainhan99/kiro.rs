@@ -827,9 +827,9 @@ Artifacts 区，不会出现在 Releases 页面——Releases 是空的通常说
 
 低位连锁进位也成立：`patch` 作用于 `0.99.999` 得到 `1.0.0`。
 
-发布方式：在 Actions 里手动运行 **Release**，`level` 选 `patch`（默认）/ `minor` / `major`，工作流会自己算出下一个版本、同步改写 `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json`、提交并据此打 tag 发布，无需手工改版本号。要发布一个已经写死在 `Cargo.toml` 里的版本，把 `level` 选成 `none` 并填 `version`。直接推 `v*` tag 的老方式继续可用。
+发布方式：在 Actions 里手动运行 **Release**，`level` 选 `patch`（默认）/ `minor` / `major`，工作流会自己算出下一个版本、同步改写根 Cargo 包、管理前端、桌面 Cargo/Tauri 配置及 `Cargo.lock` 中的本地包版本，提交并据此打 tag 发布，无需手工改版本号。要发布一个已经写死在 `Cargo.toml` 里的版本，把 `level` 选成 `none` 并填 `version`。直接推 `v*` tag 的老方式继续可用。
 
-- 校验 `Cargo.toml` 版本和 tag 一致。
+- 校验根 Cargo 包、管理前端、桌面 Cargo/Tauri 配置及 `Cargo.lock` 的本地包版本和 tag 全部一致。
 - 构建 Admin UI。
 - 构建多平台二进制。
 - 构建并推送 Docker Hub 多架构镜像（**可选**：仓库未配置 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets 时自动跳过）。

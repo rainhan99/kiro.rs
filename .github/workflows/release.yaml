@@ -84,34 +84,19 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/next-version.sh --self-test
+          bash scripts/sync-release-version.test.sh
           CURRENT="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           NEXT="$(bash scripts/next-version.sh "$LEVEL" "$CURRENT")"
           echo "::notice::Version bump: ${CURRENT} -> ${NEXT} (${LEVEL})"
 
-          # 三处版本必须一起改：Cargo.toml 是发布校验的来源，Cargo.lock 里本包的
-          # 版本若不同步会让 --locked 构建失败，package.json 决定前端产物版本。
-          sed -i "0,/^version = \"${CURRENT}\"/s//version = \"${NEXT}\"/" Cargo.toml
-          sed -i "s/^  \"version\": \"${CURRENT}\",/  \"version\": \"${NEXT}\",/" admin-ui/package.json
-          python3 - "$CURRENT" "$NEXT" <<'PY'
-          import re, sys
-          current, nxt = sys.argv[1], sys.argv[2]
-          path = "Cargo.lock"
-          text = open(path, encoding="utf-8").read()
-          # 只改本包自己的条目，不碰任何依赖的版本。
-          updated = re.sub(
-              r'(\[\[package\]\]\nname = "kiro-rs"\nversion = ")%s(")' % re.escape(current),
-              r"\g<1>%s\g<2>" % nxt,
-              text,
-              count=1,
-          )
-          if updated == text:
-              raise SystemExit("Cargo.lock: kiro-rs %s entry not found; refusing to tag a mismatched lockfile" % current)
-          open(path, "w", encoding="utf-8").write(updated)
-          PY
+          # 服务端、管理前端与桌面应用必须保持同一个发布版本；脚本会先校验
+          # 所有来源，再一起写入，避免生成版本不一致的 tag。
+          bash scripts/sync-release-version.sh "$CURRENT" "$NEXT"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock admin-ui/package.json
+          git add Cargo.toml Cargo.lock admin-ui/package.json \
+            desktop/src-tauri/Cargo.toml desktop/src-tauri/tauri.conf.json
           git commit -m "chore(release): ${NEXT}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
           echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
@@ -154,11 +139,9 @@ jobs:
             exit 1
           fi
 
-          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          if [ "$CARGO_VERSION" != "$VERSION" ]; then
-            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match requested release version ($VERSION)"
-            exit 1
-          fi
+          # 自动进位、显式版本与 tag 三条入口都必须验证全部版本源，不能只看
+          # 根 Cargo.toml 后就发布一个桌面端或 lockfile 仍旧落后的版本。
+          bash scripts/sync-release-version.sh --check "$VERSION"
 
           TAG="v${VERSION}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
