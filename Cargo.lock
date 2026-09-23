@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-rs"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-rs-desktop"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "directories",

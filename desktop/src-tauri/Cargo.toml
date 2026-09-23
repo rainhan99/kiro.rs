@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs-desktop"
-version = "0.9.5"
+version = "0.9.6"
 edition = "2024"
 description = "kiro-rs 桌面应用：原生窗口 + 进程内代理"
 
