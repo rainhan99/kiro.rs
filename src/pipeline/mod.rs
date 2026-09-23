@@ -190,6 +190,15 @@ impl RequestPipeline {
         }
         // Commit only after every enabled preparation step has succeeded.
         *payload = candidate;
+        if normalization.transformed_blocks > 0 {
+            tracing::warn!(
+                strategy = normalization.strategy.as_str(),
+                scanned_blocks = normalization.scanned_blocks,
+                transformed_blocks = normalization.transformed_blocks,
+                opaque_bytes = normalization.opaque_bytes,
+                "portable history transformed"
+            );
+        }
         Ok(PrepareOutcome {
             context,
             normalization,

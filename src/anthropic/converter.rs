@@ -892,7 +892,7 @@ fn convert_request_inner(
     // 连同未知角色、未知内容块一起处理过了；这里是最后一道，兜住不经过 prepare
     // 的调用（内部轮次、compaction 通道），免得同一份配置两条路径表现不同。
     let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
-        if unexpressible == crate::pipeline::expressible::UnexpressibleStrategy::Refuse {
+        if unexpressible != crate::pipeline::expressible::UnexpressibleStrategy::Drop {
             return Err(ConversionError::InvalidMessageSequence(
                 "Kiro does not support assistant prefill; supply a final user turn \
                  (no messages have been dropped)"
@@ -2447,6 +2447,43 @@ mod tests {
         ]));
         let error = convert_request(&request).unwrap_err();
         assert!(matches!(error, ConversionError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn final_review_direct_converter_only_drop_may_remove_prefill() {
+        use crate::pipeline::expressible::UnexpressibleStrategy;
+        for strategy in [
+            UnexpressibleStrategy::PortableText,
+            UnexpressibleStrategy::Refuse,
+            UnexpressibleStrategy::Drop,
+        ] {
+            let request = converter_request(serde_json::json!([
+                {"role":"user","content":"continue"},
+                {"role":"assistant","content":"partial answer"}
+            ]));
+            let config = crate::pipeline::config::PipelineConfig {
+                unexpressible: strategy,
+                ..Default::default()
+            };
+            let result =
+                convert_request_with_pipeline(&request, ToolCompatibilityMode::Raw, &config);
+            if strategy == UnexpressibleStrategy::Drop {
+                assert_eq!(
+                    result
+                        .unwrap()
+                        .conversation_state
+                        .current_message
+                        .user_input_message
+                        .content,
+                    "continue"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ConversionError::InvalidMessageSequence(_))),
+                    "{strategy:?} must fail closed"
+                );
+            }
+        }
     }
 
     #[test]

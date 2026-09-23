@@ -2457,6 +2457,77 @@ mod tests {
     }
 
     #[test]
+    fn final_review_completed_search_replays_across_strategies_and_modes() {
+        use crate::pipeline::{
+            RequestPipeline,
+            config::{PipelineConfig, PipelineMode},
+            expressible::UnexpressibleStrategy,
+        };
+        let emitted = build_flush_content(
+            Vec::new(),
+            "Answer",
+            &[tu("web_search")],
+            &[fake_results("public query")],
+            &names(&["web_search"]),
+            &nomap(),
+        );
+        for mode in [
+            PipelineMode::Off,
+            PipelineMode::Audit,
+            PipelineMode::Enforce,
+        ] {
+            for strategy in [
+                UnexpressibleStrategy::PortableText,
+                UnexpressibleStrategy::Refuse,
+                UnexpressibleStrategy::Drop,
+            ] {
+                let mut payload = payload_with_last_block(json!({"type":"text","text":"question"}));
+                payload.messages.extend([
+                    Message {
+                        role: "assistant".into(),
+                        content: Value::Array(emitted.clone()),
+                    },
+                    Message {
+                        role: "user".into(),
+                        content: json!("Continue"),
+                    },
+                ]);
+                let pipeline = RequestPipeline::new(PipelineConfig {
+                    mode,
+                    unexpressible: strategy,
+                    ..Default::default()
+                });
+                let prepared = pipeline.prepare(&mut payload, 7).unwrap();
+                assert_eq!(prepared.normalization.transformed_blocks, 2);
+                assert_eq!(prepared.normalization.by_action.get("legacy_dropped"), None);
+                let converted = crate::anthropic::converter::convert_request_with_pipeline(
+                    &payload,
+                    ToolCompatibilityMode::Raw,
+                    &pipeline.config,
+                )
+                .unwrap();
+                let wire = serde_json::to_string(&converted.conversation_state).unwrap();
+                for block in &emitted {
+                    if block["type"] == "web_search_tool_result" {
+                        for result in block["content"].as_array().unwrap() {
+                            assert!(wire.contains(result["title"].as_str().unwrap()));
+                            assert!(wire.contains(result["url"].as_str().unwrap()));
+                        }
+                    }
+                }
+                assert_eq!(
+                    pipeline
+                        .prepare(&mut payload, 7)
+                        .unwrap()
+                        .normalization
+                        .transformed_blocks,
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn emitted_contract_a_search_results_replay_as_public_portable_history() {
         let emitted = build_flush_content(
             Vec::new(),

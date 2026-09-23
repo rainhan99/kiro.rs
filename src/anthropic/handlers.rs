@@ -2912,6 +2912,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_review_known_malformed_shapes_map_to_safe_400_in_all_modes() {
+        use crate::pipeline::{
+            RequestPipeline,
+            config::{PipelineConfig, PipelineMode},
+            expressible::UnexpressibleStrategy,
+        };
+        for mode in [
+            PipelineMode::Off,
+            PipelineMode::Audit,
+            PipelineMode::Enforce,
+        ] {
+            for strategy in [
+                UnexpressibleStrategy::PortableText,
+                UnexpressibleStrategy::Refuse,
+                UnexpressibleStrategy::Drop,
+            ] {
+                let pipeline = RequestPipeline::new(PipelineConfig {
+                    mode,
+                    unexpressible: strategy,
+                    ..Default::default()
+                });
+                for mut payload in
+                    crate::pipeline::portable_history::tests::final_review_malformed_requests()
+                {
+                    let Err(error) = pipeline.prepare(&mut payload, 1) else {
+                        panic!("malformed input accepted");
+                    };
+                    let response = pipeline_prepare_error_response(&error);
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(body["error"]["type"], "invalid_request_error");
+                    assert_eq!(
+                        body["error"]["message"],
+                        "portable_history.malformed: malformed portable history"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn both_message_handlers_return_safe_portable_client_errors() {
         use crate::kiro::{provider::KiroProvider, token_manager::MultiTokenManager};
         use crate::pipeline::config::PipelineMode;

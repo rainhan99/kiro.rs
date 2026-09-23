@@ -127,6 +127,9 @@ pub fn normalize(
         strategy: strategy_name(strategy).to_string(),
         ..Default::default()
     };
+    // Validate discarded prefill normally, but do not count its intermediate
+    // projections as transformations of the retained request.
+    let mut discarded_report = NormalizationReport::default();
     for (index, message) in normalized.messages.iter_mut().enumerate() {
         let scope =
             if index < frontier || (index > frontier && strategy == UnexpressibleStrategy::Drop) {
@@ -134,17 +137,25 @@ pub fn normalize(
             } else {
                 Scope::Current
             };
-        normalize_message(message, scope, index, strategy, &mut report, fingerprint)?;
+        let message_report = if index > frontier {
+            &mut discarded_report
+        } else {
+            &mut report
+        };
+        normalize_message(message, scope, index, strategy, message_report, fingerprint)?;
     }
     // Validate before dropping prefill so a dangling call cannot disappear.
     validate_tool_pairing(&normalized)?;
     if strategy == UnexpressibleStrategy::Drop {
-        for message in &normalized.messages[frontier + 1..] {
+        report.opaque_bytes += discarded_report.opaque_bytes;
+        for message in &payload.messages[frontier + 1..] {
             if let Some(blocks) = message.content.as_array() {
                 for block in blocks {
+                    let category = block_category(block["type"].as_str().unwrap_or(""));
+                    record_scanned(&mut report, category);
                     record_block(
                         &mut report,
-                        block_category(block["type"].as_str().unwrap_or("")),
+                        category,
                         NormalizationAction::LegacyDropped,
                         block,
                         &Value::Null,
@@ -163,8 +174,10 @@ pub fn normalize(
                 );
             }
         }
-        normalized.messages.truncate(frontier + 1);
     }
+    // The effective frontier must also be the physical wire tail. Empty trailing
+    // messages carry no content and are not an intentional-loss event.
+    normalized.messages.truncate(frontier + 1);
     validate_tool_pairing(&normalized)?;
     Ok(NormalizationOutcome {
         payload: normalized,
@@ -259,7 +272,7 @@ fn normalize_content(
             reason: "content must be a string or content-block array".into(),
         })?;
     let projected_searches = if scope == Scope::History && role == "assistant" {
-        normalize_server_searches(blocks, path, strategy, report, fingerprint)?
+        normalize_server_searches(blocks, path, report, fingerprint)?
     } else {
         BTreeSet::new()
     };
@@ -338,6 +351,12 @@ fn normalize_block(
             }
             require_string(block, "id", path, "tool_use requires an id string")?;
             require_string(block, "name", path, "tool_use requires a name string")?;
+            if block.get("input").is_some_and(|input| !input.is_object()) {
+                return Err(malformed(
+                    path,
+                    "tool_use input must be an object when supplied",
+                ));
+            }
         }
         "tool_result" => {
             if role != "user" {
@@ -349,6 +368,15 @@ fn normalize_block(
                 path,
                 "tool_result requires a tool_use_id string",
             )?;
+            if block
+                .get("is_error")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(malformed(
+                    path,
+                    "tool_result is_error must be boolean when supplied",
+                ));
+            }
             if let Some(content) = block.get_mut("content") {
                 normalize_content(
                     content,
@@ -373,6 +401,10 @@ fn normalize_block(
                 "thinking block requires a thinking string",
             )?;
             if scope == Scope::History && block.get("signature").is_some() {
+                report.opaque_bytes += block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len);
                 block
                     .as_object_mut()
                     .expect("content block was read as an object")
@@ -560,7 +592,6 @@ fn unknown_projection(block: &Value, block_type: &str) -> Value {
 fn normalize_server_searches(
     blocks: &mut [Value],
     path: &str,
-    strategy: UnexpressibleStrategy,
     report: &mut NormalizationReport,
     fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<BTreeSet<usize>, PortableHistoryError> {
@@ -587,15 +618,24 @@ fn normalize_server_searches(
                         "duplicate server search use",
                     ));
                 }
-                let query = block
+                let block_path = format!("{path}[{index}]");
+                let input = block
                     .get("input")
-                    .and_then(Value::as_object)
-                    .and_then(|input| input.get("query"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                    .filter(|input| input.is_object())
+                    .ok_or_else(|| {
+                        malformed(&block_path, "server search requires an input object")
+                    })?;
+                let query = require_string(
+                    input,
+                    "query",
+                    &block_path,
+                    "server search requires a query string",
+                )?
+                .to_owned();
                 pending.insert(id.to_string(), (index, query));
             }
             Some("web_search_tool_result") => {
+                let result_text = search_result_text(block, &format!("{path}[{index}]"))?;
                 let id = match block.get("tool_use_id") {
                     Some(Value::String(id)) => id.to_string(),
                     Some(_) => {
@@ -626,7 +666,7 @@ fn normalize_server_searches(
                         "duplicate server search result",
                     ));
                 }
-                pairs.push((use_index, index, query));
+                pairs.push((use_index, index, query, result_text));
             }
             _ => {}
         }
@@ -639,17 +679,16 @@ fn normalize_server_searches(
     }
 
     let mut projected = BTreeSet::new();
-    for (use_index, result_index, query) in pairs {
+    for (use_index, result_index, query, result_text) in pairs {
         let original_use = blocks[use_index].clone();
         let original_result = blocks[result_index].clone();
-        let use_text = query
-            .map(|query| format!("Web search query: {query}"))
-            .unwrap_or_else(|| "Web search record".into());
+        let use_text = format!("Web search query: {query}");
         blocks[use_index] = quoted_text(use_text);
-        blocks[result_index] = quoted_text(search_result_text(&original_result));
-        let action = legacy_unexpressible(&mut blocks[use_index], strategy, path)?
-            .unwrap_or(NormalizationAction::PortableText);
-        legacy_unexpressible(&mut blocks[result_index], strategy, path)?;
+        blocks[result_index] = quoted_text(result_text);
+        // Completed public search records are expressible after projection under
+        // every strategy. Legacy policy applies only to unsupported content.
+        let action = NormalizationAction::PortableText;
+        report.opaque_bytes += search_opaque_bytes(&original_result);
         record_scanned(report, NormalizationBlockCategory::ServerToolUse);
         record_scanned(report, NormalizationBlockCategory::WebSearchToolResult);
         record_block(
@@ -674,37 +713,115 @@ fn normalize_server_searches(
     Ok(projected)
 }
 
-fn search_result_text(block: &Value) -> String {
+fn search_result_text(block: &Value, path: &str) -> Result<String, PortableHistoryError> {
     const PUBLIC_SEARCH_FIELDS: &[&str] =
         &["title", "url", "content", "snippet", "error", "message"];
 
-    fn collect_public_fields(value: &Value, fields: &mut Vec<String>) {
+    fn collect_public_fields(
+        value: &Value,
+        fields: &mut Vec<String>,
+        path: &str,
+    ) -> Result<(), PortableHistoryError> {
         for field in PUBLIC_SEARCH_FIELDS {
-            if let Some(value) = value.get(*field).and_then(Value::as_str) {
+            if let Some(value) = value.get(*field) {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| malformed(path, "public search fields must be strings"))?;
                 fields.push(format!("{field}: {value}"));
             }
         }
+        Ok(())
     }
 
     let mut fields = Vec::new();
-    collect_public_fields(block, &mut fields);
     match block.get("content") {
+        // Older gateway replies also used plain readable result content.
+        Some(Value::String(content)) => fields.push(format!("content: {content}")),
         Some(Value::Array(content)) => {
             for result in content {
-                collect_public_fields(result, &mut fields);
+                if result.get("type").and_then(Value::as_str) != Some("web_search_result") {
+                    return Err(malformed(
+                        path,
+                        "search result entries must be web_search_result objects",
+                    ));
+                }
+                require_string(
+                    result,
+                    "title",
+                    path,
+                    "search result requires a title string",
+                )?;
+                require_string(result, "url", path, "search result requires a URL string")?;
+                if result
+                    .get("encrypted_content")
+                    .is_some_and(|value| !value.is_string())
+                {
+                    return Err(malformed(path, "encrypted search content must be a string"));
+                }
+                collect_public_fields(result, &mut fields, path)?;
             }
         }
-        Some(Value::Object(_)) => {
-            if let Some(content) = block.get("content") {
-                collect_public_fields(content, &mut fields);
+        Some(content @ Value::Object(_)) => {
+            if content.get("type").and_then(Value::as_str) != Some("web_search_tool_result_error") {
+                return Err(malformed(
+                    path,
+                    "search error content must be a public search error object",
+                ));
             }
+            let code = require_string(
+                content,
+                "error_code",
+                path,
+                "search error requires an error code",
+            )?;
+            if !matches!(
+                code,
+                "invalid_tool_input"
+                    | "unavailable"
+                    | "max_uses_exceeded"
+                    | "too_many_requests"
+                    | "query_too_long"
+                    | "request_too_large"
+            ) {
+                return Err(malformed(path, "unsupported public search error code"));
+            }
+            // The public error code is a closed vocabulary; arbitrary message or
+            // provider-private fields on the error object never enter the text.
+            return Ok(format!("Web search failed: {code}"));
         }
-        _ => {}
+        _ => {
+            return Err(malformed(
+                path,
+                "search result content must be a string, result array or public error object",
+            ));
+        }
     }
-    if fields.is_empty() {
+    Ok(if fields.is_empty() {
         "Web search result record".into()
     } else {
         fields.join("\n")
+    })
+}
+
+fn search_opaque_bytes(block: &Value) -> usize {
+    fn encrypted_bytes(value: &Value) -> usize {
+        value
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .map_or(0, str::len)
+    }
+    encrypted_bytes(block)
+        + match block.get("content") {
+            Some(Value::Array(results)) => results.iter().map(encrypted_bytes).sum(),
+            Some(content @ Value::Object(_)) => encrypted_bytes(content),
+            _ => 0,
+        }
+}
+
+fn malformed(path: &str, reason: &str) -> PortableHistoryError {
+    PortableHistoryError::Malformed {
+        path: path.into(),
+        reason: reason.into(),
     }
 }
 
@@ -902,7 +1019,7 @@ fn action_name(action: NormalizationAction) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::anthropic::types::MessagesRequest;
     use crate::pipeline::expressible::UnexpressibleStrategy;
@@ -924,6 +1041,260 @@ mod tests {
             "messages": messages
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn final_review_empty_tail_is_trimmed_without_loss_events() {
+        for strategy in [
+            UnexpressibleStrategy::PortableText,
+            UnexpressibleStrategy::Refuse,
+            UnexpressibleStrategy::Drop,
+        ] {
+            for tail in [json!(""), json!([])] {
+                let input = request(json!([
+                    {"role":"user","content":"actual frontier"},
+                    {"role":"assistant","content":tail},
+                    {"role":"user","content":tail}
+                ]));
+                let before = serde_json::to_value(&input).unwrap();
+                let normalized = normalize(&input, strategy, &TestFingerprint).unwrap();
+                assert_eq!(normalized.payload.messages.len(), 1);
+                assert_eq!(normalized.report.transformed_blocks, 0);
+                assert!(normalized.report.events.is_empty());
+                assert_eq!(serde_json::to_value(input).unwrap(), before);
+            }
+        }
+    }
+
+    // Shared invalid client shapes exercise the normalizer, prepare atomicity and
+    // the real HTTP error mapper against the same input classes.
+    pub(crate) fn final_review_malformed_requests() -> Vec<MessagesRequest> {
+        let mut cases = Vec::new();
+        for bad in [
+            json!(null),
+            json!(7),
+            json!([]),
+            json!("PRIVATE_SHAPE"),
+            json!(false),
+        ] {
+            cases.push(request(json!([
+                {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":bad}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}
+            ])));
+        }
+        for bad in [
+            json!(null),
+            json!(7),
+            json!([]),
+            json!("PRIVATE_SHAPE"),
+            json!({}),
+        ] {
+            cases.push(request(json!([
+                {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read"}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","is_error":bad,"content":"ok"}]}
+            ])));
+        }
+        for (field, bad) in [
+            ("input", json!(null)),
+            ("input", json!([])),
+            ("input", json!(7)),
+            ("input", json!({"query":7})),
+            ("input", json!({"query":null})),
+            ("input", json!({"query":[]})),
+            ("input", json!({})),
+            ("content", json!(null)),
+            ("content", json!(7)),
+            ("content", json!(false)),
+            ("content", json!({})),
+            ("content", json!([7])),
+            (
+                "content",
+                json!([{"type":"web_search_result","title":7,"url":"https://example.invalid"}]),
+            ),
+            (
+                "content",
+                json!([{"type":"web_search_result","title":"Source","url":null}]),
+            ),
+            (
+                "content",
+                json!([{"type":"web_search_result","title":"Source","url":"https://example.invalid","snippet":{}}]),
+            ),
+            (
+                "content",
+                json!({"type":"web_search_tool_result_error","error_code":7}),
+            ),
+            (
+                "content",
+                json!({"type":"web_search_tool_result_error","error_code":"PRIVATE_SHAPE"}),
+            ),
+        ] {
+            let mut blocks = json!([
+                {"type":"server_tool_use","id":"search-1","name":"web_search","input":{"query":"query"}},
+                {"type":"web_search_tool_result","tool_use_id":"search-1","content":[]}
+            ]);
+            blocks[if field == "input" { 0 } else { 1 }][field] = bad;
+            cases.push(request(json!([
+                {"role":"assistant","content":blocks}, {"role":"user","content":"continue"}
+            ])));
+        }
+        cases
+    }
+
+    #[test]
+    fn final_review_known_malformed_shapes_fail_atomically_in_every_strategy() {
+        let mut accepted_or_misclassified = Vec::new();
+        for strategy in [
+            UnexpressibleStrategy::PortableText,
+            UnexpressibleStrategy::Refuse,
+            UnexpressibleStrategy::Drop,
+        ] {
+            for (index, input) in final_review_malformed_requests().into_iter().enumerate() {
+                let before = serde_json::to_value(&input).unwrap();
+                let result = normalize(&input, strategy, &TestFingerprint);
+                if !matches!(result, Err(PortableHistoryError::Malformed { .. })) {
+                    accepted_or_misclassified.push((index, strategy));
+                }
+                assert_eq!(serde_json::to_value(&input).unwrap(), before);
+            }
+        }
+        assert!(
+            accepted_or_misclassified.is_empty(),
+            "malformed cases accepted or misclassified: {accepted_or_misclassified:?}"
+        );
+    }
+
+    #[test]
+    fn final_review_public_search_errors_remain_distinct_from_empty_success() {
+        let mut texts = Vec::new();
+        for content in [
+            json!([]),
+            json!({
+                "type":"web_search_tool_result_error", "error_code":"max_uses_exceeded",
+                "signature":"PRIVATE_SIGNATURE", "encrypted_content":"PRIVATE_CIPHERTEXT",
+                "arbitrary":"PRIVATE_EXTRA"
+            }),
+        ] {
+            let input = request(json!([
+                {"role":"assistant","content":[
+                    {"type":"server_tool_use","id":"search-1","name":"web_search","input":{"query":"query"}},
+                    {"type":"web_search_tool_result","tool_use_id":"search-1","content":content}
+                ]}, {"role":"user","content":"continue"}
+            ]));
+            let outcome = normalize(
+                &input,
+                UnexpressibleStrategy::PortableText,
+                &TestFingerprint,
+            )
+            .unwrap();
+            let text = outcome.payload.messages[0].content[1]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(!text.contains("PRIVATE_"));
+            let again = normalize(
+                &outcome.payload,
+                UnexpressibleStrategy::PortableText,
+                &TestFingerprint,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&again.payload).unwrap(),
+                serde_json::to_value(&outcome.payload).unwrap()
+            );
+            texts.push(text);
+        }
+        assert_ne!(texts[0], texts[1]);
+        assert!(texts[1].contains("Web search failed: max_uses_exceeded"));
+    }
+
+    #[test]
+    fn final_review_drop_prefill_records_each_original_block_once() {
+        let blocks = json!([
+            {"type":"text","text":"partial"},
+            {"type":"thinking","thinking":"reasoning","signature":"sig"},
+            {"type":"document","source":{"type":"text","data":"doc"}},
+            {"type":"FUTURE_PRIVATE_TYPE","text":"other"},
+            {"type":"server_tool_use","id":"s","name":"web_search","input":{"query":"q"}},
+            {"type":"web_search_tool_result","tool_use_id":"s","content":[]}
+        ]);
+        let input = request(json!([
+            {"role":"user","content":"continue"}, {"role":"assistant","content":blocks}
+        ]));
+        let outcome = normalize(&input, UnexpressibleStrategy::Drop, &TestFingerprint).unwrap();
+        assert_eq!(outcome.payload.messages.len(), 1);
+        assert_eq!(outcome.report.scanned_blocks, 6);
+        assert_eq!(outcome.report.transformed_blocks, 6);
+        assert_eq!(
+            outcome.report.by_action,
+            BTreeMap::from([("legacy_dropped".into(), 6)])
+        );
+        for (index, category) in [
+            NormalizationBlockCategory::Text,
+            NormalizationBlockCategory::Thinking,
+            NormalizationBlockCategory::Document,
+            NormalizationBlockCategory::Unknown,
+            NormalizationBlockCategory::ServerToolUse,
+            NormalizationBlockCategory::WebSearchToolResult,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(outcome.report.by_original_type[&category], 1);
+            let event = &outcome.report.events[index];
+            assert_eq!(event.original_type, category);
+            assert_eq!(event.action, NormalizationAction::LegacyDropped);
+            assert_eq!(
+                event.input_bytes,
+                serde_json::to_vec(&blocks[index]).unwrap().len()
+            );
+        }
+        let dangling = request(json!([
+            {"role":"user","content":"continue"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"dangling","name":"read","input":{}}]}
+        ]));
+        assert!(matches!(
+            normalize(&dangling, UnexpressibleStrategy::Drop, &TestFingerprint),
+            Err(PortableHistoryError::ToolPairing { .. })
+        ));
+    }
+
+    #[test]
+    fn final_review_opaque_bytes_count_all_removed_values_exactly() {
+        let input = request(json!([
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"kept","signature":"签名"},
+                {"type":"redacted_thinking","data":"hidden"},
+                {"type":"server_tool_use","id":"s","name":"web_search","input":{"query":"q"}},
+                {"type":"web_search_tool_result","tool_use_id":"s","content":[
+                    {"type":"web_search_result","title":"one","url":"https://example.invalid/1","encrypted_content":"cipher"},
+                    {"type":"web_search_result","title":"two","url":"https://example.invalid/2","encrypted_content":"密"}
+                ]}
+            ]}, {"role":"user","content":"continue"}
+        ]));
+        let outcome = normalize(
+            &input,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap();
+        assert_eq!(outcome.report.opaque_bytes, 21); // 6 + 6 + 6 + 3 UTF-8 bytes.
+        let serialized = serde_json::to_string(&outcome.payload).unwrap();
+        let report = serde_json::to_string(&outcome.report).unwrap();
+        for private in ["签名", "hidden", "cipher", "密"] {
+            assert!(!serialized.contains(private));
+            assert!(!report.contains(private));
+        }
+        assert_eq!(
+            normalize(
+                &outcome.payload,
+                UnexpressibleStrategy::PortableText,
+                &TestFingerprint
+            )
+            .unwrap()
+            .report
+            .opaque_bytes,
+            0
+        );
     }
 
     #[test]

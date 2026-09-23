@@ -442,6 +442,181 @@ fn fixture_wire(pipeline: &RequestPipeline, payload: &mut MessagesRequest) -> St
 }
 
 #[test]
+fn final_review_empty_tail_keeps_real_current_input_on_final_wire() {
+    for mode in [
+        config::PipelineMode::Off,
+        config::PipelineMode::Audit,
+        config::PipelineMode::Enforce,
+    ] {
+        for strategy in [
+            expressible::UnexpressibleStrategy::PortableText,
+            expressible::UnexpressibleStrategy::Refuse,
+            expressible::UnexpressibleStrategy::Drop,
+        ] {
+            for role in ["user", "assistant"] {
+                for tail in [json!(""), json!([])] {
+                    let mut payload: MessagesRequest = serde_json::from_value(json!({
+                        "model":"claude-sonnet-4", "max_tokens":1024,
+                        "messages":[{"role":"user","content":"actual current question"}, {"role":role,"content":tail}]
+                    })).unwrap();
+                    let pipeline = RequestPipeline::new(config::PipelineConfig {
+                        mode,
+                        unexpressible: strategy,
+                        ..Default::default()
+                    });
+                    let wire: Value =
+                        serde_json::from_str(&fixture_wire(&pipeline, &mut payload)).unwrap();
+                    assert_eq!(
+                        wire["conversationState"]["currentMessage"]["userInputMessage"]["content"],
+                        "actual current question",
+                        "{mode:?}/{strategy:?}/{role}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn final_review_malformed_prepare_is_atomic_and_400_in_all_modes() {
+    for mode in [
+        config::PipelineMode::Off,
+        config::PipelineMode::Audit,
+        config::PipelineMode::Enforce,
+    ] {
+        for strategy in [
+            expressible::UnexpressibleStrategy::PortableText,
+            expressible::UnexpressibleStrategy::Refuse,
+            expressible::UnexpressibleStrategy::Drop,
+        ] {
+            let pipeline = RequestPipeline::new(config::PipelineConfig {
+                mode,
+                unexpressible: strategy,
+                ..Default::default()
+            });
+            for (index, mut payload) in portable_history::tests::final_review_malformed_requests()
+                .into_iter()
+                .enumerate()
+            {
+                let before = serde_json::to_value(&payload).unwrap();
+                let result = pipeline.prepare(&mut payload, 1);
+                let Err(error) = result else {
+                    panic!("case {index} accepted in {mode:?}/{strategy:?}");
+                };
+                assert_eq!(error.code(), "portable_history.malformed");
+                assert_eq!(error.status(), http::StatusCode::BAD_REQUEST);
+                assert!(!error.safe_message().contains("PRIVATE_"));
+                assert_eq!(serde_json::to_value(&payload).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn final_review_transformation_warning_is_content_free_without_wire_audit() {
+    // Callsite registration is process-global, while the capture subscriber is
+    // thread-local. Isolate this assertion from other tests registering the same
+    // warning concurrently without a subscriber.
+    const CAPTURE_CHILD: &str = "KIRO_PORTABLE_WARNING_CAPTURE_CHILD";
+    if std::env::var_os(CAPTURE_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pipeline::tests::final_review_transformation_warning_is_content_free_without_wire_audit",
+                "--nocapture",
+            ])
+            .env(CAPTURE_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for mode in [
+        config::PipelineMode::Off,
+        config::PipelineMode::Audit,
+        config::PipelineMode::Enforce,
+    ] {
+        let logs = LogBuffer::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let pipeline = RequestPipeline::new(config::PipelineConfig {
+                mode,
+                audit_enabled: false,
+                ..Default::default()
+            });
+            let mut payload: MessagesRequest = serde_json::from_value(json!({
+                "model":"claude-sonnet-4", "max_tokens":1024,
+                "messages":[
+                    {"role":"assistant","content":[
+                        {"type":"PRIVATE_TYPE","text":"PRIVATE_CONTENT","url":"https://private.invalid","id":"PRIVATE_ID"},
+                        {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"PRIVATE_SIGNATURE"}
+                    ]}, {"role":"user","content":"continue"}
+                ]
+            })).unwrap();
+            let prepared = pipeline.prepare(&mut payload, 1).unwrap();
+            assert_eq!(prepared.normalization.transformed_blocks, 2);
+            let first = logs.0.lock().unwrap().clone();
+            let text = String::from_utf8(first.clone()).unwrap();
+            assert!(
+                text.contains("WARN"),
+                "successful transformations must emit a warning"
+            );
+            assert!(text.contains("strategy=\"portable-text\""));
+            assert!(text.contains("scanned_blocks=2"));
+            assert!(text.contains("transformed_blocks=2"));
+            assert!(text.contains("opaque_bytes=17"));
+            for forbidden in [
+                "PRIVATE",
+                "private.invalid",
+                "messages[",
+                "fingerprint",
+                "original_type",
+                "events",
+                "path",
+            ] {
+                assert!(!text.contains(forbidden), "warning leaked {forbidden}");
+            }
+            pipeline.prepare(&mut payload, 1).unwrap();
+            assert_eq!(
+                *logs.0.lock().unwrap(),
+                first,
+                "unchanged preparation must not warn"
+            );
+            payload.messages[0].content = json!([{"type":"text","text":7}]);
+            assert!(pipeline.prepare(&mut payload, 1).is_err());
+            assert_eq!(
+                *logs.0.lock().unwrap(),
+                first,
+                "failed preparation must not report successful transformation"
+            );
+        });
+    }
+}
+
+#[test]
 fn offline_abce_prove_construction_not_cache_hits() {
     let mut cfg = config::PipelineConfig::default();
     cfg.cache_strategy = config::CacheStrategy::StaticPrefix;
