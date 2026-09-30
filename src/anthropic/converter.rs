@@ -350,6 +350,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-opus-5"
+                || mapped == "claude-opus-5.5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -2781,6 +2782,13 @@ mod tests {
         assert_eq!(get_context_window_size("claude-opus.5"), 1_000_000);
         // opus-4-5 不得被误匹配为 opus-5
         assert_eq!(get_context_window_size("claude-opus-4-5"), 200_000);
+    }
+
+    #[test]
+    fn test_context_window_opus_5_5() {
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-5.5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-5-5-latest"), 1_000_000);
     }
 
     /// 1M 名单的整体校验：新增 1M 模型时应同步此处，避免再次漏配。

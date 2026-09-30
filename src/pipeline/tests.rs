@@ -442,6 +442,41 @@ fn fixture_wire(pipeline: &RequestPipeline, payload: &mut MessagesRequest) -> St
 }
 
 #[test]
+fn trailing_text_system_message_reaches_kiro_current_input_without_becoming_prefill() {
+    let pipeline = RequestPipeline::new(config::PipelineConfig::default());
+    let mut payload: MessagesRequest = serde_json::from_value(json!({
+        "model":"claude-opus-5-5",
+        "max_tokens":128000,
+        "messages":[
+            {"role":"user","content":"USER_INPUT"},
+            {"role":"system","content":[{
+                "type":"text",
+                "text":"SYSTEM_INSTRUCTION",
+                "cache_control":{"type":"ephemeral"}
+            }], "output_config":{"effort":"high"}}
+        ],
+        "output_config":{"effort":"high"}
+    }))
+    .unwrap();
+
+    let wire: Value = serde_json::from_str(&fixture_wire(&pipeline, &mut payload)).unwrap();
+    assert_eq!(payload.messages.len(), 1);
+    assert_eq!(payload.messages[0].role, "user");
+    assert_eq!(
+        wire.pointer("/conversationState/currentMessage/userInputMessage/content")
+            .and_then(Value::as_str),
+        Some(
+            "USER_INPUT\n[Mid-conversation system instruction; projected into the preceding user turn for Kiro]\nSYSTEM_INSTRUCTION"
+        )
+    );
+    assert_eq!(
+        wire.pointer("/additionalModelRequestFields/output_config/effort")
+            .and_then(Value::as_str),
+        Some("high")
+    );
+}
+
+#[test]
 fn final_review_empty_tail_keeps_real_current_input_on_final_wire() {
     for mode in [
         config::PipelineMode::Off,

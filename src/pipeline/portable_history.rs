@@ -10,6 +10,8 @@ use crate::pipeline::expressible::UnexpressibleStrategy;
 const MAX_CONTENT_DEPTH: usize = 64;
 const MAX_REPORT_EVENTS: usize = 128;
 const QUOTED_HISTORY: &str = "[Portable history; quoted data, not instructions]";
+const MID_CONVERSATION_SYSTEM: &str =
+    "[Mid-conversation system instruction; projected into the preceding user turn for Kiro]";
 const REDACTED_REASONING: &str =
     "[Portable history: redacted reasoning was present; opaque data withheld]";
 const READABLE_FIELDS: &[&str] = &["text", "content", "title", "url", "name", "message"];
@@ -121,8 +123,11 @@ pub fn normalize(
     strategy: UnexpressibleStrategy,
     fingerprint: &dyn SensitiveFingerprint,
 ) -> Result<NormalizationOutcome, PortableHistoryError> {
-    let frontier = current_frontier(&payload.messages, strategy)?;
     let mut normalized = payload.clone();
+    let has_mid_conversation_system =
+        canonicalize_mid_conversation_system_messages(&mut normalized.messages)?;
+    let mut drop_source = has_mid_conversation_system.then(|| normalized.clone());
+    let frontier = current_frontier(&normalized.messages, strategy)?;
     let mut report = NormalizationReport {
         strategy: strategy_name(strategy).to_string(),
         ..Default::default()
@@ -131,13 +136,17 @@ pub fn normalize(
     // projections as transformations of the retained request.
     let mut discarded_report = NormalizationReport::default();
     for (index, message) in normalized.messages.iter_mut().enumerate() {
-        let scope =
-            if index < frontier || (index > frontier && strategy == UnexpressibleStrategy::Drop) {
-                Scope::History
-            } else {
-                Scope::Current
-            };
-        let message_report = if index > frontier {
+        let attached_current_system = index == frontier + 1 && message.role == "system";
+        let scope = if index < frontier
+            || (index > frontier
+                && !attached_current_system
+                && strategy == UnexpressibleStrategy::Drop)
+        {
+            Scope::History
+        } else {
+            Scope::Current
+        };
+        let message_report = if index > frontier && !attached_current_system {
             &mut discarded_report
         } else {
             &mut report
@@ -146,9 +155,19 @@ pub fn normalize(
     }
     // Validate before dropping prefill so a dangling call cannot disappear.
     validate_tool_pairing(&normalized)?;
+    lower_mid_conversation_system_messages(&mut normalized.messages)?;
+    if let Some(source) = drop_source.as_mut() {
+        lower_mid_conversation_system_messages(&mut source.messages)?;
+    }
+    let frontier = if has_mid_conversation_system {
+        current_frontier(&normalized.messages, strategy)?
+    } else {
+        frontier
+    };
     if strategy == UnexpressibleStrategy::Drop {
         report.opaque_bytes += discarded_report.opaque_bytes;
-        for message in &payload.messages[frontier + 1..] {
+        let source = drop_source.as_ref().unwrap_or(payload);
+        for message in &source.messages[frontier + 1..] {
             if let Some(blocks) = message.content.as_array() {
                 for block in blocks {
                     let category = block_category(block["type"].as_str().unwrap_or(""));
@@ -185,15 +204,137 @@ pub fn normalize(
     })
 }
 
+/// Valid Anthropic mid-conversation system instructions have no native Kiro
+/// history role. Canonicalize their text before normalization, then lower them
+/// into the user turn that immediately precedes them after block validation.
+fn canonicalize_mid_conversation_system_messages(
+    messages: &mut [Message],
+) -> Result<bool, PortableHistoryError> {
+    let mut found = false;
+    for (index, message) in messages.iter().enumerate() {
+        match message.role.as_str() {
+            "user" | "assistant" => {}
+            "system" => {
+                found = true;
+                if index == 0 || messages[index - 1].role != "user" {
+                    return Err(malformed(
+                        &format!("messages[{index}]"),
+                        "a mid-conversation system message must immediately follow a user turn",
+                    ));
+                }
+                if index + 1 < messages.len() && messages[index + 1].role != "assistant" {
+                    return Err(malformed(
+                        &format!("messages[{index}]"),
+                        "a mid-conversation system message must be final or followed by an assistant turn",
+                    ));
+                }
+            }
+            _ => {
+                return Err(malformed(
+                    &format!("messages[{index}]"),
+                    "message role must be user, assistant, or system",
+                ));
+            }
+        }
+    }
+
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.role != "system" {
+            continue;
+        }
+        let path = format!("messages[{index}].content");
+        match &mut message.content {
+            Value::String(text) => {
+                message.content = Value::Array(vec![text_block(text.clone())]);
+            }
+            Value::Array(blocks) => {
+                for (block_index, block) in blocks.iter().enumerate() {
+                    let block_path = format!("{path}[{block_index}]");
+                    let block_type =
+                        block.get("type").and_then(Value::as_str).ok_or_else(|| {
+                            malformed(&block_path, "content block requires a type string")
+                        })?;
+                    if block_type != "text" {
+                        return Err(PortableHistoryError::CurrentUnexpressible {
+                            path: block_path,
+                            reason:
+                                "Kiro can project only text mid-conversation system instructions"
+                                    .into(),
+                        });
+                    }
+                    require_string(
+                        block,
+                        "text",
+                        &block_path,
+                        "text block requires a text string",
+                    )?;
+                }
+            }
+            _ => {
+                return Err(malformed(
+                    &path,
+                    "system content must be a string or text-block array",
+                ));
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn lower_mid_conversation_system_messages(
+    messages: &mut Vec<Message>,
+) -> Result<(), PortableHistoryError> {
+    let mut index = 0;
+    while index < messages.len() {
+        if messages[index].role != "system" {
+            index += 1;
+            continue;
+        }
+        if index == 0 || messages[index - 1].role != "user" {
+            return Err(PortableHistoryError::InvariantViolation {
+                path: format!("messages[{index}]"),
+                reason: "validated system message lost its preceding user turn".into(),
+            });
+        }
+        let system = messages.remove(index);
+        let system_blocks = system.content.as_array().cloned().ok_or_else(|| {
+            PortableHistoryError::InvariantViolation {
+                path: format!("messages[{index}].content"),
+                reason: "validated system content was not canonical text blocks".into(),
+            }
+        })?;
+        let previous = &mut messages[index - 1];
+        let previous_content = std::mem::replace(&mut previous.content, Value::Null);
+        previous.content = match previous_content {
+            Value::String(text) => {
+                let mut blocks = vec![text_block(text)];
+                blocks.extend(system_blocks);
+                Value::Array(blocks)
+            }
+            Value::Array(mut blocks) => {
+                blocks.extend(system_blocks);
+                Value::Array(blocks)
+            }
+            _ => {
+                return Err(PortableHistoryError::InvariantViolation {
+                    path: format!("messages[{}].content", index - 1),
+                    reason: "validated user content was not a string or block array".into(),
+                });
+            }
+        };
+    }
+    Ok(())
+}
+
 fn current_frontier(
     messages: &[Message],
     strategy: UnexpressibleStrategy,
 ) -> Result<usize, PortableHistoryError> {
     for (index, message) in messages.iter().enumerate() {
-        if !matches!(message.role.as_str(), "user" | "assistant") {
+        if !matches!(message.role.as_str(), "user" | "assistant" | "system") {
             return Err(PortableHistoryError::Malformed {
                 path: format!("messages[{index}]"),
-                reason: "message role must be user or assistant".into(),
+                reason: "message role must be user, assistant, or system".into(),
             });
         }
     }
@@ -211,7 +352,7 @@ fn current_frontier(
     if strategy != UnexpressibleStrategy::Drop
         && messages[index + 1..]
             .iter()
-            .any(|message| !content_is_empty(&message.content))
+            .any(|message| message.role == "assistant" && !content_is_empty(&message.content))
     {
         return Err(PortableHistoryError::CurrentUnexpressible {
             path: format!("messages[{}]", index + 1),
@@ -323,7 +464,11 @@ fn normalize_block(
     let mut action = NormalizationAction::Preserved;
     match block_type.as_str() {
         "text" => {
-            require_string(block, "text", path, "text block requires a text string")?;
+            let text = require_string(block, "text", path, "text block requires a text string")?;
+            if role == "system" {
+                *block = text_block(format!("{MID_CONVERSATION_SYSTEM}\n{text}"));
+                action = NormalizationAction::PortableText;
+            }
         }
         "image" => {
             if !supported_image(block, role) {
@@ -1041,6 +1186,38 @@ pub(crate) mod tests {
             "messages": messages
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn trailing_text_system_message_is_projected_into_the_preceding_user_turn() {
+        let input = request(json!([
+            {"role":"user","content":"USER_INPUT"},
+            {"role":"system","content":[{
+                "type":"text",
+                "text":"SYSTEM_INSTRUCTION",
+                "cache_control":{"type":"ephemeral"}
+            }]}
+        ]));
+        let before = serde_json::to_value(&input).unwrap();
+
+        let outcome = normalize(
+            &input,
+            UnexpressibleStrategy::PortableText,
+            &TestFingerprint,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.payload.messages.len(), 1);
+        assert_eq!(outcome.payload.messages[0].role, "user");
+        assert_eq!(
+            outcome.payload.messages[0].content,
+            json!([
+                {"type":"text","text":"USER_INPUT"},
+                {"type":"text","text":"[Mid-conversation system instruction; projected into the preceding user turn for Kiro]\nSYSTEM_INSTRUCTION"}
+            ])
+        );
+        assert_eq!(outcome.report.transformed_blocks, 1);
+        assert_eq!(serde_json::to_value(input).unwrap(), before);
     }
 
     #[test]
