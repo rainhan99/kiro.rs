@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.8] - 2026-10-08
+
+### 修复 — 系统 Key 用量统计
+
+- 修复由 `config.json` 的 `apiKey` 同步生成的系统 Key（`#0`）只累计调用次数、不累计输入/输出 Token、缓存创建/读取 Token 和积分的问题；成功的 Kiro 请求现在与普通客户端 Key 一样入账。
+- 系统 Key 的累计用量可正常持久化，积分上限会根据已完成请求的实际累计积分生效；不重复增加调用次数，失败请求仍不增加 Key 用量。
+- 新增 7 个回归测试，覆盖系统/普通 Key、连续累计、失败请求、持久化、积分上限、无 Key 管理器及异常用量值。
+
+### 升级说明
+
+- 服务端、管理前端和桌面端版本统一为 `0.9.8`，无需迁移配置或客户端 Key 文件。
+- 修复从升级后的请求开始生效，不自动回补历史 Key 统计。
+
 ## [0.9.0] - 2026-09-17
 
 主题：**控制台主题与表格体验、Prompt Cache 计量与会话粘性路由、Codex 远程上下文压缩，以及凭据区域兼容性修复**。本版汇总 `v0.8.0` 之后的变更；新增配置提供默认值，请求日志数据库在启动时自动补齐新增字段。
