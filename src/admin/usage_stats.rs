@@ -29,7 +29,7 @@ const DAY_BUCKETS: usize = 31;
 pub struct UsageRecord {
     /// 请求结束时间（RFC3339）
     pub ts: String,
-    /// 客户端 Key id；0 表示用 master apiKey 调用
+    /// 客户端 Key id；0 为系统 Key，兼容历史 master apiKey 记录
     pub key_id: u64,
     /// 实际命中的上游凭据 id；0 表示请求未走到上游
     pub credential_id: u64,

@@ -178,7 +178,8 @@ impl UsageRecordHook {
             a.ingest(&rec);
         }
         self.settle(credits, status);
-        if status == "success" && self.key_id != 0 {
+        // id=0 是 config.apiKey 同步的系统 Key，同样需要累计用量。
+        if status == "success" {
             if let Some(m) = &self.client_keys {
                 m.record_usage(
                     self.key_id,
@@ -2788,7 +2789,253 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::client_keys::{ClientKeyManager, KeyAuth};
+    use crate::admin::usage_stats::{UsageAggregator, UsageRecorder};
     use crate::model::config::ToolCompatibilityMode;
+
+    fn usage_key_fixture(
+        system: bool,
+    ) -> (
+        AppState,
+        SharedClientKeyManager,
+        SharedAggregator,
+        u64,
+        String,
+    ) {
+        let keys = std::sync::Arc::new(ClientKeyManager::new());
+        let plaintext = if system {
+            "sk-system-usage-test"
+        } else {
+            "sk-client-usage-test"
+        }
+        .to_string();
+        let key_id = if system {
+            keys.sync_system_key("默认密钥".into(), None, plaintext.clone());
+            0
+        } else {
+            keys.create_with_key("测试密钥".into(), None, None, plaintext.clone())
+                .id
+        };
+        let aggregator = std::sync::Arc::new(UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
+            Some(keys.clone()),
+            None,
+            Some(aggregator.clone()),
+        );
+        (state, keys, aggregator, key_id, plaintext)
+    }
+
+    #[test]
+    fn usage_hook_records_success_for_system_and_client_keys() {
+        for system in [true, false] {
+            let (state, keys, aggregator, key_id, plaintext) = usage_key_fixture(system);
+            assert_eq!(key_id == 0, system);
+            assert_eq!(keys.verify_and_touch_ex(&plaintext), KeyAuth::Ok(key_id));
+
+            let hook = UsageRecordHook::from_state(&state, key_id, "test-model".into());
+            hook.record(42, 120, 30, 12, 48, 0.5, "success");
+
+            let key = keys.list().into_iter().find(|k| k.id == key_id).unwrap();
+            assert_eq!(key.total_calls, 1);
+            assert_eq!((key.total_input_tokens, key.total_output_tokens), (120, 30));
+            assert_eq!(
+                (key.total_cache_creation_tokens, key.total_cache_read_tokens),
+                (12, 48)
+            );
+            assert_eq!(key.total_credits, 0.5);
+
+            let overview = aggregator.overview();
+            assert_eq!(overview.today_calls, 1);
+            assert_eq!(overview.today_input_tokens, 120);
+            assert_eq!(overview.today_output_tokens, 30);
+            assert_eq!(overview.today_credits, 0.5);
+        }
+    }
+
+    #[test]
+    fn usage_hook_accumulates_system_key_without_counting_calls_twice() {
+        let (state, keys, aggregator, key_id, plaintext) = usage_key_fixture(true);
+        let hook = UsageRecordHook::from_state(&state, key_id, "test-model".into());
+        for (input, output, cache_creation, cache_read, credits) in
+            [(120, 30, 12, 48, 0.5), (60, 10, 3, 7, 0.25)]
+        {
+            assert_eq!(keys.verify_and_touch_ex(&plaintext), KeyAuth::Ok(key_id));
+            hook.record(
+                42,
+                input,
+                output,
+                cache_creation,
+                cache_read,
+                credits,
+                "success",
+            );
+        }
+
+        let key = keys.list().into_iter().find(|k| k.id == key_id).unwrap();
+        assert_eq!(key.total_calls, 2);
+        assert_eq!((key.total_input_tokens, key.total_output_tokens), (180, 40));
+        assert_eq!(
+            (key.total_cache_creation_tokens, key.total_cache_read_tokens),
+            (15, 55)
+        );
+        assert_eq!(key.total_credits, 0.75);
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 2);
+        assert_eq!(overview.today_input_tokens, 180);
+        assert_eq!(overview.today_output_tokens, 40);
+        assert_eq!(overview.today_credits, 0.75);
+    }
+
+    #[test]
+    fn usage_hook_errors_do_not_increment_key_totals() {
+        for system in [true, false] {
+            let (state, keys, aggregator, key_id, plaintext) = usage_key_fixture(system);
+            assert_eq!(keys.verify_and_touch_ex(&plaintext), KeyAuth::Ok(key_id));
+            let hook = UsageRecordHook::from_state(&state, key_id, "test-model".into());
+            hook.record(42, 120, 30, 12, 48, 0.5, "error");
+
+            let key = keys.list().into_iter().find(|k| k.id == key_id).unwrap();
+            assert_eq!(key.total_calls, 1);
+            assert_eq!(
+                (
+                    key.total_input_tokens,
+                    key.total_output_tokens,
+                    key.total_cache_creation_tokens,
+                    key.total_cache_read_tokens,
+                ),
+                (0, 0, 0, 0)
+            );
+            assert_eq!(key.total_credits, 0.0);
+            let overview = aggregator.overview();
+            assert_eq!(overview.today_calls, 1);
+            assert_eq!(overview.today_errors, 1);
+            assert_eq!(overview.today_input_tokens, 120);
+            assert_eq!(overview.today_output_tokens, 30);
+            assert_eq!(overview.today_credits, 0.5);
+        }
+    }
+
+    #[test]
+    fn usage_hook_system_key_usage_persists_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_path = dir.path().join("client_api_keys.json");
+        let log_dir = dir.path().join("usage");
+        let keys = std::sync::Arc::new(ClientKeyManager::load(&keys_path).unwrap());
+        keys.sync_system_key("默认密钥".into(), None, "sk-system-usage-test".into());
+        assert_eq!(
+            keys.verify_and_touch_ex("sk-system-usage-test"),
+            KeyAuth::Ok(0)
+        );
+        let aggregator = std::sync::Arc::new(UsageAggregator::new());
+        let recorder = std::sync::Arc::new(UsageRecorder::with_retention(log_dir.clone(), 31));
+        let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
+            Some(keys),
+            Some(recorder),
+            Some(aggregator.clone()),
+        );
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".into());
+        hook.record(42, 120, 30, 12, 48, 0.5, "success");
+
+        let reloaded = ClientKeyManager::load(&keys_path).unwrap();
+        let key = reloaded.list().into_iter().find(|k| k.id == 0).unwrap();
+        assert_eq!(key.total_calls, 1);
+        assert_eq!((key.total_input_tokens, key.total_output_tokens), (120, 30));
+        assert_eq!(
+            (key.total_cache_creation_tokens, key.total_cache_read_tokens),
+            (12, 48)
+        );
+        assert_eq!(key.total_credits, 0.5);
+
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(log_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap();
+            if name.starts_with("usage_log.") && name.ends_with(".jsonl") {
+                let content = std::fs::read_to_string(path).unwrap();
+                for line in content.lines() {
+                    records.push(serde_json::from_str::<UsageRecord>(line).unwrap());
+                }
+            }
+        }
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.key_id, 0);
+        assert_eq!(record.credential_id, 42);
+        assert_eq!(record.status, "success");
+        assert_eq!((record.input_tokens, record.output_tokens), (120, 30));
+        assert_eq!(
+            (record.cache_creation_tokens, record.cache_read_tokens),
+            (12, 48)
+        );
+        assert_eq!(record.credits, 0.5);
+        assert_eq!(aggregator.overview().today_calls, 1);
+    }
+
+    #[test]
+    fn usage_hook_system_credit_limit_uses_completed_usage() {
+        let (state, keys, _, key_id, plaintext) = usage_key_fixture(true);
+        assert!(keys.set_max_credits(key_id, Some(0.5)));
+        assert_eq!(keys.verify_and_touch_ex(&plaintext), KeyAuth::Ok(key_id));
+        let hook = UsageRecordHook::from_state(&state, key_id, "test-model".into());
+        hook.record(42, 120, 30, 12, 48, 0.5, "success");
+        assert_eq!(
+            keys.verify_and_touch_ex(&plaintext),
+            KeyAuth::OverLimit {
+                id: 0,
+                used: 0.5,
+                limit: 0.5
+            }
+        );
+        let key = keys.list().into_iter().find(|k| k.id == key_id).unwrap();
+        assert_eq!(key.total_calls, 1);
+        assert_eq!(key.total_credits, 0.5);
+    }
+
+    #[test]
+    fn usage_hook_without_key_manager_still_records_usage() {
+        let aggregator = std::sync::Arc::new(UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
+            None,
+            None,
+            Some(aggregator.clone()),
+        );
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".into());
+        hook.record(42, 120, 30, 12, 48, 0.5, "success");
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 0);
+        assert_eq!(overview.today_input_tokens, 120);
+        assert_eq!(overview.today_output_tokens, 30);
+        assert_eq!(overview.today_credits, 0.5);
+    }
+
+    #[test]
+    fn usage_hook_normalizes_invalid_usage_for_system_keys() {
+        for system in [true, false] {
+            for credits in [-1.0, f64::NAN, f64::INFINITY] {
+                let (state, keys, aggregator, key_id, _) = usage_key_fixture(system);
+                let hook = UsageRecordHook::from_state(&state, key_id, "test-model".into());
+                hook.record(42, -120, -30, -12, -48, credits, "success");
+
+                let key = keys.list().into_iter().find(|k| k.id == key_id).unwrap();
+                assert_eq!(
+                    (
+                        key.total_input_tokens,
+                        key.total_output_tokens,
+                        key.total_cache_creation_tokens,
+                        key.total_cache_read_tokens,
+                    ),
+                    (0, 0, 0, 0)
+                );
+                assert_eq!(key.total_credits, 0.0);
+                let overview = aggregator.overview();
+                assert_eq!(overview.today_calls, 1);
+                assert_eq!(overview.today_input_tokens, 0);
+                assert_eq!(overview.today_output_tokens, 0);
+                assert_eq!(overview.today_credits, 0.0);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn preparation_error_responses_have_stable_status_codes_and_no_private_details() {
